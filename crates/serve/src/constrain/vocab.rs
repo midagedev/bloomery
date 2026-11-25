@@ -4,9 +4,9 @@
 //! which tokens those are is a property of the vocabulary alone: one decode of
 //! every id at bind, not a scan a request or a step repeats. The class of a
 //! JSON string (no `"`, no `\`, no control character; and, where a tag could
-//! open or end a value, no `<`) is built here; the class of a raw value, which
-//! ends at a fixed text, depends on that text's first byte and is built on
-//! first use for each byte (a handful of bytes ever occur).
+//! open or end a value, no `<`) is built here; a raw value's automaton
+//! ([`RawTags`]), which depends on its format's tags, is built on first use
+//! for each set of tags (a handful ever occur).
 //! A token's text is its single-id decode: a byte-level token that is half a
 //! character decodes to the replacement character, which holds none of the
 //! bytes a class forbids, so the class reads the same either way.
@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use super::Refusal;
+use super::raw::{Ends, RawTags};
 use crate::engine::Tokenizer;
 
 /// A set of ids.
@@ -21,11 +23,11 @@ use crate::engine::Tokenizer;
 pub(crate) struct Bits(Vec<u64>);
 
 impl Bits {
-    fn new(n: usize) -> Bits {
+    pub(super) fn new(n: usize) -> Bits {
         Bits(vec![0; n.div_ceil(64)])
     }
 
-    fn set(&mut self, id: usize) {
+    pub(super) fn set(&mut self, id: usize) {
         self.0[id / 64] |= 1 << (id % 64);
     }
 
@@ -70,7 +72,7 @@ impl Class {
 }
 
 /// The vocabulary read once: every id's text, its length in characters, the
-/// stop ids, and the two JSON-string classes.
+/// stop ids, the special ids, and the two JSON-string classes.
 pub(crate) struct Vocab {
     /// Every id's text, concatenated; id `i` is `text[at[i]..at[i + 1]]`.
     text: String,
@@ -83,11 +85,12 @@ pub(crate) struct Vocab {
     /// point, exponent), ascending.
     numeric: Vec<u32>,
     stops: Arc<[u32]>,
+    special: Bits,
     json: Class,
     /// `json` without the tokens that hold a `<`.
     json_in_markup: Class,
-    /// The raw classes built so far, by the byte their value may not hold.
-    raw: Mutex<HashMap<u8, Class>>,
+    /// The raw values' automata built so far, by their tags.
+    raw: Mutex<HashMap<Ends, Arc<RawTags>>>,
 }
 
 impl Vocab {
@@ -102,6 +105,7 @@ impl Vocab {
         let mut numeric = Vec::new();
         let mut json = Bits::new(n);
         let mut json_in_markup = Bits::new(n);
+        let mut special = Bits::new(n);
         for id in 0..n {
             let id32 = u32::try_from(id).expect("a vocabulary fits u32");
             at.push(u32::try_from(text.len()).expect("the vocabulary's text fits u32"));
@@ -112,6 +116,9 @@ impl Vocab {
                 first[usize::from(b)].push(id32);
             }
             let stop = stops.contains(&id32);
+            if tok.is_special(id32) {
+                special.set(id);
+            }
             if !stop
                 && !piece.is_empty()
                 && piece
@@ -154,6 +161,7 @@ impl Vocab {
             first,
             numeric,
             stops,
+            special,
             raw: Mutex::new(HashMap::new()),
         }
     }
@@ -182,30 +190,30 @@ impl Vocab {
         self.json_in_markup.clone()
     }
 
-    /// The tokens whose text holds no `stop` byte: the body of a raw value
-    /// that ends at a text beginning with it.
-    pub(crate) fn raw_class(&self, stop: u8) -> Class {
-        let mut built = self.raw.lock().unwrap_or_else(|e| e.into_inner());
-        built
-            .entry(stop)
-            .or_insert_with(|| {
-                let mut ok = Bits::new(self.n_vocab());
-                for id in 0..self.n_vocab() {
-                    let id32 = u32::try_from(id).expect("a vocabulary fits u32");
-                    let piece = self.piece(id32);
-                    if !piece.is_empty()
-                        && !self.stops.contains(&id32)
-                        && !piece.bytes().any(|b| b == stop)
-                    {
-                        ok.set(id);
-                    }
-                }
-                Class {
-                    ok: Arc::new(ok),
-                    chars: Arc::clone(&self.chars),
-                }
-            })
-            .clone()
+    /// The automaton of a raw value whose format reads it by `ends`, built
+    /// on first use with `tok`, this vocabulary's tokenizer.
+    pub(crate) fn raw_tags(
+        &self,
+        ends: Ends,
+        tok: &dyn Tokenizer,
+    ) -> Result<Arc<RawTags>, Refusal> {
+        if let Some(t) = self
+            .raw
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ends)
+        {
+            return Ok(Arc::clone(t));
+        }
+        let built = Arc::new(RawTags::new(ends, tok, self)?);
+        let mut cache = self.raw.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(Arc::clone(cache.entry(ends).or_insert(built)))
+    }
+
+    /// Whether `id` may be text a value holds: a non-empty piece, neither a
+    /// stop nor a special token.
+    pub(crate) fn is_text(&self, id: u32) -> bool {
+        !self.piece(id).is_empty() && !self.stops.contains(&id) && !self.special.has(id)
     }
 
     /// The text of `id`, empty for an id past the vocabulary.

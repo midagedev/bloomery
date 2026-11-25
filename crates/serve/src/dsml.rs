@@ -44,8 +44,8 @@ use crate::callstream::{
     self, Advance, Args, CallPiece, Progress, Reading, Streamer, find_from, held, read_value,
 };
 use crate::constrain::{
-    Arg, Call, CallMode, Fun, Part, Refusal, Style, any_start, call, is_text, object_parameters,
-    value,
+    Arg, Call, CallMode, Ends, Fun, Order, Part, Refusal, Style, any_start, call, is_text,
+    object_parameters, value,
 };
 use crate::engine::Tokenizer;
 use crate::erniexml::{ErnieScan, ErnieXmlError};
@@ -1285,7 +1285,7 @@ pub(crate) fn call_parts(
 /// (`string="true"` around a text value, `string="false"` around any other)
 /// — the template's own empty line for a call that writes no parameter at
 /// all, and the invoke's close.
-fn body(t: &Tags, f: &Fun<'_>) -> Result<Vec<Part>, Refusal> {
+fn body(t: &'static Tags, f: &Fun<'_>) -> Result<Vec<Part>, Refusal> {
     let block = |a: &Arg<'_>| -> Result<Vec<Part>, Refusal> {
         let mut parts = vec![Part::Text(format!(
             "{}{}\" string=\"{}\">",
@@ -1293,7 +1293,12 @@ fn body(t: &Tags, f: &Fun<'_>) -> Result<Vec<Part>, Refusal> {
             a.key,
             is_text(&a.schema)
         ))];
-        parts.extend(value(&a.schema, Style::Raw, &a.path)?);
+        // The scan cuts the invoke at its close before it reads a value.
+        let ends = Ends {
+            close: t.param_close,
+            never: std::slice::from_ref(&t.invoke_close),
+        };
+        parts.extend(value(&a.schema, Style::Raw(ends), &a.path)?);
         parts.push(Part::Text(format!("{}\n", t.param_close)));
         Ok(parts)
     };
@@ -1309,7 +1314,7 @@ fn body(t: &Tags, f: &Fun<'_>) -> Result<Vec<Part>, Refusal> {
             vec![Part::Text("\n".to_owned())],
         )?);
     } else {
-        parts.extend(object_parameters(&f.args, &block)?);
+        parts.extend(object_parameters(&f.args, Order::Schema, &block)?);
         if f.args.is_empty() {
             // The template's own empty line for a call of no parameters.
             parts.push(Part::Text("\n".to_owned()));

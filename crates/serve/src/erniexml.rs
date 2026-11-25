@@ -45,8 +45,8 @@ use serde_json::Value;
 
 use crate::callstream::{self, Reading, find_from, held, read_value};
 use crate::constrain::{
-    Arg, Call, CallMode, Fun, Part, Refusal, Style, call, is_text, object_parameters, outside,
-    value,
+    Arg, Call, CallMode, Ends, Fun, Order, Part, Refusal, Style, call, is_text, object_parameters,
+    outside, value,
 };
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
@@ -555,9 +555,10 @@ impl CallRead {
 /// The call this markup spells, as the parts structured output forces: the
 /// inverse of [`ErnieScan`]. The block's opening, then an `invoke` a call —
 /// `<invoke name="NAME">` and a `<parameter name="KEY">` block per parameter
-/// as the object rule writes them, the required ones in the schema's order,
-/// then the optional ones, each of which may be left out — each value written
-/// as the schema reads it (raw text for a string, JSON for the rest), then
+/// in key order, as the protocol's renderer writes every call the model sees,
+/// each optional one left out or written in its place — each value written
+/// as the schema reads it (raw text for a string, ended by the first
+/// `</parameter>` and holding no block close; JSON for the rest), then
 /// `</invoke>` and the line feed after it. The scanner reads a value as text
 /// only where the schema says `"type": "string"`, itself or through a `$ref`,
 /// so a text-valued parameter that does not say it is refused rather than
@@ -574,15 +575,19 @@ pub(crate) fn call_parts(funs: &[Fun<'_>], mode: CallMode) -> Result<Call, Refus
             ));
         }
         let mut parts = vec![Part::Text(format!("<parameter name=\"{}\">", a.key))];
-        parts.extend(value(&a.schema, Style::Raw, &a.path)?);
-        parts.push(Part::Text("</parameter>".to_owned()));
+        let ends = Ends {
+            close: PARAM_CLOSE,
+            never: &[CALL_CLOSE],
+        };
+        parts.extend(value(&a.schema, Style::Raw(ends), &a.path)?);
+        parts.push(Part::Text(PARAM_CLOSE.to_owned()));
         Ok(parts)
     };
     let name = |name: &str| format!("{name}\">");
     // One call after its function's name: its parameters, `</invoke>` and the line feed the
     // protocol writes after it, which is all that stands between two calls.
     let one = |f: &Fun<'_>| {
-        let mut parts = object_parameters(&f.args, &block)?;
+        let mut parts = object_parameters(&f.args, Order::Sorted, &block)?;
         parts.push(Part::Text(format!("{INVOKE_CLOSE}\n")));
         Ok(parts)
     };

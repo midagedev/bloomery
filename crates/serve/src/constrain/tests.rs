@@ -1186,9 +1186,10 @@ fn markup(format: ToolFormat) -> [String; 2] {
             "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"unit\": \"celsius\", \"days\": 2}}<|end_message|>",
             "<|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"query\": \"cats\", \"deep\": false}}<|end_message|>",
         ],
+        // The protocol's renderer writes a call's keys sorted.
         ToolFormat::ErnieXml => [
-            "<ernie:tool_call>\n<invoke name=\"get_weather\"><parameter name=\"unit\">celsius</parameter><parameter name=\"days\">2</parameter></invoke>\n</ernie:tool_call>",
-            "<ernie:tool_call>\n<invoke name=\"search\"><parameter name=\"query\">cats</parameter><parameter name=\"deep\">false</parameter></invoke>\n</ernie:tool_call>",
+            "<ernie:tool_call>\n<invoke name=\"get_weather\"><parameter name=\"days\">2</parameter><parameter name=\"unit\">celsius</parameter></invoke>\n</ernie:tool_call>",
+            "<ernie:tool_call>\n<invoke name=\"search\"><parameter name=\"deep\">false</parameter><parameter name=\"query\">cats</parameter></invoke>\n</ernie:tool_call>",
         ],
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
@@ -1878,38 +1879,57 @@ fn a_literal_with_closing_tags_reads_back_through_each_scanner() {
     }
 }
 
-/// Rows that favour a format's own closing tag, one byte a step, cannot make a
-/// free string spell it: a string inside a call's markup, as the argument
-/// itself or inside a JSON object a parameter holds, takes no token with a `<`
-/// (or, for Qwen's raw string, a newline), and the call reads back as one call.
+/// Rows that favour one of a format's own tags, one byte a step, cannot make a
+/// free string spell it. A raw value (the argument itself, in all but Hermes)
+/// ends where its text completes its close and never spells a tag its scanner
+/// cuts the call at; a JSON string inside a call's markup (Hermes's argument,
+/// or a string inside an object a parameter holds) takes no token with a `<`.
+/// The call reads back as one call, over a vocabulary of bytes and over one
+/// where tags and their starts are special tokens, the string at its length
+/// limit too.
 #[test]
 fn a_free_string_cannot_spell_its_formats_closing_tag() {
-    let tok = bytes_tok();
+    let toks = [
+        bytes_tok(),
+        Arc::new(Pieces(Arc::new(PieceTok(&TAG_PIECES)))) as Arc<dyn Tokenizer>,
+    ];
     let direct = call_body(&json!({"type": "object", "properties": {
         "q": {"type": "string", "maxLength": 40}}, "required": ["q"]}));
     let nested = call_body(&json!({"type": "object", "properties": {
         "q": {"type": "object", "properties": {"s": {"type": "string", "maxLength": 40}},
             "required": ["s"]}}, "required": ["q"]}));
+    let dsml_j = ToolFormat::Dsml(Spelling::Joined);
+    let dsml_s = ToolFormat::Dsml(Spelling::Spaced);
     let tags = [
         (ToolFormat::Hermes, "</tool_call>"),
         (QWEN, "\n</parameter>\n"),
         (QWEN_COMPACT, "</parameter>"),
         (ToolFormat::ErnieXml, "</parameter>"),
+        (ToolFormat::ErnieXml, "</ernie:tool_call>"),
         (GLM, "</arg_value>"),
+        (GLM, "</tool_call>"),
         (SOLAR, "<|tool_arg:end|>"),
-        (ToolFormat::Dsml(Spelling::Joined), "</｜DSML｜parameter>"),
-        (ToolFormat::Dsml(Spelling::Spaced), "</｜DSML｜ parameter>"),
+        (SOLAR, "<|tool_call:end|>"),
+        (HY4, "</arg_value:6124c78e>"),
+        (HY4, "</tool_call:6124c78e>"),
+        (dsml_j, "</｜DSML｜parameter>"),
+        (dsml_j, "</｜DSML｜invoke>"),
+        (dsml_s, "</｜DSML｜ parameter>"),
+        (dsml_s, "</｜DSML｜ invoke>"),
+        (ToolFormat::MuseSpark, "</atem:parameter>"),
+        (ToolFormat::MuseSpark, "</atem:invoke>"),
+        (ToolFormat::MuseSpark, "<|eom|>"),
     ];
-    for (format, tag) in tags {
+    for (tok, (format, tag)) in toks.iter().flat_map(|t| tags.map(|r| (t, r))) {
         for (body, nested) in [(&direct, false), (&nested, true)] {
-            let c = build(&tok, format, body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let c = build(tok, format, body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
             let want: Vec<u32> = tag
                 .bytes()
                 .map(|b| BYTES + u32::from(b))
                 .cycle()
                 .take(300)
                 .collect();
-            let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+            let o = run(tok, Some(c), ThinkEntry::Closed, &want);
             let calls = scanned(format, &body["tools"], &o.content);
             assert_eq!(calls.len(), 1, "{format:?}: {}", o.content);
             let q = &calls[0].1["q"];
@@ -1918,10 +1938,179 @@ fn a_free_string_cannot_spell_its_formats_closing_tag() {
                 .as_str()
                 .unwrap_or_else(|| panic!("{format:?}: {}", o.content));
             assert!(!q.contains(tag), "{format:?}: {q:?}");
-            if format != QWEN || nested {
+            if nested || format == ToolFormat::Hermes {
                 assert!(!q.contains('<'), "{format:?} nested {nested}: {q:?}");
             }
         }
+    }
+}
+
+/// A raw value takes any text that spells none of its format's tags: HTML, a
+/// heredoc, line feeds, the starts of the tags and characters the vocabulary
+/// splits read back whole through each format's scanner, the value ending
+/// where its text completes its close.
+#[test]
+fn a_raw_value_reads_back_whole_whatever_text_it_holds() {
+    let tok = bytes_tok();
+    let mut tools = forecast_tools();
+    tools[1]["function"]["parameters"]["properties"]["query"] = json!({"type": "string"});
+    let body = json!({"tools": tools, "tool_choice":
+        {"type": "function", "function": {"name": "search"}}});
+    let value = "<!DOCTYPE html>\n<html><p>a < b</p></html>\ncat <<'EOF' > x.sh\n\
+                 </para </arg_val <|tool_arg:e </tool_cal </ernie:tool </atem:invo <|eo é｜\nEOF";
+    for format in [
+        QWEN,
+        QWEN_COMPACT,
+        GLM,
+        SOLAR,
+        HY4,
+        ToolFormat::Dsml(Spelling::Joined),
+        ToolFormat::Dsml(Spelling::Spaced),
+        ToolFormat::MuseSpark,
+        ToolFormat::ErnieXml,
+    ] {
+        let text = markup(format)[1].replace("cats", value);
+        let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+        let mut p = params(Some(c), ThinkEntry::Closed);
+        p.n_predict = 2000;
+        let o = run_read(&tok, &p, &ids(&tok, &text)).0;
+        assert_eq!(o.content, text, "{format:?}");
+        assert_eq!(
+            scanned(format, &tools, &o.content),
+            vec![("search".to_owned(), json!({"query": value, "deep": false}))],
+            "{format:?}"
+        );
+    }
+}
+
+/// The tag before a raw value is forced without its last token, which the
+/// value's first token writes: a piece that joins the tag's end to the
+/// value's start (`">/`, `"><`), as the model's own tokenization writes the
+/// two, is taken, and the call reads back the same.
+#[test]
+fn a_raw_values_first_token_may_join_the_tag_before_it() {
+    let pieces = Arc::new(PieceTok(&["\">", "\">/", "\"><"]));
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::clone(&pieces)));
+    let mut tools = forecast_tools();
+    tools[1]["function"]["parameters"]["properties"]["query"] = json!({"type": "string"});
+    let body = json!({"tools": tools, "tool_choice":
+        {"type": "function", "function": {"name": "search"}}});
+    for (format, value, joined) in [
+        (ToolFormat::ErnieXml, "/root/x/index.html", "\">/"),
+        (ToolFormat::ErnieXml, "<!DOCTYPE html>", "\"><"),
+        (ToolFormat::Dsml(Spelling::Spaced), "/root", "\">/"),
+    ] {
+        let text = markup(format)[1].replace("cats", value);
+        let want = ids(&tok, &text);
+        assert!(want.contains(&pieces.piece(joined)), "{text}");
+        let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+        let mut p = params(Some(c), ThinkEntry::Closed);
+        p.n_predict = 2000;
+        let o = run_read(&tok, &p, &want).0;
+        assert_eq!(o.tokens, with_eos(&tok, want), "{format:?} {value}");
+        assert_eq!(
+            scanned(format, &tools, &o.content),
+            vec![("search".to_owned(), json!({"query": value, "deep": false}))],
+            "{format:?}"
+        );
+    }
+}
+
+/// A raw value's token may hold value text and the start of its close, or
+/// the close and the text after it, and is taken where the call goes on as
+/// its text says; one that completes the close and goes on with text the call
+/// does not hold is refused. A tail that starts the close and breaks off (`<`
+/// before `</parameter>`) is the value's text, at its length limit too.
+#[test]
+fn a_raw_values_token_may_cross_its_close() {
+    let format = ToolFormat::ErnieXml;
+    for (pieces, value, max, bad) in [
+        (&["</parameter></"][..], "cats", None, None),
+        (&["s</par"][..], "cats", Some(4), None),
+        (&[][..], "cats <", Some(6), None),
+        (
+            &["</parameter>x"][..],
+            "cats",
+            Some(6),
+            Some("</parameter>x"),
+        ),
+    ] {
+        let pieces = Arc::new(PieceTok(pieces));
+        let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::clone(&pieces)));
+        let mut tools = forecast_tools();
+        let mut query = json!({"type": "string"});
+        if let Some(m) = max {
+            query["maxLength"] = json!(m);
+        }
+        tools[1]["function"]["parameters"]["properties"]["query"] = query;
+        let body = json!({"tools": tools, "tool_choice":
+            {"type": "function", "function": {"name": "search"}}});
+        let text = markup(format)[1].replace("cats", value);
+        let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{value}: {e}"));
+        let o = match bad {
+            None => {
+                let want = ids(&tok, &text);
+                if let Some(p) = pieces.0.first() {
+                    assert!(want.contains(&pieces.piece(p)), "{text}");
+                }
+                let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+                assert_eq!(o.tokens, with_eos(&tok, want), "{value}");
+                o
+            }
+            Some(p) => {
+                let want = ids(
+                    &tok,
+                    &text.replacen("cats</parameter>", "cats</parameter>x", 1),
+                );
+                let bad = pieces.piece(p);
+                assert!(want.contains(&bad), "{text}");
+                let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+                assert!(!o.tokens.contains(&bad), "{}", o.content);
+                o
+            }
+        };
+        let calls = scanned(format, &tools, &o.content);
+        assert_eq!(calls.len(), 1, "{}", o.content);
+        let q = calls[0].1["query"].as_str().expect("a string");
+        match bad {
+            None => assert_eq!(q, value),
+            Some(_) => assert!(q.starts_with("cats"), "{q:?}"),
+        }
+    }
+}
+
+/// ERNIE 5.5's renderer writes a call's keys sorted, so the program walks the
+/// parameters in key order, each optional one left out or written in its
+/// place: here an optional key that sorts before a required string value.
+#[test]
+fn ernie_walks_a_calls_parameters_in_key_order() {
+    let tok = bytes_tok();
+    let body = call_body(&json!({"type": "object", "properties": {
+        "pattern": {"type": "string"}, "glob": {"type": "string"}, "path": {"type": "string"}},
+        "required": ["pattern", "path"]}));
+    let open = "<ernie:tool_call>\n<invoke name=\"f\">";
+    let close = "</invoke>\n</ernie:tool_call>";
+    let glob = "<parameter name=\"glob\">*.rs</parameter>";
+    let rest =
+        "<parameter name=\"path\">src</parameter><parameter name=\"pattern\">fn main</parameter>";
+    for (text, args) in [
+        (
+            format!("{open}{glob}{rest}{close}"),
+            json!({"glob": "*.rs", "path": "src", "pattern": "fn main"}),
+        ),
+        (
+            format!("{open}{rest}{close}"),
+            json!({"path": "src", "pattern": "fn main"}),
+        ),
+    ] {
+        let c = build(&tok, ToolFormat::ErnieXml, &body).expect("served");
+        let want = ids(&tok, &text);
+        let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+        assert_eq!(o.tokens, with_eos(&tok, want), "{}", o.content);
+        assert_eq!(
+            scanned(ToolFormat::ErnieXml, &body["tools"], &o.content),
+            vec![("f".to_owned(), args)]
+        );
     }
 }
 
