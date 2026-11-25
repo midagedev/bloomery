@@ -1534,6 +1534,10 @@ impl Marked for Body {
         self.ckpt.copies.marks(from, to)
     }
 
+    fn call(&mut self, from: u32) {
+        self.ckpt.copies.call(from);
+    }
+
     fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError> {
         Body::checkpoint(self, gpu, pos)
     }

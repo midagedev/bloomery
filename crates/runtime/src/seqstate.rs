@@ -422,12 +422,14 @@ pub struct Stats {
     pub dropped: u64,
 }
 
-/// One checkpoint: its position, its slot, and when it was last used.
+/// One checkpoint: its position, its slot, when it was last used, and whether
+/// a call that began after steps took it ([`Ledger::call`]).
 #[derive(Clone, Copy, Debug)]
 struct Point {
     pos: u32,
     slot: usize,
     used: u64,
+    reply: bool,
 }
 
 /// The checkpoints of one model's recurrent state: at most `cap` slots,
@@ -435,6 +437,13 @@ struct Point {
 /// nonzero spacing, the first point leaves last, and later anchors
 /// ([`anchor`] at the spacing `every`) stay before later non-anchor marks.
 /// A save carries the first point and the doubling ones ([`save_points`]).
+///
+/// A prompt call that begins where a point stands, or at 0, continues a
+/// request's prompt; one that begins elsewhere began after steps, a reply's
+/// own ([`Ledger::call`]). The newest point a continuing call took, where the
+/// request's prompt ended, is the one the next request restores: it leaves
+/// last once a reply's points stand past it, and the points a reply's calls
+/// take leave before any other.
 #[derive(Clone, Debug)]
 pub struct Ledger {
     cap: usize,
@@ -449,6 +458,8 @@ pub struct Ledger {
     /// Positions whose points an eviction removed, ascending, on the
     /// current branch.
     evicted: Vec<u32>,
+    /// Whether the call in progress began after steps.
+    reply: bool,
     pending: Option<Cut>,
     stats: Stats,
 }
@@ -471,6 +482,7 @@ impl Ledger {
             made: 0,
             clock: 0,
             evicted: Vec::new(),
+            reply: false,
             pending: None,
             stats: Stats::default(),
         })
@@ -490,6 +502,17 @@ impl Ledger {
     #[must_use]
     pub fn positions(&self) -> Vec<u32> {
         self.points.iter().map(|p| p.pos).collect()
+    }
+
+    /// A prompt call begins at `from`, the position the model stands at,
+    /// before its takes. It continues a request's prompt at 0 or where a
+    /// point stands, taking that point's kind; anywhere else steps ran since
+    /// the last point, and the call is a reply's own: the points it takes
+    /// leave before every point a request's prompt took, and never displace
+    /// the newest of those. A caller that never says keeps every call a
+    /// request's, and the points leave least recently used first.
+    pub fn call(&mut self, from: u32) {
+        self.reply = from != 0 && self.points.last().is_none_or(|p| p.pos != from || p.reply);
     }
 
     /// The cut waiting for the caller's copy.
@@ -557,6 +580,7 @@ impl Ledger {
                 .ok_or_else(|| CheckpointError::NotKept(self.keep(n, held)))?;
             self.clock += 1;
             self.points[i].used = self.clock;
+            self.points[i].reply = false;
             self.stats.restored += 1;
             Cut::Restore {
                 slot: self.points[i].slot,
@@ -573,8 +597,11 @@ impl Ledger {
     /// capacity are made, or the least recently used point's that is neither
     /// the first point nor an anchor. With nonzero spacing, anchors leave
     /// next and the first point only when it is the sole slot. A ledger
-    /// without spacing uses least recent order. Refused while a cut
-    /// waits, and when a point stands past `at`.
+    /// without spacing uses least recent order. A point taken in a reply's
+    /// call ([`Ledger::call`]) leaves before any other, and the newest point
+    /// a request's prompt took, while a reply's point stands past it or
+    /// takes the slot, leaves
+    /// after all of them, the first point too. Refused while a cut waits, and when a point stands past `at`.
     pub fn take(&mut self, at: u32) -> Result<Take, CheckpointError> {
         if self.pending.is_some() {
             return Err(CheckpointError::Pending { at });
@@ -600,11 +627,24 @@ impl Ledger {
             self.made += 1;
             (self.made - 1, true, None)
         } else {
+            let prompt_end = self
+                .points
+                .iter()
+                .rposition(|p| !p.reply)
+                .filter(|&i| self.reply || self.points[i + 1..].iter().any(|p| p.reply));
             let (i, _) = self
                 .points
                 .iter()
                 .enumerate()
-                .min_by_key(|(i, p)| (self.every > 0 && *i == 0, anchor(p.pos, self.every), p.used))
+                .min_by_key(|(i, p)| {
+                    (
+                        Some(*i) == prompt_end,
+                        self.every > 0 && *i == 0,
+                        anchor(p.pos, self.every),
+                        !p.reply,
+                        p.used,
+                    )
+                })
                 .ok_or(CheckpointError::Budget {
                     budget: 0,
                     bytes: 0,
@@ -621,6 +661,7 @@ impl Ledger {
             pos: at,
             slot,
             used: self.clock,
+            reply: self.reply,
         });
         self.stats.taken += 1;
         Ok(Take::Copy { slot, new, evicted })
@@ -1749,6 +1790,64 @@ mod tests {
         );
         assert_eq!(l.stats().evicted, 1);
         assert_eq!(l.stats().taken, 3);
+    }
+
+    /// A prompt call takes the marks of its span, as a body does.
+    fn call_takes(l: &mut Ledger, from: u32, to: u32, every: u32) {
+        l.call(from);
+        for at in marks(from, to, every) {
+            l.take(at).expect("a point");
+            l.applied();
+        }
+    }
+
+    /// The prompt's end survives the reply's own prompt calls: a prompt call
+    /// from 0 to 5297, a reply of steps between five short prompt calls (the
+    /// ids a forced tool call feeds), then a request sharing 5302 positions
+    /// keeps the point at 5297, with the two slots a spacing of 0 grants.
+    #[test]
+    fn the_prompt_end_survives_the_replys_prompt_calls() {
+        let mut l = Ledger::new(2, 0).expect("a ledger");
+        call_takes(&mut l, 0, 5_297, 0);
+        let mut held = 5_297;
+        for run in [4, 3, 7, 2, 5] {
+            let from = held + 3;
+            call_takes(&mut l, from, from + run, 0);
+            held = from + run + 2;
+        }
+        let k = l.keep(5_302, held);
+        assert!(
+            k.at == 5_297 && matches!(k.why, Why::Checkpoint { .. }),
+            "{k}"
+        );
+    }
+
+    /// A call that begins at the point the last call ended continues it, of
+    /// that point's kind: a reply's call cut in two takes points of a reply
+    /// both times, and the prompt's end stays.
+    #[test]
+    fn a_call_continues_the_kind_of_the_point_it_begins_at() {
+        let mut l = Ledger::new(2, 0).expect("a ledger");
+        call_takes(&mut l, 0, 100, 0);
+        call_takes(&mut l, 110, 120, 0);
+        call_takes(&mut l, 120, 130, 0);
+        call_takes(&mut l, 140, 150, 0);
+        assert!(l.positions().contains(&100), "{:?}", l.positions());
+    }
+
+    /// A cut that restores a point makes it a request's: the prompt call that
+    /// continues from it ends in a point that a reply's calls leave standing.
+    #[test]
+    fn a_restored_point_continues_as_a_requests() {
+        let mut l = Ledger::new(3, 0).expect("a ledger");
+        call_takes(&mut l, 0, 100, 0);
+        call_takes(&mut l, 110, 120, 0);
+        l.cut(110, 120).expect("a restore");
+        l.applied();
+        call_takes(&mut l, 110, 200, 0);
+        call_takes(&mut l, 210, 220, 0);
+        call_takes(&mut l, 230, 240, 0);
+        assert!(l.positions().contains(&200), "{:?}", l.positions());
     }
 
     /// A cut frees the slots of the points it drops, and a take fills a
