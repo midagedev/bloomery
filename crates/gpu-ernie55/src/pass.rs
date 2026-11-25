@@ -38,7 +38,9 @@ pub fn prompt(model: &mut GpuModel<Body>, tokens: &[u32]) -> Result<u32, GpuErro
         .ok()
         .and_then(|n| from.checked_add(n))
         .ok_or_else(|| GpuError::shape(CALL, "ids past u32"))?;
-    let marks = model.body(CALL)?.ckpt.marks(from, to);
+    let (_, _, body) = model.body_parts(CALL)?;
+    body.ckpt.call(from);
+    let marks = body.ckpt.marks(from, to);
     let mut token = None;
     let mut at = from;
     for mark in marks {

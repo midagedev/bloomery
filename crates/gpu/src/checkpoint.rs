@@ -287,6 +287,16 @@ impl Checkpoints {
         }
     }
 
+    /// A prompt call begins at `from`, the position the model stands at,
+    /// ahead of its takes ([`Ledger::call`]): a call that begins after steps,
+    /// a reply's own, takes points that leave before the end of the request's
+    /// prompt. Nothing with no store to copy.
+    pub fn call(&mut self, from: u32) {
+        if let Some(ledger) = self.ledger.as_mut() {
+            ledger.call(from);
+        }
+    }
+
     /// The positions a prompt call from `from` to `to` takes a checkpoint at;
     /// with no store to copy, the call's end alone.
     #[must_use]
@@ -813,6 +823,10 @@ pub trait Marked: ChainBody {
     /// ([`Checkpoints::marks`] of the body's checkpoints).
     fn marks(&self, from: u32, to: u32) -> Vec<u32>;
 
+    /// A prompt call begins at `from` ([`Checkpoints::call`] of the body's checkpoints), ahead of
+    /// its checkpoints.
+    fn call(&mut self, from: u32);
+
     /// A checkpoint at `pos`, the position the stores stand at, after any waiting cut; nothing
     /// where one stands. Refused by name when the stores hold another position.
     fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError>;
@@ -838,7 +852,9 @@ pub fn prompt_marked<B: Marked>(
         .ok()
         .and_then(|n| from.checked_add(n))
         .ok_or_else(|| GpuError::shape(CALL, "ids past u32"))?;
-    let marks = model.body(CALL)?.marks(from, to);
+    let (_, _, body) = model.body_parts(CALL)?;
+    body.call(from);
+    let marks = body.marks(from, to);
     let mut token = None;
     let mut at = from;
     for mark in marks {
