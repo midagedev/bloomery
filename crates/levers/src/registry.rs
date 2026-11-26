@@ -1198,8 +1198,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               and runs the streamed slots there beside the card's stacks; a MiniMax-M3.1 or \
               Mistral Large 4 load (the gates' seats, `Body::set_xstream`) takes it through the \
               common prompt walk, and a Hy4-flash or ERNIE 5.5 load through its placed prompt pass \
-              (a load that runs its prompt stepped streams nothing: `split` set there is refused by \
-              name, ERNIE 5.5's `admit` too; ERNIE 5.5's MXFP4 experts have no route GEMM entry, \
+              (a load that runs its prompt stepped streams nothing: `split` set there is refused \
+              by name, ERNIE 5.5's `admit` too; ERNIE 5.5's MXFP4 experts have no route GEMM entry, \
               so its `split` is refused by name even with the pass and unset runs `admit`). \
               Mistral Large 4 is the lever's host streaming (`admit`, V4.1's \
               `BLOOMERY_HOSTSTREAM` under another name) and its expert stream (`split`). Beside an \
