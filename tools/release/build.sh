@@ -853,7 +853,7 @@ for b in "${BINS[@]}"; do
     fail=1
   fi
 
-  targets=$("$STRINGS" -n 8 "$f" | sed -n 's/^\.target[[:space:]]\+\([a-z0-9_]*\).*/\1/p' | sort -u | tr '\n' ' ')
+  targets=$("$STRINGS" -n 8 "$f" | sed -n 's/^\.target[[:space:]][[:space:]]*\([a-z0-9_]*\).*/\1/p' | sort -u | tr '\n' ' ')
   if [ "$targets" != "$RELEASE_ARCH " ]; then
     echo "release: $b embeds PTX targets [$targets], not $RELEASE_ARCH alone" >&2
     fail=1
