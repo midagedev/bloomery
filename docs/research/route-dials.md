@@ -73,8 +73,13 @@ eval, a look and not a timed number.
 | bonus 0.1 | 75.3 % (p 1.0) | 73.7 % (p 1.0) | 97.0 % | 92.7 % (p 1.0) | 36.5 |
 | bonus 0.2 | 75.0 % (p 1.0) | 73.3 % (p 1.0) | 95.1 % | 90.9 % (p 0.25) | 42.2 |
 | top-k 5 | 75.3 % (p 1.0) | 74.0 % (p 0.69) | 96.3 % | 92.1 % | |
+| bonus 0.3 | 74.7 % | 74.3 % | 95.1 % | 90.9 % | |
 
 No arm differs from the unset one at these sample sizes.
+
+ERNIE 5.5 Flash Preview F8M4 on the same card took the same levers, and its eval was stopped early: unset KMMLU
+69.0 %, HumanEval 98.8 %, HumanEval+ 93.9 %, 43.4 decode ids/s (look); bonus 0.1 KMMLU 69.3 %, its other suites not
+run. ERNIE has no timed row and no perplexity yet.
 
 ## What is not known
 
@@ -86,6 +91,7 @@ No arm differs from the unset one at these sample sizes.
   themselves cost).
 - The cut is a one-column decode rule: a batched or speculative pass weighs all k slots.
 - The mask and the census have run in no timed or scored experiment yet.
+- ERNIE 5.5 has one score at one bonus and no timed row.
 
 ## Related: pass count and loop contrast on Inkling 2 Mini
 
