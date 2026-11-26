@@ -581,8 +581,8 @@ pub enum ToolFormat {
 }
 
 impl ToolFormat {
-    /// Whether the family's reasoning is a span only its own scan reads (Inkling 2's thinking
-    /// block, Muse Spark's message to `self`), not a `<think>` span a budget tracker can close.
+    /// Whether the family's reasoning is a span only its own scan reads (a thinking block, a
+    /// message to `self`), not a `<think>` span a budget tracker can close.
     pub(crate) fn scans_own_reasoning(self) -> bool {
         matches!(self, ToolFormat::Inkling | ToolFormat::MuseSpark)
     }
