@@ -12,7 +12,7 @@ use common::{msg, post, start_templated, tool_call as call};
 use serde_json::{Value, json};
 use serve::callstream::CallPiece;
 use serve::dsml::{ChatParser, MarkupError, Message, ToolFormat, Tools};
-use serve::inkling::InklingError;
+use serve::inkling::{ANSWER, InklingError};
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
 
@@ -420,8 +420,120 @@ fn hw_inkling2_templates_render_as_the_reference() {
                 continue;
             }
             assert_eq!(r.status, 200, "{key} {}: {}", case["name"], r.body);
-            assert_eq!(r.json()["prompt"], case["prompt"], "{key} {}", case["name"]);
+            // PIN(2026-11-27): the reference renders the template alone; the server ends the
+            // prompt of a request for no thinking in the answer block, which the template does not
+            // write (`hw_inkling2_thinking_off_ends_the_prompt_in_the_answer_block`).
+            let ends = if case["body"]["reasoning_effort"] == "none" {
+                ANSWER
+            } else {
+                ""
+            };
+            let want = format!("{}{ends}", case["prompt"].as_str().expect("a prompt"));
+            assert_eq!(r.json()["prompt"], json!(want), "{key} {}", case["name"]);
         }
+    }
+}
+
+/// The reference's render of the case `name` of the template `key` (`mini` or `small`).
+fn reference(key: &str, name: &str) -> String {
+    let fixture: Value = serde_json::from_str(RENDERS).expect("fixture JSON");
+    fixture["templates"][key]["cases"]
+        .as_array()
+        .expect("cases")
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("{key}: no case {name}"))["prompt"]
+        .as_str()
+        .expect("a prompt")
+        .to_owned()
+}
+
+/// A request for no thinking ends the prompt in the answer block: `reasoning_effort: "none"`,
+/// `enable_thinking: false` (top level and in `chat_template_kwargs`), a kwargs `reasoning_effort`
+/// of `"none"` and `reasoning_budget: 0` each render the template's effort-0 prompt and then
+/// `<|message_model|><|content_text|>`, the template's own start of an assistant turn that is
+/// only text, so the model writes no thinking block. The template writes no such prompt itself
+/// (it ends at the last message and the model opens its own block, thinking among them), and a
+/// request that asks for thinking or for nothing renders as the template does, byte for byte, as
+/// does one that asks for no generation prompt. Mutant: a server that appends nothing renders the
+/// effort-0 prompt alone for each spelling.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_inkling2_thinking_off_ends_the_prompt_in_the_answer_block() {
+    for (key, template) in [("mini", MINI), ("small", SMALL)] {
+        let addr = start("", template);
+        let prompt = |extra: &Value| -> String {
+            let mut body = json!({"messages": [{"role": "user", "content": "Hello"}]});
+            body.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            let r = post(addr, "/apply-template", &body);
+            assert_eq!(r.status, 200, "{key} {extra}: {}", r.body);
+            r.json()["prompt"].as_str().expect("a prompt").to_owned()
+        };
+        let stop = format!("{}{ANSWER}", reference(key, "effort none"));
+        for extra in [
+            json!({"reasoning_effort": "none"}),
+            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+            json!({"enable_thinking": false}),
+            json!({"chat_template_kwargs": {"reasoning_effort": "none"}}),
+            json!({"reasoning_budget": 0}),
+            json!({"reasoning_effort": "none", "enable_thinking": false, "reasoning_budget": 0}),
+        ] {
+            assert_eq!(prompt(&extra), stop, "{key} {extra}");
+        }
+        for (name, extra) in [
+            ("a user turn", json!({})),
+            ("a user turn", json!({"enable_thinking": true})),
+            ("a user turn", json!({"reasoning_budget": -1})),
+            ("a user turn", json!({"reasoning_budget": null})),
+            ("effort low", json!({"reasoning_effort": "low"})),
+            ("effort max", json!({"reasoning_effort": "max"})),
+        ] {
+            assert_eq!(prompt(&extra), reference(key, name), "{key} {extra}");
+        }
+        assert_eq!(
+            prompt(&json!({"reasoning_effort": "none", "add_generation_prompt": false})),
+            reference(key, "effort none"),
+            "{key}: no generation prompt asked"
+        );
+    }
+}
+
+/// A request whose program starts at the first generated id writes no thinking and takes no
+/// answer block: a forced call writes its own header and a JSON document its own text, so under
+/// `reasoning_effort: "none"` they render the effort-0 prompt alone, while a `tool_choice: "auto"`
+/// request, whose model is free until it opens a call, ends in the answer block. Mutant: a server
+/// that appends the block whatever the program leaves a forced call's header after it.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_inkling2_a_program_that_starts_at_once_gets_no_answer_block() {
+    let addr = start("", MINI);
+    let prompt = |extra: Value| -> String {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": tools(),
+            "reasoning_effort": "none",
+        });
+        body.as_object_mut()
+            .expect("an object")
+            .extend(extra.as_object().expect("an object").clone());
+        let r = post(addr, "/apply-template", &body);
+        assert_eq!(r.status, 200, "{extra}: {}", r.body);
+        r.json()["prompt"].as_str().expect("a prompt").to_owned()
+    };
+    for extra in [
+        json!({"tool_choice": "required"}),
+        json!({"tool_choice": {"type": "function", "function": {"name": "get_weather"}}}),
+        json!({"response_format": {"type": "json_object"}}),
+    ] {
+        let p = prompt(extra.clone());
+        assert!(p.contains("Thinking effort level: 0<"), "{extra}: {p}");
+        assert!(!p.ends_with(ANSWER), "{extra}: {p}");
+    }
+    for extra in [json!({}), json!({"tool_choice": "auto"})] {
+        let p = prompt(extra.clone());
+        assert!(p.ends_with(ANSWER), "{extra}: {p}");
     }
 }
 
@@ -592,5 +704,257 @@ fn hw_inkling2_malformed_call_is_an_api_error() {
         |stream| common::unwatched(common::tool_body(tools(), stream)),
         "tool-call markup: tool call 0 (get_time) is not the template's call body: \"{\\\"name\\\":\\\"o\"",
         |body| common::fold_stream(body, &[]),
+    );
+}
+
+/// The message a chat answer carries as `(finish, reasoning, content, calls)`, whole or streamed.
+fn message_of(r: &common::Reply, stream: bool) -> (Value, String, String, Vec<Value>) {
+    assert_eq!(r.status, 200, "{}", r.body);
+    if stream {
+        let (finish, m) = common::fold_stream(&r.body, &[H, E]).expect("no error event");
+        return (
+            finish,
+            m["reasoning_content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            m["content"].as_str().unwrap_or_default().to_owned(),
+            m["calls"].as_array().cloned().unwrap_or_default(),
+        );
+    }
+    let v = r.json();
+    let c = &v["choices"][0];
+    let m = &c["message"];
+    (
+        c["finish_reason"].clone(),
+        m["reasoning_content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        m["content"].as_str().unwrap_or_default().to_owned(),
+        m["tool_calls"]
+            .as_array()
+            .map(|a| a.iter().map(|tc| tc["function"].clone()).collect())
+            .unwrap_or_default(),
+    )
+}
+
+/// A reply to a prompt that ends in the answer block is content from its first byte: the model
+/// is already inside a text block, so its text is the block's and its `<|end_message|>` closes it
+/// (it is no content), and a call block after it is read as ever, streamed and not. Mutant: a
+/// parser that starts between blocks leaves the block's end in the content.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_inkling2_a_reply_in_the_answer_block_is_content() {
+    let call = format!(
+        "{H}get_weather<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":\
+         {{\"city\":\"Paris\"}}}}{E}"
+    );
+    for stream in [false, true] {
+        let addr = start(&format!("Hello!{E}"), MINI);
+        let mut body = plain_body(stream);
+        body["reasoning_effort"] = json!("none");
+        let (finish, reasoning, content, calls) =
+            message_of(&post(addr, "/v1/chat/completions", &body), stream);
+        assert_eq!(
+            (finish, reasoning.as_str(), content.as_str(), calls.len()),
+            (json!("stop"), "", "Hello!", 0),
+            "stream {stream}"
+        );
+
+        let addr = start(&format!("On it.{E}{call}"), MINI);
+        let mut body = common::tool_body(tools(), stream);
+        body["reasoning_effort"] = json!("none");
+        let (finish, reasoning, content, calls) =
+            message_of(&post(addr, "/v1/chat/completions", &body), stream);
+        assert_eq!(
+            (finish, reasoning.as_str(), content.as_str()),
+            (json!("tool_calls"), "", "On it."),
+            "stream {stream}"
+        );
+        assert_eq!(
+            calls,
+            vec![json!({"name": "get_weather", "arguments": r#"{"city":"Paris"}"#})],
+            "stream {stream}"
+        );
+    }
+}
+
+/// `reasoning_budget` on Inkling 2 is 0 or -1: its thinking is a block of its own that the budget
+/// tracker (which reads `<think>` spans) cannot see, so a budget of 0 is the request for no
+/// thinking (the prompt ends in the answer block and the reply is content), -1 and no budget leave
+/// the model unrestricted, and any other budget is a 400 naming the field, on chat and on
+/// `/completion`, where a prompt that already ends in the answer block takes any budget as moot.
+/// Mutant: a server that accepts the budget answers 200 and never spends it.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_inkling2_a_budget_is_zero_or_refused() {
+    let addr = start(&format!("Hello!{E}"), MINI);
+    let chat = |extra: Value| {
+        let mut body = plain_body(false);
+        body.as_object_mut()
+            .expect("an object")
+            .extend(extra.as_object().expect("an object").clone());
+        post(addr, "/v1/chat/completions", &body)
+    };
+    let (_, reasoning, content, _) = message_of(&chat(json!({"reasoning_budget": 0})), false);
+    assert_eq!((reasoning.as_str(), content.as_str()), ("", "Hello!"));
+    for extra in [
+        json!({"reasoning_budget": -1}),
+        json!({"reasoning_budget": null}),
+    ] {
+        let r = chat(extra.clone());
+        assert_eq!(r.status, 200, "{extra}: {}", r.body);
+    }
+    let r = chat(json!({"reasoning_budget": 5}));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(
+        r.body.contains("reasoning_budget 5 is not supported")
+            && r.body.contains("\"param\":\"reasoning_budget\""),
+        "{}",
+        r.body
+    );
+    // A program that starts at once takes no budget on any family, and a request that asks for no
+    // generation prompt leaves no prompt to end in the answer block.
+    for extra in [
+        json!({"reasoning_budget": 0, "response_format": {"type": "json_object"}}),
+        json!({"reasoning_budget": 0, "tools": tools(), "tool_choice": "required"}),
+    ] {
+        let r = chat(extra.clone());
+        assert_eq!(r.status, 400, "{extra}: {}", r.body);
+        assert!(
+            r.body
+                .contains("reasoning_budget is not supported with structured output"),
+            "{extra}: {}",
+            r.body
+        );
+    }
+    let r = chat(json!({"reasoning_budget": 0, "add_generation_prompt": false}));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(
+        r.body.contains("reasoning_budget 0 is not supported")
+            && r.body
+                .contains("a chat request that asks for a generation prompt"),
+        "{}",
+        r.body
+    );
+    let raw = |prompt: &str| {
+        post(
+            addr,
+            "/completion",
+            &json!({"prompt": prompt, "n_predict": 4, "reasoning_budget": 3}),
+        )
+    };
+    let r = raw("<|message_user|><|content_text|>Hi<|end_message|>");
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(
+        r.body.contains("reasoning_budget 3 is not supported"),
+        "{}",
+        r.body
+    );
+    let r = raw(&format!(
+        "<|message_user|><|content_text|>Hi<|end_message|>{ANSWER}"
+    ));
+    assert_eq!(r.status, 200, "{}", r.body);
+}
+
+/// `/v1/messages/count_tokens`' `input_tokens` for a request body whose `extra` fields are added
+/// to one user message.
+fn counted(addr: std::net::SocketAddr, extra: Value) -> u64 {
+    let mut body = json!({"messages": [{"role": "user", "content": "Hello"}]});
+    body.as_object_mut()
+        .expect("an object")
+        .extend(extra.as_object().expect("an object").clone());
+    let r = post(addr, "/v1/messages/count_tokens", &body);
+    assert_eq!(r.status, 200, "{extra}: {}", r.body);
+    r.json()["input_tokens"].as_u64().expect("input_tokens")
+}
+
+/// Anthropic's `thinking: {"type": "disabled"}` is thinking off like the chat path's other
+/// switches: the prompt it renders is the one `chat_template_kwargs.enable_thinking: false`
+/// renders (the effort-0 prompt that ends in the answer block, counted by `count_tokens`), the
+/// reply is a text block from its first byte with no thinking block before it, and one that
+/// also sends `enable_thinking: true` in the kwargs is a 400 naming both. Mutant: a conversion
+/// that drops `disabled` leaves the prompt as it was, so the count moves and the block's end
+/// stays in the reply's text.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_inkling2_messages_thinking_disabled_is_thinking_off() {
+    let addr = start(&format!("Hello!{E}"), MINI);
+    let ask = |extra: Value| {
+        let mut body =
+            json!({"max_tokens": 64, "messages": [{"role": "user", "content": "Hello"}]});
+        body.as_object_mut()
+            .expect("an object")
+            .extend(extra.as_object().expect("an object").clone());
+        post(addr, "/v1/messages", &body)
+    };
+    let r = ask(json!({"thinking": {"type": "disabled"}}));
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(
+        r.json()["content"],
+        json!([{"type": "text", "text": "Hello!"}])
+    );
+    let off = counted(addr, json!({"thinking": {"type": "disabled"}}));
+    assert_eq!(
+        off,
+        counted(
+            addr,
+            json!({"chat_template_kwargs": {"enable_thinking": false}})
+        )
+    );
+    assert!(off > counted(addr, json!({})), "{off}");
+    assert_eq!(
+        counted(addr, json!({"thinking": {"type": "adaptive"}})),
+        counted(addr, json!({}))
+    );
+    let r = ask(json!({
+        "thinking": {"type": "disabled"},
+        "chat_template_kwargs": {"enable_thinking": true},
+    }));
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(
+        r.body.contains("thinking.type is disabled") && r.body.contains("opposite thinking"),
+        "{}",
+        r.body
+    );
+}
+
+/// `thinking: {"type": "enabled", "budget_tokens": N}` on Inkling 2 is not refused: clients send
+/// it on every request, and no tracker closes this model's thinking block, so the request runs
+/// with the thinking the template has, unbounded (the thinking block and the text block both
+/// come back), and the prompt is the one a request with no `thinking` renders. Mutant: a
+/// conversion that keeps the budget is the chat path's 400.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_inkling2_messages_enabled_budget_is_not_refused() {
+    let reply = format!("{H}<|content_thinking|>Greet back.{E}{H}<|content_text|>Hello!{E}");
+    let addr = start(&reply, MINI);
+    for budget in [2048, 1] {
+        let r = post(
+            addr,
+            "/v1/messages",
+            &json!({
+                "max_tokens": 400,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "thinking": {"type": "enabled", "budget_tokens": budget},
+            }),
+        );
+        assert_eq!(r.status, 200, "{budget}: {}", r.body);
+        assert_eq!(
+            r.json()["content"],
+            json!([
+                {"type": "thinking", "thinking": "Greet back.", "signature": ""},
+                {"type": "text", "text": "Hello!"},
+            ]),
+            "{budget}"
+        );
+    }
+    assert_eq!(
+        counted(
+            addr,
+            json!({"thinking": {"type": "enabled", "budget_tokens": 2048}})
+        ),
+        counted(addr, json!({}))
     );
 }

@@ -47,6 +47,11 @@ pub const TEXT: &str = "<|content_text|>";
 pub const TOOL_JSON: &str = "<|content_invoke_tool_json|>";
 /// Closes every block.
 pub const END: &str = "<|end_message|>";
+/// A header and a text block's opener: the template's own start of an assistant turn that is only
+/// text. A prompt that ends with it leaves the model inside its answer block, so it writes no
+/// thinking ([`InklingScan::in_answer`]); this is the generation prompt of a request for no
+/// thinking.
+pub const ANSWER: &str = "<|message_model|><|content_text|>";
 
 /// A generation whose block markup does not parse. `index` counts calls in the generation from 0.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -129,6 +134,14 @@ impl InklingScan {
             buf: String::new(),
             calls: 0,
         }
+    }
+
+    /// The scan of a generation whose prompt ended with [`ANSWER`]: the model is already inside a
+    /// text block, so its first text is the block's and the block's end closes it.
+    #[must_use]
+    pub fn in_answer(mut self) -> Self {
+        self.state = State::Text;
+        self
     }
 
     /// The scan of a request that asks for no tool call (no tools, or `tool_choice: "none"`): the

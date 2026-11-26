@@ -13,9 +13,17 @@
 //! `tool_result` blocks, `tools`, `tool_choice`, `stop_sequences`, `max_tokens`,
 //! `temperature`, `top_p`, `top_k`, `stream`, `chat_template_kwargs` — and
 //! `thinking.budget_tokens` to the chat path's `reasoning_budget`; the chat
-//! path's `reasoning_loop` passes as it is. `thinking`
-//! does not turn the template's thinking on: that stays the template's default
-//! or the request's `chat_template_kwargs`, as in llama-server. A system text that is
+//! path's `reasoning_loop` passes as it is. `thinking: {"type": "disabled"}` is
+//! the chat path's `enable_thinking: false`, so each template answers it as it
+//! answers that switch (honoured, approximated, or a 400 where the model always
+//! thinks). `thinking` otherwise does not turn the template's thinking on: that
+//! stays the template's default or the request's `chat_template_kwargs`, as in
+//! llama-server. On a template whose reasoning only its family's scan reads
+//! (Inkling 2, Muse Spark) a `budget_tokens` above 0 is not kept: no tracker can
+//! close that reasoning, and a client that sends the field on every request must
+//! not be refused, so the request runs with thinking as the template has it,
+//! unbounded, and the server's stderr names the dropped cap once
+//! ([`unkept_budget`]). A system text that is
 //! Claude Code's billing header has its per-request `cch` stamp written as
 //! `fffff` ([`normalize_billing_header`]), so the prompt cache reaches past it.
 //! Other fields are ignored, as on the OpenAI path (`cache_control` and
@@ -68,13 +76,19 @@ const CCH_LEN: usize = 5;
 /// `POST /v1/messages`.
 pub(super) fn messages(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let parsed = body(req).and_then(|b| {
-        let chat = to_chat(&b, true)?;
+        let mut chat = to_chat(&b, true)?;
+        let unkept = unkept_budget(state, &mut chat);
         // Anthropic has no `reasoning_format`: the chat path's default, which
         // splits the think span off into the thinking block.
-        Ok((Ids::new(state, &b), chat_plan(state, &chat, None)?))
+        Ok((Ids::new(state, &b), chat_plan(state, &chat, None)?, unkept))
     });
     let (ids, plan) = match parsed {
-        Ok(x) => x,
+        Ok((ids, plan, unkept)) => {
+            if let Some(budget) = unkept {
+                state.shared.note(unkept_line(&ids, budget));
+            }
+            (ids, plan)
+        }
         Err(e) => return send_error(w, req, &e),
     };
     if plan.p.stream {
@@ -82,6 +96,32 @@ pub(super) fn messages(state: &State, req: &Request, w: &mut TcpStream) -> io::R
     } else {
         whole(state, req, w, &ids, plan)
     }
+}
+
+/// The `thinking.budget_tokens` this request's template cannot keep, taken out of the chat
+/// body: a template whose reasoning only its family's scan reads
+/// ([`ToolFormat::scans_own_reasoning`]) has no tracker that closes it, so a budget above 0
+/// would be refused there as the chat path's `reasoning_budget` is. Anthropic clients send the
+/// field on every request, so the request runs with thinking as the template has it and
+/// [`unkept_line`] says so. A budget of 0 stays: the chat path reads it as no thinking.
+fn unkept_budget(state: &State, chat: &mut Map<String, Value>) -> Option<u64> {
+    if !state.tool_format.scans_own_reasoning() {
+        return None;
+    }
+    let budget = chat.get("reasoning_budget")?.as_u64().filter(|&n| n > 0)?;
+    chat.remove("reasoning_budget");
+    Some(budget)
+}
+
+/// The stderr line naming a cap [`unkept_budget`] dropped, once per request, after the id the
+/// answer carries.
+fn unkept_line(ids: &Ids, budget: u64) -> String {
+    format!(
+        "bloomery-serve: request {} /v1/messages: thinking.budget_tokens {budget} is not kept: \
+         this chat template's reasoning is not a <think> span a budget can close, so thinking \
+         runs unbounded",
+        ids.id
+    )
 }
 
 /// `POST /v1/messages/count_tokens`: `{"input_tokens": N}`, N the ids of the
@@ -133,6 +173,25 @@ fn to_chat(b: &Map<String, Value>, generate: bool) -> Result<Map<String, Value>,
     }
     let mut chat = Map::new();
     chat.insert("messages".into(), Value::Array(messages));
+    match thinking(set(b, "thinking"))? {
+        Thinking::Default => {}
+        Thinking::Off => {
+            let kwargs_on = b
+                .get("chat_template_kwargs")
+                .and_then(|kw| kw.get("enable_thinking"))
+                == Some(&Value::Bool(true));
+            if kwargs_on {
+                return Err(invalid(
+                    "thinking.type is disabled but chat_template_kwargs.enable_thinking is true: \
+                     they ask for opposite thinking, send one of them",
+                ));
+            }
+            chat.insert("enable_thinking".into(), Value::Bool(false));
+        }
+        Thinking::Budget(n) => {
+            chat.insert("reasoning_budget".into(), json!(n));
+        }
+    }
     if let Some(t) = set(b, "tools") {
         chat.insert("tools".into(), tools(t)?);
     }
@@ -157,9 +216,6 @@ fn to_chat(b: &Map<String, Value>, generate: bool) -> Result<Map<String, Value>,
             chat.insert(key.into(), v.clone());
         }
     }
-    if let Some(budget) = thinking_budget(set(b, "thinking"))? {
-        chat.insert("reasoning_budget".into(), json!(budget));
-    }
     Ok(chat)
 }
 
@@ -176,12 +232,19 @@ fn max_tokens(b: &Map<String, Value>) -> Result<i64, ApiError> {
     }
 }
 
-/// The think-span budget `thinking` asks for: `enabled` with its
-/// `budget_tokens` (an integer of at least 0, required), `disabled` and
-/// `adaptive` none.
-fn thinking_budget(v: Option<&Value>) -> Result<Option<u64>, ApiError> {
+/// What `thinking` asks of the chat path.
+enum Thinking {
+    /// No `thinking`, or `adaptive`: the template's default.
+    Default,
+    /// `disabled`: thinking off.
+    Off,
+    /// `enabled` with its `budget_tokens`, an integer of at least 0, required.
+    Budget(u64),
+}
+
+fn thinking(v: Option<&Value>) -> Result<Thinking, ApiError> {
     let Some(v) = v else {
-        return Ok(None);
+        return Ok(Thinking::Default);
     };
     match v.get("type").and_then(Value::as_str) {
         Some("enabled") => {
@@ -195,13 +258,14 @@ fn thinking_budget(v: Option<&Value>) -> Result<Option<u64>, ApiError> {
                     .filter(|f| f.fract() == 0.0 && *f >= 0.0 && *f < u64::MAX as f64)
                     .map(|f| f as u64)
             });
-            budget.map(Some).ok_or_else(|| {
+            budget.map(Thinking::Budget).ok_or_else(|| {
                 invalid(format!(
                     "thinking.budget_tokens must be an integer of at least 0, not {n}"
                 ))
             })
         }
-        Some("disabled" | "adaptive") => Ok(None),
+        Some("disabled") => Ok(Thinking::Off),
+        Some("adaptive") => Ok(Thinking::Default),
         _ => Err(invalid(format!(
             "thinking must be an object whose type is enabled, disabled or adaptive, not {v}"
         ))),

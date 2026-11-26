@@ -1151,6 +1151,14 @@ fn watch(
     )))
 }
 
+/// Whether the request's fields ask for a program that starts with the first generated id: a
+/// forced tool call or a JSON `response_format`. A field [`request`] refuses is read as asking for
+/// none; the refusal is made where the request runs.
+pub(crate) fn starts_at_once(o: &Map<String, Value>) -> bool {
+    matches!(tool_choice(o), Ok(Some(_)))
+        || matches!(response_schema(o), Ok(Reply::Schema(_) | Reply::Object))
+}
+
 /// The constraint a request's fields ask for, `None` for a request that
 /// asks for none. A tool call and a schema together are refused: a request
 /// has one program.

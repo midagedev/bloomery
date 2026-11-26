@@ -317,7 +317,7 @@ impl Shared {
 
     /// One of the server's per-request stderr lines. The tests collect it
     /// instead: the engine thread's stderr is beyond a test's capture.
-    fn note(&self, line: String) {
+    pub(crate) fn note(&self, line: String) {
         #[cfg(test)]
         relock(&self.stderr_lines).push(line);
         #[cfg(not(test))]

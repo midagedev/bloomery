@@ -59,7 +59,7 @@ pub(crate) use program::{Constraint, Decision, Draw, Part, StepError, Style, Wal
 pub(crate) use raw::Ends;
 pub(crate) use schema::{
     Arg, Ask, Call, CallMode, Fun, Order, any_start, call, is_text, object_parameters, outside,
-    request, value,
+    request, starts_at_once, value,
 };
 pub(crate) use vocab::Vocab;
 
