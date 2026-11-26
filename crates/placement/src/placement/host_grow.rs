@@ -11,9 +11,13 @@
 //!
 //! The plan's host need is the cap's whatever the floor: the experts kept at load count in it,
 //! and the K/V's growth they will yield to does not, so the headroom a churn pool budgets from
-//! is the static plan's. Nothing here touches a device or a mapping: the host residency
-//! machine (`bloomery_gpu::host::residency`) drops the pages a yield names, and the K/V rooms'
-//! fit (`bloomery_gpu::room::host_grow`) asks it to.
+//! is the static plan's. The room the floor leaves free beyond that — the window the split
+//! reserves is idle until the first yield — is the churn pool's: the split budgets it
+//! ([`HostGrow::pool_bytes`]) before the growth takes the room, keeps every paged expert at
+//! load, and lists the pool's and the window's bytes as yields beside the growth's, given up
+//! with the first page past the floor. Nothing here touches a device or a mapping: the host
+//! residency machine (`bloomery_gpu::host::residency`) drops the pages a yield names, and the
+//! K/V rooms' fit (`bloomery_gpu::room::host_grow`) asks it to.
 //!
 //! [`expert_nvme_tier`]: super::expert_nvme_tier
 
@@ -87,9 +91,18 @@ pub struct HostGrow {
     /// The experts the load keeps on the host that the static plan pages at the cap, the first
     /// to yield first; their bytes are in [`super::HostTotals::expert_bytes`].
     pub yields: Vec<Yield>,
-    /// The bytes of [`HostGrow::yields`].
+    /// The bytes of [`HostGrow::yields`]: the growth's, and past it the churn pool's and the
+    /// window's, which the load keeps on the host until the first page past the floor.
     pub yield_bytes: u64,
     pub hold: GrowHold,
+    /// Whether the split budgets the churn pool's room ahead of the growth
+    /// ([`HostGrow::pool_bytes`]); set with the growth. A load that hosts no pool pays for the
+    /// room all the same (its yields pass the growth); a caller that knows it hosts none clears
+    /// this before the split and gets the plan that charges the growth alone.
+    pub pool_room: bool,
+    /// The churn pool's bytes the split budgeted: the headroom a pool fits is these and the
+    /// split's rounding. 0 where no pool was, or the room the floor leaves free cannot hold one.
+    pub pool_bytes: u64,
 }
 
 /// How far a load's yields have gone: the count of [`HostGrow::yields`] given up, first to
@@ -102,7 +115,8 @@ pub struct YieldCursor {
 
 /// The yields a growth step asks for ([`HostGrow::due`]): `yields[from..to]` of
 /// [`HostGrow::yields`], `bytes` of them, for a growth `shortfall` bytes past what the plan
-/// charged and the yields done so far hold.
+/// charged and the yields done so far hold; the first step past the floor includes the bytes
+/// the plan listed beyond the growth.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct YieldAsk {
     pub from: usize,
@@ -139,6 +153,8 @@ impl HostGrow {
             yields: Vec::new(),
             yield_bytes: 0,
             hold: GrowHold::Room,
+            pool_room: true,
+            pool_bytes: 0,
         }
     }
 
@@ -158,7 +174,7 @@ impl HostGrow {
     }
 
     /// The host K/V bytes the plan's host need counts: the floor's and the growth the yields
-    /// do not cover.
+    /// do not cover (none past the floor where the yields pass the growth).
     #[must_use]
     pub fn charged(&self) -> u64 {
         self.floor_bytes
@@ -173,10 +189,16 @@ impl HostGrow {
 
     /// The yields a fit asks for that backs `asks` bytes of new host pages beside the `held`
     /// bytes of host K/V the process holds, with `at` yields done: none for a fit that backs
-    /// no new host page, or while `held + asks` is within what the plan charged and the done
-    /// yields hold; else the fewest next yields whose bytes reach the shortfall plus `page`
-    /// (the room's next page, so the next fit does not ask at once), or every one left when
-    /// they do not.
+    /// no new host page, or while `held + asks` is within the floor or within what the plan
+    /// charged and the done yields hold; else the fewest next yields whose bytes reach the
+    /// shortfall plus `page` (the room's next page, so the next fit does not ask at once), or
+    /// every one left when they do not.
+    ///
+    /// The books are the floor and the growth less every yield, plus the yields done
+    /// ([`HostGrow::charged`], without its floor at zero): a plan whose yields pass the growth
+    /// (the churn pool's and the window's bytes) has books under the floor until those yields
+    /// are done, so the first page past the floor asks for them with the growth's own, the
+    /// physical host holding the floor's state and the pool until then and the cap's after.
     ///
     /// Refused by name ([`GrowShort`]) only when the bytes the host already holds pass what
     /// the plan charged and every yield holds: a fit's asks count every new page a host-capable
@@ -189,11 +211,14 @@ impl HostGrow {
         at: YieldCursor,
         page: u64,
     ) -> Result<Option<YieldAsk>, GrowShort> {
-        let allowed = self.charged().saturating_add(at.bytes);
-        let backed = held.saturating_add(asks);
-        let Some(shortfall) = backed.checked_sub(allowed).filter(|&s| s > 0 && asks > 0) else {
+        let floor = i128::from(self.floor_bytes);
+        let allowed = floor + i128::from(self.grow_bytes) - i128::from(self.yield_bytes)
+            + i128::from(at.bytes);
+        let backed = i128::from(held) + i128::from(asks);
+        if asks == 0 || backed <= allowed.max(floor) {
             return Ok(None);
-        };
+        }
+        let shortfall = u64::try_from(backed - allowed).unwrap_or(u64::MAX);
         let want = shortfall.saturating_add(page);
         let rest = self.yields.get(at.done..).unwrap_or(&[]);
         let mut bytes = 0u64;
@@ -205,11 +230,12 @@ impl HostGrow {
             bytes = bytes.saturating_add(y.bytes);
             to += 1;
         }
-        if bytes < shortfall && held > allowed.saturating_add(bytes) {
+        let held_with = allowed + i128::from(bytes);
+        if bytes < shortfall && i128::from(held) > held_with {
             return Err(GrowShort {
                 held,
                 asks,
-                allowed: allowed.saturating_add(bytes),
+                allowed: u64::try_from(held_with.max(0)).unwrap_or(u64::MAX),
                 left: bytes,
             });
         }
@@ -243,7 +269,15 @@ impl fmt::Display for HostGrow {
             self.yields.len(),
             self.yield_bytes,
             self.hold.name()
-        )
+        )?;
+        if self.pool_bytes > 0 {
+            write!(
+                f,
+                ", {} B of room kept free at load for the churn pool",
+                self.pool_bytes
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -354,6 +388,8 @@ mod tests {
             yield_bytes: units.iter().sum(),
             yields,
             hold: GrowHold::Yields,
+            pool_room: false,
+            pool_bytes: 0,
         }
     }
 
@@ -482,6 +518,90 @@ mod tests {
                 left: 300
             }),
             "short with the yields left: none is made"
+        );
+    }
+
+    /// Yields past the growth (the churn pool's and the window's bytes beside it) are asked with
+    /// the first page past the floor and none before it: inside the floor nothing yields, the
+    /// first page past it asks the growth's shortfall and the bytes listed beyond the growth
+    /// (the books under the floor until they are done), then each page asks its own, and the
+    /// cap with every yield done holds. FAIL-first: books clamped at the floor (the old
+    /// `charged`) ask the first page for 300 B at a shortfall of 50 B, not 600 B at 550 B; a
+    /// `due` with no floor clause asks 600 B at the floor itself.
+    #[test]
+    fn yields_past_the_growth_are_asked_with_the_first_page_past_the_floor() {
+        // 1,000 B at the floor, 1,000 B of growth, five yields of 300 B: 500 B past the growth.
+        let g = grow(1_000, 1_000, &[300, 300, 300, 300, 300]);
+        assert_eq!(g.charged(), 1_000, "the growth's books are the floor's");
+        let start = YieldCursor::default();
+        assert_eq!(g.due((900, 100), start, 50), Ok(None), "at the floor");
+        assert_eq!(
+            g.due((0, 0), start, 50),
+            Ok(None),
+            "a fit that backs no page"
+        );
+        // 1,050 B backed: books 500 B, 550 B short, 600 B with the page: two yields.
+        assert_eq!(
+            g.due((1_000, 50), start, 50),
+            Ok(Some(YieldAsk {
+                from: 0,
+                to: 2,
+                bytes: 600,
+                shortfall: 550
+            }))
+        );
+        let two = YieldCursor {
+            done: 2,
+            bytes: 600,
+        };
+        assert_eq!(
+            g.due((1_000, 100), two, 50),
+            Ok(None),
+            "1,100 B hold the two"
+        );
+        assert_eq!(
+            g.due((1_000, 101), two, 50)
+                .map(|a| a.map(|a| (a.from, a.to, a.shortfall))),
+            Ok(Some((2, 3, 1))),
+            "then a page asks its own bytes"
+        );
+        let all = YieldCursor {
+            done: 5,
+            bytes: 1_500,
+        };
+        let cap = g.cap_bytes();
+        assert_eq!(
+            g.due((cap - 100, 100), all, 50),
+            Ok(None),
+            "the cap with every yield"
+        );
+        assert_eq!(
+            g.due((cap + 1, 0), all, 50),
+            Ok(None),
+            "a fit that backs nothing"
+        );
+        let past = g.due((cap + 1, 1), all, 50).expect_err("past the cap");
+        assert_eq!((past.held, past.allowed, past.left), (cap + 1, cap, 0));
+        // With the first two done the host is within the books at the floor still: the shortfall
+        // a fit makes counts from the books, not from the floor.
+        let short = g.due((cap, 1), two, 50).expect("yields left to make room");
+        assert_eq!(
+            short.map(|a| (a.from, a.to)),
+            Some((2, 5)),
+            "every yield left"
+        );
+    }
+
+    /// The Display line says what the yields past the growth are for.
+    #[test]
+    fn the_line_names_the_pool_room_only_where_there_is_one() {
+        let mut g = grow(1_000, 1_000, &[300, 300, 300, 300, 300]);
+        assert!(!g.to_string().contains("churn pool"), "{g}");
+        g.pool_bytes = 500;
+        assert!(
+            g.to_string()
+                .ends_with(", 500 B of room kept free at load for the churn pool"),
+            "{g}"
         );
     }
 

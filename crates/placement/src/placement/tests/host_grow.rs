@@ -6,7 +6,7 @@
 use std::sync::{Arc, LazyLock};
 
 use super::*;
-use bloomery_levers::KvHost;
+use bloomery_levers::{KvHost, Room, RoomShort};
 use runtime::stores::{Access, PosBuf, PosLayout};
 
 /// A position's ring-shadow bytes a layer: host rooms that grow with the positions.
@@ -19,9 +19,10 @@ const PAGES: u64 = 1_000;
 /// The host terms beside the routed experts.
 const BESIDE: u64 = 1_000;
 
-static ROOMS: LazyLock<PosLayout> = LazyLock::new(|| {
+/// `layers` layers of one host-able room each.
+fn rooms_of(layers: usize) -> PosLayout {
     PosLayout::new(
-        (0..4)
+        (0..layers)
             .map(|_| {
                 vec![PosBuf {
                     what: "selected",
@@ -33,11 +34,19 @@ static ROOMS: LazyLock<PosLayout> = LazyLock::new(|| {
             })
             .collect(),
     )
-});
+}
 
-/// Four layers of 100 B of state and 8 B a position, with a ring shadow of [`SHADOW`] B a
-/// position on the host.
-struct Shadowed;
+static ROOMS: LazyLock<PosLayout> = LazyLock::new(|| rooms_of(4));
+/// The rooms of the [`WIDE`]-layer model the pool tests plan.
+static WIDE_ROOMS: LazyLock<PosLayout> = LazyLock::new(|| rooms_of(WIDE));
+
+/// The layers of the model the pool tests plan, past [`layered`]'s four: the window the split
+/// reserves is one layer's host experts, the churn pool takes every layer's.
+const WIDE: usize = 16;
+
+/// Layers of 100 B of state and 8 B a position, with a ring shadow of [`SHADOW`] B a position
+/// on the host, over the rooms it is given.
+struct Shadowed(&'static LazyLock<PosLayout>);
 
 impl KvBytes for Shadowed {
     fn layer_bytes(&self, _layer: usize, ctx_max: u64) -> u64 {
@@ -49,7 +58,7 @@ impl KvBytes for Shadowed {
     }
 
     fn rooms(&self) -> Option<&PosLayout> {
-        Some(&*ROOMS)
+        Some(&**self.0)
     }
 
     fn host_yields(&self) -> bool {
@@ -59,11 +68,16 @@ impl KvBytes for Shadowed {
 
 /// The four layers on a card that holds some of the experts, beside a host of `room`.
 fn machine(room: u64) -> Machine {
+    machine_of(4, 3, room)
+}
+
+/// `layers` layers on a card that holds `held` experts of each, beside a host of `room`.
+fn machine_of(layers: usize, held: u64, room: u64) -> Machine {
     Machine {
         cards: vec![bytes_card(
             "stage",
-            HEAD + 4 * (100 + 8 * CAP) + 12 * EXPERT,
-            0..4,
+            HEAD + layers as u64 * (100 + 8 * CAP + held * EXPERT),
+            0..layers,
         )],
         tiers: Vec::new(),
         nodes: vec![Node {
@@ -102,10 +116,12 @@ fn grown_under<'a>(
         expert_rank: rank,
         ..PlanLevers::default()
     };
-    let mut plan = plan(model, machine, CAP, &Shadowed, &levers)?;
+    let mut plan = plan(model, machine, CAP, &Shadowed(&ROOMS), &levers)?;
     if !arm {
         plan.host.grow = HostGrow::default();
     }
+    // The tests of the yields' order and the books charge the growth alone.
+    plan.host.grow.pool_room = false;
     if lever != KvHost::Off {
         plan.kv_host_planes(PAGES, 0)?;
     }
@@ -398,4 +414,315 @@ fn a_growth_step_yields_the_shortfall_plus_a_page() {
         .due((g.cap_bytes() + 1, 64), all, 64)
         .expect_err("a host past the cap");
     assert_eq!((past.held - past.allowed, past.left), (1, 0));
+}
+
+/// The experts a layer the card is sized to hold in the pool tests (it holds 3 or 4 of each):
+/// the pool's pinned count runs 0 to 1, the ceiling `room_for` leaves the fewest layer less
+/// the spare and the one that moves.
+const POOL_HELD: u64 = 3;
+
+/// The K/V growth the pool tests plan: 48 experts' bytes, host pages and the shadows' growth.
+const POOL_GROWTH: u64 = 48 * EXPERT;
+
+/// A [`WIDE`]-layer plan whose growth to the cap is [`POOL_GROWTH`], made as [`grown_under`]
+/// makes one with its growth charged at the floor, with the churn pool's room budgeted when
+/// `pool` is set.
+fn pooled<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    pool: bool,
+) -> Result<Plan<'a>, PlacementError> {
+    let levers = PlanLevers {
+        kv_floor: Some(FLOOR),
+        kv_host: KvHost::Spill,
+        ..PlanLevers::default()
+    };
+    let mut plan = plan(model, machine, CAP, &Shadowed(&WIDE_ROOMS), &levers)?;
+    let shadows = plan.host.grow.grow_bytes;
+    plan.kv_host_planes(POOL_GROWTH - shadows, 0)?;
+    plan.host.grow.pool_room = pool;
+    let room = plan.plan_at(&(machine.host().usable_bytes, workstation::HostRead::Given));
+    expert_nvme_tier(&mut plan, room, Some(0))?;
+    Ok(plan)
+}
+
+/// The host need of the pool model's plan at the floor, every host expert resident and the
+/// K/V at its floor: the room that leaves `slack` free is this plus it.
+fn floor_need(model: &ModelTensors, held: u64) -> u64 {
+    let ample = machine_of(WIDE, held, 1 << 40);
+    let base = pooled(model, &ample, true).expect("the plan at an ample room");
+    assert_eq!(
+        base.host.grow.hold,
+        GrowHold::Room,
+        "an ample room splits nothing"
+    );
+    assert_eq!(base.host.grow.grow_bytes, POOL_GROWTH);
+    let cap = u64::try_from(workstation::HostNeed::of(&base, 0).exact(true)).expect("u64");
+    cap - POOL_GROWTH
+}
+
+/// What a plan's pool of `pinned` seed experts a layer takes on the card.
+fn pool_at(plan: &Plan<'_>, pinned: usize) -> u64 {
+    churn::ChurnPool::of(plan, 0, pinned)
+        .expect("the pool")
+        .bytes
+}
+
+/// The unset residency word's pick over `plan` made at `room`: what the climb of `room_for`
+/// makes of the plan's headroom and of what the room leaves past its need.
+fn pick_over(plan: &Plan<'_>, room: u64) -> Room {
+    bloomery_levers::room_for::<std::convert::Infallible>(
+        false,
+        0,
+        1,
+        plan.n_l.iter().copied(),
+        |pinned| Ok(pool_at(plan, pinned)),
+        churn::ChurnPool::room(plan, 0),
+        workstation::HostNeed::of(plan, 0).room_left(&(room, workstation::HostRead::Given)),
+    )
+    .expect("an infallible pool")
+}
+
+/// The window the split reserves on the pool model's plan: two of its heaviest layer's host
+/// experts.
+fn window_of(plan: &Plan<'_>) -> u64 {
+    let heavy = plan
+        .n_l
+        .iter()
+        .map(|&n| (8 - n) * EXPERT)
+        .max()
+        .expect("layers");
+    2 * heavy
+}
+
+/// A plan whose room the growth passes by more than the window holds still budgets the churn
+/// pool the floor's free room can take: the split rounds the headroom down to a sliver and the
+/// unset word goes `off` (`pool_unhostable`) for want of room, though the host holds every host
+/// expert and the K/V's floor with room to spare, and the window the split reserves is idle
+/// until the first yield. That room is the pool's: the yields the plan lists are the growth's,
+/// the window's and the pool's. Here the room is 44 experts, the pool of one pinned expert a
+/// layer is 40 and of none 56: the word's pool at its first pinned count is refused as before,
+/// and the climb ends at 1.
+///
+/// FAIL-first: a split that budgets no pool leaves the headroom at 0 and the pick ends
+/// `PoolUnhostable { needs: 23040, headroom: 0, mem_left: 0 }`; a `HostNeed` that does not take
+/// the yields past the K/V's out of the reserves leaves it at 22,144 B and the pick ends the
+/// same way.
+#[test]
+fn a_churn_pool_the_floors_free_room_holds_is_budgeted_before_the_growth() {
+    let model = layered(WIDE);
+    let slack = 44 * EXPERT;
+    let room = floor_need(&model, POOL_HELD) + slack;
+    let tight = machine_of(WIDE, POOL_HELD, room);
+    let plan = pooled(&model, &tight, true).expect("the plan at the floor");
+    match pick_over(&plan, room) {
+        Room::MovedForPool { from: 0, to: 1 } => {}
+        other => panic!("the pool of the first count that fits: {other:?}"),
+    }
+    let g = &plan.host.grow;
+    assert_eq!(g.hold, GrowHold::Yields, "{g}");
+    assert_eq!(plan.nvme_bytes, 0, "every expert is on the host at load");
+    assert!(
+        (pool_at(&plan, 1)..pool_at(&plan, 0)).contains(&slack),
+        "the free room holds the pool of one pinned expert a layer and not of none"
+    );
+    // The pool's room is the floor's free room, the yields the growth, the window and it.
+    assert_eq!(g.pool_bytes, slack);
+    let window = window_of(&plan);
+    let owed = POOL_GROWTH + window;
+    assert!(
+        (owed..owed + EXPERT).contains(&g.yield_bytes),
+        "{} B of yields for the growth's {POOL_GROWTH} B and the window's {window} B",
+        g.yield_bytes
+    );
+    let headroom = u64::try_from(plan.host.headroom_bytes).expect("a headroom");
+    assert!(
+        (slack..slack + EXPERT).contains(&headroom),
+        "the headroom is the room and the split's rounding: {headroom} B"
+    );
+    assert!(
+        g.to_string()
+            .contains("kept free at load for the churn pool"),
+        "{g}"
+    );
+    assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+}
+
+/// The books close in both states: the cap's (every yield done: the host experts left, the
+/// K/V at the cap, the window and the host's other terms, and the plan's headroom hold the
+/// room, so the churn pool fits the plan's own accounting) and the floor's (every host
+/// expert, the K/V at its floor, the host's other terms and the pool's room hold the room to
+/// the byte). The sums are taken from the plan's totals, not from [`workstation::HostNeed`].
+///
+/// FAIL-first: a `HostNeed` that takes the yields past the K/V's bytes out of the shadows alone
+/// (saturating at 0) counts the window beside the yields that freed it, and the cap's sum and
+/// the headroom fall 3,200 B short of the room (71,528 B against 74,728 B); a pool bound
+/// without the floor's free room plans a cap's sum of 73,104 B.
+#[test]
+fn the_books_close_at_the_floor_and_at_the_cap_with_the_pool_budgeted() {
+    let model = layered(WIDE);
+    let slack = 44 * EXPERT;
+    let room = floor_need(&model, POOL_HELD) + slack;
+    let tight = machine_of(WIDE, POOL_HELD, room);
+    let plan = pooled(&model, &tight, true).expect("the plan at the floor");
+    let (h, g) = (&plan.host, &plan.host.grow);
+    let need = workstation::HostNeed::of(&plan, 0);
+    assert!(
+        g.yield_bytes > h.shadow_bytes + h.stage_kv_bytes + h.kv_host_bytes,
+        "the yields pass the K/V's bytes, the case the sums below are about"
+    );
+    let sum = |terms: &[u64]| terms.iter().map(|&t| i128::from(t)).sum::<i128>();
+    let cap_state = sum(&[
+        h.expert_bytes,
+        h.table_bytes,
+        h.shadow_bytes,
+        h.stage_kv_bytes,
+        h.kv_host_bytes,
+        h.reserve_bytes,
+        h.pool_card_bytes,
+    ]) - i128::from(g.yield_bytes)
+        - i128::from(need.os);
+    assert_eq!(
+        cap_state + h.headroom_bytes,
+        i128::from(room),
+        "the cap's state"
+    );
+    let floor_state = sum(&[
+        h.expert_bytes,
+        h.table_bytes,
+        g.floor_bytes,
+        h.reserve_bytes - window_of(&plan),
+        h.pool_card_bytes,
+        g.pool_bytes,
+    ]) - i128::from(need.os);
+    assert_eq!(
+        floor_state,
+        i128::from(room),
+        "the floor's state, the pool beside it"
+    );
+    assert_eq!(
+        i128::from(need.plan_bytes()) + h.headroom_bytes,
+        i128::from(room),
+        "the need and the headroom are the room"
+    );
+}
+
+/// A plan the room holds at the cap splits nothing, and the pool's room is not budgeted: it is
+/// the plan it was, as is the plan of a caller that clears the budget on a room the growth
+/// passes (the K/V charged at the floor with the growth alone yielded, which leaves the pool
+/// nothing).
+///
+/// FAIL-first: a budget that ignores the clear gives the cleared plan the pool's 25,344 B and
+/// yields past its growth.
+#[test]
+fn a_plan_the_room_holds_and_a_plan_with_the_budget_cleared_keep_their_books() {
+    let model = layered(WIDE);
+    let ample = machine_of(WIDE, POOL_HELD, 1 << 40);
+    let with = pooled(&model, &ample, true).expect("the plan with the budget");
+    let without = pooled(&model, &ample, false).expect("the plan without it");
+    assert_eq!(with.host.grow.hold, GrowHold::Room);
+    let split = |p: &Plan<'_>| (format!("{:?}", p.host.grow), p.host.headroom_bytes);
+    assert_eq!(split(&with).1, split(&without).1);
+    assert_eq!(split_of(&with), split_of(&without));
+    // Pool_room itself is the difference between the two growths, and nothing else.
+    let mut cleared = with.host.grow;
+    cleared.pool_room = false;
+    assert!(cleared == without.host.grow);
+
+    let room = floor_need(&model, POOL_HELD) + 44 * EXPERT;
+    let tight = machine_of(WIDE, POOL_HELD, room);
+    let old = pooled(&model, &tight, false).expect("the plan with the budget cleared");
+    assert_eq!(old.host.grow.pool_bytes, 0);
+    assert!(
+        old.host.grow.yield_bytes <= old.host.grow.grow_bytes,
+        "the growth alone yields: {}",
+        old.host.grow
+    );
+    assert!(
+        matches!(
+            pick_over(&old, room),
+            Room::Short(RoomShort::PoolUnhostable(_))
+        ),
+        "the plan that charges the growth alone leaves the pool nothing"
+    );
+}
+
+/// A host whose free room at the floor cannot hold the pool still says so: the pool's room is
+/// what the floor leaves, a pool past it is `pool_unhostable` by the same climb, and a floor
+/// that leaves nothing (the room the host experts and the K/V's floor take, or less) budgets
+/// no pool and plans as the cleared budget does.
+///
+/// FAIL-first: a budget without the floor's free room as its bound plans a pool of 16,704 B on
+/// a room with 11,520 B of it; one that budgets nothing plans none.
+#[test]
+fn a_host_that_cannot_hold_the_pool_at_the_floor_still_reports_it() {
+    let model = layered(WIDE);
+    let floor = floor_need(&model, POOL_HELD);
+    for (name, room) in [
+        ("a part of the pool", floor + 20 * EXPERT),
+        ("no room past the floor", floor),
+        ("a room under the floor", floor - 2 * EXPERT),
+    ] {
+        let tight = machine_of(WIDE, POOL_HELD, room);
+        let plan = pooled(&model, &tight, true).expect(name);
+        let Room::Short(RoomShort::PoolUnhostable(short)) = pick_over(&plan, room) else {
+            panic!("{name}: the pool is unhostable");
+        };
+        assert_eq!(
+            short.needs,
+            pool_at(&plan, 1),
+            "{name}: the pool at the card's last count"
+        );
+        assert!(
+            short.headroom < i128::from(short.needs),
+            "{name}: {short:?}"
+        );
+        assert!(
+            plan.violations().is_empty(),
+            "{name}: {:?}",
+            plan.violations()
+        );
+        if room <= floor {
+            let old = pooled(&model, &tight, false).expect(name);
+            let mut grow = plan.host.grow.clone();
+            grow.pool_room = false;
+            assert!(
+                grow == old.host.grow,
+                "{name}: no pool, the growth the cleared budget makes"
+            );
+            assert_eq!(split_of(&plan), split_of(&old), "{name}: the same split");
+            assert_eq!(plan.host.headroom_bytes, old.host.headroom_bytes, "{name}");
+        } else {
+            assert_eq!(
+                plan.host.grow.pool_bytes,
+                20 * EXPERT,
+                "{name}: the room's bytes"
+            );
+        }
+    }
+}
+
+/// The pool's room is no more than the pool the cards' routed experts can make: a card that
+/// holds one or two experts a layer has 24 of them to churn, and the 40 experts the floor
+/// leaves free are not reserved past them.
+///
+/// FAIL-first: a budget without that bound takes the floor's whole free room, 23,040 B for a
+/// pool of 13,824 B, and the yields give up 16 experts the pool never uses.
+#[test]
+fn the_pool_room_is_no_more_than_the_cards_experts_can_make() {
+    let model = layered(WIDE);
+    let held = 1;
+    let room = floor_need(&model, held) + 40 * EXPERT;
+    let tight = machine_of(WIDE, held, room);
+    let plan = pooled(&model, &tight, true).expect("the plan at the floor");
+    let g = &plan.host.grow;
+    assert_eq!(g.hold, GrowHold::Yields, "{g}");
+    let cards = pool_at(&plan, 0);
+    assert!(
+        0 < cards && cards < 40 * EXPERT,
+        "{cards} B of card experts"
+    );
+    assert_eq!(g.pool_bytes, cards, "{g}");
+    let headroom = u64::try_from(plan.host.headroom_bytes).expect("a headroom");
+    assert!((cards..cards + EXPERT).contains(&headroom), "{headroom} B");
 }

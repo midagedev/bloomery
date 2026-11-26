@@ -3,6 +3,7 @@ use std::fmt;
 use gguf::GgmlType;
 
 use super::Role;
+use super::churn::ChurnPool;
 use super::host_grow::{self, GrowHold, GrowLayer};
 use super::machine::{Card, Device, ExpertList, Format, Heap, ModelTensor, ModelTensors};
 use super::refusal::PlacementError;
@@ -839,6 +840,43 @@ enum Grant {
     AtLeastFloor,
 }
 
+/// The bytes of churn pool the split budgets beside the K/V's growth on `plan`, whose host
+/// need `need` passes `room`, with `(over, held, heavy)` the bytes it pages without a pool, the
+/// host expert bytes it splits and its heaviest layer's.
+///
+/// The floor's state holds every host expert, the K/V at its floor and the plan's other host
+/// terms, and the window the split reserves is idle until the first expert pages, so the room
+/// past that state is free at load: the pool's. It is no more than the pool the cards' routed
+/// experts can make, and leaves the split at least one layer of host experts. A plan with no
+/// growth to yield to, or whose caller cleared [`HostGrow::pool_room`], budgets none.
+fn pool_room(
+    plan: &Plan<'_>,
+    need: &workstation::HostNeed,
+    room: u64,
+    (over, held, heavy): (u128, u64, u64),
+) -> Result<u64, PlacementError> {
+    let grow = &plan.host.grow;
+    if !grow.armed() || !grow.pool_room {
+        return Ok(0);
+    }
+    let past = |what: &str| PlacementError::Metadata {
+        key: "the NVMe expert tier's churn pool room".to_string(),
+        detail: format!("{what} passes u64 bytes"),
+    };
+    let floor_need = need.exact(true).saturating_sub(u128::from(grow.grow_bytes));
+    let slack = u128::from(room).saturating_sub(floor_need);
+    let mut cards = 0u64;
+    for card in 0..plan.machine.cards.len() {
+        cards = cards
+            .checked_add(ChurnPool::of(plan, card, 0)?.bytes)
+            .ok_or_else(|| past("the cards' routed experts"))?;
+    }
+    let kept = u128::from(held)
+        .saturating_sub(over)
+        .saturating_sub(u128::from(heavy));
+    u64::try_from(slack.min(u128::from(cards)).min(kept)).map_err(|_| past("the pool's room"))
+}
+
 fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), PlacementError> {
     let model = plan.model;
     let need = workstation::HostNeed::of(plan, 0);
@@ -960,6 +998,15 @@ fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), P
         .checked_add(window)
         .ok_or_else(|| past("the host reserve beside the window"))?;
     let over = need.exact(true) + u128::from(window) - u128::from(room);
+    // A plan whose K/V grows by yields budgets the churn pool the floor's free room can hold
+    // before the growth takes it: those bytes page at the cap beside the growth's and the
+    // window's, and all of them stay on the host at load.
+    let pool = if arena == 0 {
+        pool_room(plan, &need, room, (over, held, heavy))?
+    } else {
+        0
+    };
+    let over = over + u128::from(pool);
     let keep = u128::from(held)
         .checked_sub(over)
         .and_then(|keep| u64::try_from(keep).ok())
@@ -1022,7 +1069,14 @@ fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), P
                     unit: l.unit,
                 })
                 .collect();
-            let steps = host_grow::restore_steps(&grow, plan.host.grow.grow_bytes);
+            // Every paged expert stays at load where a pool is budgeted: the pool takes the
+            // room the floor leaves free, and the window it reserves is idle until a yield.
+            let budget = if pool > 0 {
+                u64::MAX
+            } else {
+                plan.host.grow.grow_bytes
+            };
+            let steps = host_grow::restore_steps(&grow, budget);
             let paged: Vec<(usize, &[u32], u64)> = layers
                 .iter()
                 .zip(&picks)
@@ -1036,6 +1090,7 @@ fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), P
             g.yield_bytes = yields.iter().map(|y| y.bytes).sum();
             g.yields = yields;
             g.hold = GrowHold::Yields;
+            g.pool_bytes = pool;
         }
     }
     let mut moved = 0u64;
