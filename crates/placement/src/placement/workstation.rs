@@ -1178,6 +1178,9 @@ pub struct HostNeed {
     /// host experts kept at load that yield to the K/V's growth (`HostTotals::grow`), which
     /// [`HostNeed::experts`] counts: the need is the static plan's at the cap.
     pub shadows: u64,
+    /// The host's reserves less the part reads ([`HostNeed::read_ahead`]) and less the yields'
+    /// bytes past the K/V's: the split's window and the churn pool's room are the cap's room
+    /// those yields leave, taken out of the reserves where the shadows cannot go below 0.
     pub reserves: u64,
     pub extra: u64,
     /// Owned part results and their concurrent read/normalization scratch during loading, never
@@ -1219,15 +1222,21 @@ impl HostNeed {
     #[must_use]
     pub fn of_totals(host: &Host, totals: &HostTotals, card_budget: bool, extra: u64) -> HostNeed {
         let reads = named_reserve(host, PART_READS);
+        let kv = totals
+            .shadow_bytes
+            .saturating_add(totals.stage_kv_bytes)
+            .saturating_add(totals.kv_host_bytes);
+        let yielded = totals.grow.yield_bytes;
         HostNeed {
             experts: totals.expert_bytes,
             tables: totals.table_bytes,
-            shadows: totals
-                .shadow_bytes
-                .saturating_add(totals.stage_kv_bytes)
-                .saturating_add(totals.kv_host_bytes)
-                .saturating_sub(totals.grow.yield_bytes),
-            reserves: totals.reserve_bytes.saturating_sub(reads),
+            shadows: kv.saturating_sub(yielded),
+            // The yields past the K/V's bytes (the churn pool's room and the window's, which
+            // the split kept on the host at load) free the window the plan reserves.
+            reserves: totals
+                .reserve_bytes
+                .saturating_sub(reads)
+                .saturating_sub(yielded.saturating_sub(kv)),
             extra,
             read_ahead: reads,
             arena: totals.nvme_arena_bytes,
