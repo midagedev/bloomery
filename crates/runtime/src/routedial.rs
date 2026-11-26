@@ -575,8 +575,7 @@ mod tests {
         assert_eq!(off_by_zero, plain, "no resident: no change");
         let mild = biased_picks(&scores, &bias, &resident, 0.6, 6);
         assert!(mild.contains(&7) && mild.len() == 6, "{mild:?}");
-        let big = biased_picks(&scores, &bias, &resident, 10.0, 6);
-        let mut got = big.clone();
+        let mut got = biased_picks(&scores, &bias, &resident, 10.0, 6);
         got.sort_unstable();
         assert_eq!(got, [7, 9, 11, 12, 14, 15]);
         let tie = biased_picks(&[1.0, 1.0, 1.0], &[0.0; 3], &[false; 3], 0.0, 2);

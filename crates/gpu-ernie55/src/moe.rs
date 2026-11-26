@@ -55,7 +55,7 @@ use model::arch::names::routed_stacks;
 use model::moe::{HostLayer, SituSpec};
 use model::placement::kernels::{DownAct, DownForms};
 use model::r8file::R8Source;
-use runtime::routedial::MaskShape;
+use runtime::routedial::{MaskShape, RouteMask};
 
 /// What the refusals of this file name.
 pub const WHAT: &str = "ernie55 moe";
@@ -1129,7 +1129,7 @@ impl Moe {
                     Ok(w.f32_buf(WHAT, &r.bias)?.to_host_vec(gpu.stream())?)
                 })?
             }
-            None => MaskedBias::upload(gpu.stream(), &Default::default(), n_layer, |_| {
+            None => MaskedBias::upload(gpu.stream(), &RouteMask::default(), n_layer, |_| {
                 Ok(Vec::new())
             })?,
         };
