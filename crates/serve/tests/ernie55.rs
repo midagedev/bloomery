@@ -996,18 +996,19 @@ fn hw_ernie55_chat_tool_calls_stream_and_non_stream() {
 /// Under a watch (tools the structured-output subset compiles, `tool_choice: auto`) every call of a block is held to
 /// its schema, the second as the first. The reply is the protocol's own layout (the block's opening, a line feed, a
 /// call, `</invoke>` and one line feed, the next call right after it, the block's close), and its second call writes
-/// `x` where `days` is an integer: the watch turns it into an integer, read streamed and not. FAIL-first: with the
-/// program holding the first call only, the second is free text, and `x` is not JSON for an integer.
+/// `x` where `nights` is an integer (a key after `location`, as ERNIE's parameters go in key order): the watch turns
+/// it into an integer, read streamed and not. FAIL-first: with the program holding the first call only, the second is
+/// free text, and `x` is not JSON for an integer.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_ernie55_a_watch_holds_the_second_call_to_its_schema() {
     const SCRIPT: &str = "Need both.</ernie:think><ernie:tool_call>\n\
                           <invoke name=\"get_weather\"><parameter name=\"location\">Seoul</parameter></invoke>\n\
                           <invoke name=\"get_weather\"><parameter name=\"location\">Busan</parameter>\
-                          <parameter name=\"days\">x</parameter></invoke>\n</ernie:tool_call>";
+                          <parameter name=\"nights\">x</parameter></invoke>\n</ernie:tool_call>";
     let served = json!([
         {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object",
-            "properties": {"location": {"type": "string"}, "days": {"type": "integer"}},
+            "properties": {"location": {"type": "string"}, "nights": {"type": "integer"}},
             "required": ["location"]}}},
         {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}},
     ]);
@@ -1045,8 +1046,8 @@ fn hw_ernie55_a_watch_holds_the_second_call_to_its_schema() {
             serde_json::from_str(calls[1]["arguments"].as_str().expect("text")).expect("JSON");
         assert_eq!(second["location"], "Busan", "stream {stream}: {second}");
         assert!(
-            second["days"].is_i64(),
-            "stream {stream}: the watch held the second call's days to an integer: {second}"
+            second["nights"].is_i64(),
+            "stream {stream}: the watch held the second call's nights to an integer: {second}"
         );
     }
 }
