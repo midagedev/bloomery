@@ -434,7 +434,7 @@ mod gate {
             serving: unset(true, false)?,
             fixed: unset(false, false)?,
             steps: unset(true, true)?,
-            n_l: plan.n_l.iter().copied().collect(),
+            n_l: plan.n_l.clone(),
         };
         let host = HostCfg {
             populate: residency != Residency::Off,
