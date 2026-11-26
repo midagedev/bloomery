@@ -812,3 +812,7 @@ generate_ds41   sigmoid_split_512_10_pick                0           0
 generate_ds41   sigmoid_split_512_10_router              0           0
 generate_ds41   sigmoid_split_512_10_scores              0           0
 generate_ds41   vha_mix                                  0           0
+# PIN(2026-11-26): the router dials' three entries at 0/0 [derived: 0/0 on the 5090's sm_120a scan, no local array in any of them], until a scan on this table's arch and capability.
+generate_ds41   route_census_add                         0           0
+generate_ds41   route_cut_weights                        0           0
+generate_ds41   route_resident_bias                      0           0

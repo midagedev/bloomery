@@ -763,3 +763,7 @@ generate_ds41 sigmoid_split_512_10_pick 0 0
 generate_ds41 sigmoid_split_512_10_router 0 0
 generate_ds41 sigmoid_split_512_10_scores 0 0
 generate_ds41 vha_mix 0 0
+# PIN(2026-11-26): the router dials' three entries at 0/0 [measured: the gate-ptx-spill scan of this table's arch on an RTX 5090, driver 615.71.09].
+generate_ds41 route_census_add 0 0
+generate_ds41 route_cut_weights 0 0
+generate_ds41 route_resident_bias 0 0
