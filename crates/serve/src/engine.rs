@@ -176,6 +176,15 @@ pub trait Decoder: Send {
     fn push(&mut self, id: u32) -> Option<String>;
     /// Returns whatever is still held (lossily decoded) and clears the buffer.
     fn flush(&mut self) -> String;
+    /// The text a reply sends at its end: what [`Decoder::flush`] returns, except that an
+    /// incomplete UTF-8 tail is dropped instead of written as U+FFFD. A reply cut at its
+    /// token limit, or ended on an end-of-generation id, inside a multi-byte character
+    /// therefore ends at its last whole character; an invalid sequence was already
+    /// replaced by [`Decoder::push`] and stays so. Clears the buffer. A decoder that
+    /// holds no bytes takes the default.
+    fn end(&mut self) -> String {
+        self.flush()
+    }
 }
 
 /// The vocabulary side of a model. Shared by every connection thread, so it

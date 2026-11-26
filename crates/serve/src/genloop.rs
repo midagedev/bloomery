@@ -3360,7 +3360,7 @@ impl Gen {
     ) -> Result<Outcome, GenError> {
         let mut rest = String::new();
         if self.stop != StopKind::Word {
-            let tail = self.dec.flush();
+            let tail = self.dec.end();
             let pushed = self.scan.push(&tail);
             rest = pushed.send;
             if let Some(w) = pushed.stopped {

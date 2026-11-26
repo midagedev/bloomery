@@ -5789,3 +5789,67 @@ fn an_object_of_many_optional_properties_is_refused_before_it_is_built() {
         );
     }
 }
+
+/// The byte ids of `bytes` in the byte vocabulary.
+fn byte_ids(bytes: &[u8]) -> Vec<u32> {
+    bytes.iter().map(|&b| BYTES + u32::from(b)).collect()
+}
+
+/// A generation of the byte ids `want` that stops at its token limit:
+/// the content, and the text its stream sent.
+fn run_to_limit(want: &[u32], n_predict: usize) -> (String, String) {
+    let tok = bytes_tok();
+    let mut p = params(None, ThinkEntry::Open);
+    p.n_predict = i64::try_from(n_predict).expect("a limit");
+    p.stream = true;
+    let read = Arc::new(Mutex::new(Vec::new()));
+    let mut slot = Slot::new(Box::new(Rows {
+        tok: Arc::clone(&tok),
+        want: want.to_vec(),
+        k: 0,
+        read,
+    }))
+    .schema_jump(false);
+    let mut sent = String::new();
+    let o = generate(
+        &mut slot,
+        &sampling::reference_factory(),
+        &tok.encode("hi"),
+        &p,
+        &mut |e| {
+            if let Event::Text(t, ..) = e {
+                sent.push_str(t);
+            }
+            Ok(())
+        },
+        &mut |_| {},
+        &mut Timings::default(),
+    )
+    .expect("a generation");
+    (o.content, sent)
+}
+
+/// A reply cut at its token limit inside a multi-byte character ends at its
+/// last whole character, in its content and in its stream; no U+FFFD is
+/// written for the held incomplete tail.
+#[test]
+fn a_reply_cut_inside_a_character_ends_at_the_last_whole_one() {
+    let want = byte_ids("ab가나".as_bytes());
+    // "ab가" is five bytes, "나" three more: four tokens into "나".
+    let (content, sent) = run_to_limit(&want, 7);
+    assert_eq!(content, "ab가");
+    assert_eq!(sent, "ab가");
+    let (content, sent) = run_to_limit(&want, 5);
+    assert_eq!(content, "ab가");
+    assert_eq!(sent, "ab가");
+}
+
+/// An invalid byte inside a reply is still written as U+FFFD, and a reply cut
+/// right after it loses nothing.
+#[test]
+fn an_invalid_byte_mid_reply_is_still_a_replacement_character() {
+    let want = byte_ids(b"a\xFFb\xEA\xB0");
+    let (content, sent) = run_to_limit(&want, 5);
+    assert_eq!(content, "a\u{FFFD}b");
+    assert_eq!(sent, "a\u{FFFD}b");
+}

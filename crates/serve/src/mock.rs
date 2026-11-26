@@ -1185,6 +1185,10 @@ impl Decoder for MediaDecoder {
     fn flush(&mut self) -> String {
         self.0.flush()
     }
+
+    fn end(&mut self) -> String {
+        self.0.end()
+    }
 }
 
 /// The media mock's model: [`IMAGE_SPECIAL`] as [`IMAGE_ID`], parts joined by
@@ -1927,6 +1931,11 @@ impl Decoder for Utf8Decoder {
         let s = String::from_utf8_lossy(&self.held).into_owned();
         self.held.clear();
         s
+    }
+
+    fn end(&mut self) -> String {
+        self.held.clear();
+        String::new()
     }
 }
 

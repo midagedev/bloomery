@@ -146,6 +146,17 @@ struct VocabDecoder {
     cleaner: Option<tokenizer::SpaceCleaner>,
 }
 
+impl VocabDecoder {
+    /// `rest` through the space cleaner, then what the cleaner still held.
+    fn settle(&mut self, mut rest: String) -> String {
+        if let Some(cleaner) = &mut self.cleaner {
+            rest = cleaner.push(&rest);
+            rest.push_str(&cleaner.finish());
+        }
+        rest
+    }
+}
+
 impl Decoder for VocabDecoder {
     fn push(&mut self, id: u32) -> Option<String> {
         self.pending.extend_from_slice(self.tok.piece(id, true));
@@ -182,13 +193,14 @@ impl Decoder for VocabDecoder {
     }
 
     fn flush(&mut self) -> String {
-        let mut rest = String::from_utf8_lossy(&self.pending).into_owned();
+        let rest = String::from_utf8_lossy(&self.pending).into_owned();
         self.pending.clear();
-        if let Some(cleaner) = &mut self.cleaner {
-            rest = cleaner.push(&rest);
-            rest.push_str(&cleaner.finish());
-        }
-        rest
+        self.settle(rest)
+    }
+
+    fn end(&mut self) -> String {
+        self.pending.clear();
+        self.settle(String::new())
     }
 }
 
