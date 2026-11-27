@@ -799,7 +799,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             s.pos() - steps as u32,
             s.pos() - 1
         );
-        let total = print_acc("prof", &qwen_kind_names(), &acc, layers, steps, p.layers);
+        let total = print_acc("prof", &walk_kind_names(), &acc, layers, steps, p.layers);
         eprintln!(
             "prof total groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1} decode_ms={}",
             total.groups as f64 / steps as f64,
@@ -815,8 +815,8 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         Ok(())
     }
 
-    /// The Qwen family's kinds' names, in the token's walk order.
-    fn qwen_kind_names() -> Vec<&'static str> {
+    /// The kinds' names of the walk this module times, in the token's walk order.
+    fn walk_kind_names() -> Vec<&'static str> {
         KINDS.iter().map(|k| k.name()).collect()
     }
 
@@ -988,7 +988,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
              group's at the verify's first position, the weights once a launch)",
             mid - 1
         );
-        let total = print_acc("vprof", &qwen_kind_names(), &acc, layers, n, p.layers);
+        let total = print_acc("vprof", &walk_kind_names(), &acc, layers, n, p.layers);
         let ops_s = total.gpu_s / nf;
         eprintln!(
             "vprof total groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1}",
@@ -1609,8 +1609,12 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
     mod ink2 {
         use std::time::Instant;
 
-        use bloomery_metal::arch::inkling2::count::{KINDS, Kind};
-        use bloomery_metal::arch::inkling2::{ProfileGroup, Session, generate::greedy, plan};
+        use bloomery_metal::arch::inkling2::{
+            ProfileGroup, Session,
+            count::{KINDS, Kind},
+            generate::greedy,
+            plan,
+        };
         use bloomery_metal::device::MetalDevice;
         use bloomery_metal::kernels::NvfpLayout;
         use model_hf::ModelFile;
