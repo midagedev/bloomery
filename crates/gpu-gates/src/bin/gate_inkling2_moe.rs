@@ -14,7 +14,9 @@
 //! `lcpp-inkling2`). The router's input is each visit's ffn norm, read from the
 //! set's `norm-<slot>` rows (the occurrence whose source the manifest names
 //! `(reshaped)` or `loop_ffn_inp-<slot>` — the visit's last norm of each graph
-//! the dump ran, one a ubatch), and the expert taps are set a's, the one set
+//! the dump ran, one a ubatch) times the file's `ffn_norm.weight` gain (the
+//! tap is the RMS_NORM node before the gain, and the vendor's router and
+//! experts read the product), and the expert taps are set a's, the one set
 //! that dumps the whole ladder.
 //!
 //! The clauses, one a contract:
@@ -283,13 +285,17 @@ mod gate {
         }
     }
 
-    /// The file's router weight and selection bias of every stored layer, once:
-    /// a core layer's visits share them. The bias rides as a host copy too —
-    /// the ids clause's tie-margin diagnostic reads it there.
+    /// The file's router weight, selection bias and ffn-norm gain of every
+    /// stored layer, once: a core layer's visits share them. The bias rides as
+    /// a host copy too — the ids clause's tie-margin diagnostic reads it there.
+    /// The gain is `blk.<l>.ffn_norm.weight`: the set taps the visit's
+    /// RMS_NORM node, the row before the gain, and the router and the experts
+    /// read that row times the gain ([`ffn_norm_rows`]).
     struct Routers {
         w: Vec<DeviceTensor<f32>>,
         bias: Vec<DeviceBuffer<f32>>,
         bias_host: Vec<Vec<f32>>,
+        gain: Vec<Vec<f32>>,
     }
 
     impl Routers {
@@ -299,7 +305,9 @@ mod gate {
             let mut w = Vec::with_capacity(hp.n_layer);
             let mut bias = Vec::with_capacity(hp.n_layer);
             let mut bias_host = Vec::with_capacity(hp.n_layer);
+            let mut gain = Vec::with_capacity(hp.n_layer);
             for l in 0..hp.n_layer {
+                gain.push(split_f32(split, &format!("blk.{l}.ffn_norm.weight"), embd)?);
                 w.push(DeviceTensor::upload(
                     stream,
                     &split_f32(
@@ -314,7 +322,12 @@ mod gate {
                 bias.push(dev.up(&host)?);
                 bias_host.push(host);
             }
-            Ok(Routers { w, bias, bias_host })
+            Ok(Routers {
+                w,
+                bias,
+                bias_host,
+                gain,
+            })
         }
     }
 
@@ -406,13 +419,17 @@ mod gate {
     /// The visit's ffn-norm rows — the router's input — every token of the
     /// prompt: the set's `norm-<slot>` occurrences whose source the manifest
     /// names `(reshaped)` or `loop_ffn_inp-<slot>` (the visit's last norm of
-    /// each graph the dump ran, one a ubatch), concatenated in token order. A
+    /// each graph the dump ran, one a ubatch), concatenated in token order,
+    /// each value times the stored layer's `ffn_norm.weight` gain `gain` (an
+    /// f32 product, the vendor's own `MUL` — the tap is the RMS_NORM node
+    /// before it, and the router's and the experts' input is the product). A
     /// visit without such rows, or rows that do not sum to the prompt, errors
     /// naming the set.
     fn ffn_norm_rows(
         man: &RefManifest,
         slot: usize,
         (embd, tokens): (usize, usize),
+        gain: &[f32],
     ) -> Result<Vec<f32>, GateError> {
         let name = format!("norm-{slot}");
         let ffn_src = format!("loop_ffn_inp-{slot}");
@@ -441,6 +458,11 @@ mod gate {
                 rows.len() / embd
             )
             .into());
+        }
+        for row in rows.chunks_exact_mut(embd) {
+            for (v, &g) in row.iter_mut().zip(gain) {
+                *v *= g;
+            }
         }
         Ok(rows)
     }
@@ -532,7 +554,7 @@ mod gate {
         for (slot, visit) in visit_list.iter().enumerate() {
             let l = visit.layer as usize;
             let t = set.tokens;
-            let x_rows = ffn_norm_rows(&set.man, slot, (embd, t))?;
+            let x_rows = ffn_norm_rows(&set.man, slot, (embd, t), &routers.gain[l])?;
             let batch = route_batch(dev, routers, hp, l, &x_rows, t)?;
             let (got_ids, got_w, got_p) = (
                 dev.read(&batch.ids)?,
@@ -592,7 +614,7 @@ mod gate {
         let (n_expert, n_used, embd) = (hp.n_expert, hp.n_used[0], hp.n_embd);
         let t = set.tokens;
         let slot = visit_of(hp, l)?;
-        let x_rows = ffn_norm_rows(&set.man, slot, (embd, t))?;
+        let x_rows = ffn_norm_rows(&set.man, slot, (embd, t), &routers.gain[l])?;
         let logit_tap = tap_at(&set.man, &format!("ffn_moe_logits-{slot}"), 0)?;
         let batch = route_batch(dev, routers, hp, l, &x_rows, t)?;
         let (p_b, i_b, w_b) = (
@@ -936,7 +958,7 @@ mod gate {
         )?;
         let slot = visit_of(hp, l)?;
         let t = set.tokens;
-        let x_rows = ffn_norm_rows(&set.man, slot, (embd, t))?;
+        let x_rows = ffn_norm_rows(&set.man, slot, (embd, t), &routers.gain[l])?;
         let Batch { ids, weights, .. } = route_batch(dev, routers, hp, l, &x_rows, t)?;
         let slots = t * n_used;
         let x = dev.up(&x_rows)?;
