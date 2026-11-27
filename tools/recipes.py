@@ -12,7 +12,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
     python3 tools/recipes.py ships [--rev REV] [--base REV] FILE...  # the FILEs inside the shipped closure (tools/release/build.sh's bins at its features), with why; exit 1 when any is (tools/release/late-commit.sh)
     python3 tools/recipes.py ship-scan [--rev REV] BASE_LOG HEAD_LOG...  # the shipped bins' ptx-scan pairs: a verdict line each; exit 0 only when every shipped bin has a pair and all are identical
-    python3 tools/recipes.py ptx-compare BASE_LOG HEAD_LOG [--base-label L] [--head-label L]  # two full ptx-scan logs of one bin as one table: entries, added, removed, changed (tools/ptx-compare.sh); rc 0 nothing existing moved, 3 changed, 4 removed, 5 both
+    python3 tools/recipes.py ptx-compare BASE_LOG HEAD_LOG [--base-label L] [--head-label L]  # two full ptx-scan logs of one bin as one table: entries, added, removed, changed (tools/ptx-compare.sh); rc 0 nothing existing moved, 3 changed, 4 removed, 5 both; a moved digest also names `just canon-check BASE`
     python3 tools/recipes.py ship-bins [--rev REV]  # the shipped bins and the release features read from tools/release/build.sh: bin<TAB>features
     python3 tools/recipes.py why FILE... [--recipe R]...  # every recipe a file selects, with the chain; --recipe R: whether R's key holds it and R's shortest dependency chain to the file's crate
     python3 tools/recipes.py gaps [CRATE...] [--rev REV] [--list]  # per crate: recipes whose key holds a file of it, recipes whose targets reach code of it, the gap; exit 1 on a gap of a pinned crate (KEY_REACH_PINS)
@@ -4140,7 +4140,8 @@ def scan_verdict(base: ScanLog, new: ScanLog) -> ScanVerdict:
 # `ptx-compare BASE_LOG HEAD_LOG`: the add and move classes' proof (AGENTS.md's change-class table) as one table of two full
 # ptx-scan logs of one binary. Exit codes: 0 nothing existing moved (the head holds the base's entries, each row and digest
 # equal, and maybe more); 3 an existing entry's row or digest moved, or the bundle set did; 4 an entry was removed; 5 both;
-# 2 a pair or log refused by name (RecipeError, `main`).
+# 2 a pair or log refused by name (RecipeError, `main`). A moved digest also prints the one `just canon-check` line that says whether
+# the moved entry is the same program (ptx-canon); the exit code is the table's alone.
 PTX_COMPARE_RC = {(False, False): 0, (True, False): 3, (False, True): 4, (True, True): 5}
 
 
@@ -4177,6 +4178,9 @@ def ptx_compare(base: ScanLog, head: ScanLog, base_label: str = "base", head_lab
            f"  changed       {len(changed)}: {' | '.join(f'{e} ({m})' for e, m in changed)}" if changed else "  changed       none"]
     if bundles:
         out.append(f"  bundles       moved: {' '.join(base.bundles)} -> {' '.join(head.bundles)}")
+    if any("ptx-scan-md5:" in moved for _, moved in changed):
+        rev = base_label if base_label != "base" else "BASE"
+        out.append(f"  next          a moved digest may be numbering only: `just canon-check {rev}` reads each moved entry (ptx-canon's verdict, equal columns)")
     rc = PTX_COMPARE_RC[(bool(changed) or bundles, bool(removed))]
     word = {0: "identical" if not added else "added-only", 3: "changed", 4: "removed", 5: "changed and removed"}[rc]
     out.append(f"ptx-compare: {word} (rc {rc})")
@@ -14947,18 +14951,28 @@ def narrow_self_test(expect, side: Side) -> None:
         rc_pc, txt = compared({"alpha": h1, "beta": h2})
         expect(rc_pc == 0 and "  added         none" in txt and "  removed       none" in txt and "  changed       none" in txt
                and txt.endswith("ptx-compare: identical (rc 0)") and "  base entries  2" in txt and "  head entries  2" in txt, f"ptx-compare: identical pair: {rc_pc} {txt}")
+        expect("canon-check" not in txt, f"ptx-compare: an identical pair points nowhere: {txt}")
         rc_pc, txt = compared({"alpha": h1, "beta": h2, "gamma": h3})
         expect(rc_pc == 0 and "  added         1: gamma" in txt and "  head entries  3" in txt and txt.endswith("ptx-compare: added-only (rc 0)"),
                f"ptx-compare: an added entry is rc 0: {rc_pc} {txt}")
+        expect("canon-check" not in txt, f"ptx-compare: an added entry points nowhere: {txt}")
         rc_pc, txt = compared({"alpha": h1, "beta": h3})
         expect(rc_pc == 3 and "  changed       1: beta (ptx-scan-md5:" in txt and txt.endswith("ptx-compare: changed (rc 3)"), f"ptx-compare: a moved digest is rc 3: {rc_pc} {txt}")
+        expect(txt.count("just canon-check B`") == 1 and txt.index("just canon-check B`") > txt.index("  changed       1: beta") and txt.index("just canon-check B`") < txt.index("ptx-compare: changed (rc 3)"),
+               f"ptx-compare: a moved digest points at `just canon-check BASE` once, between the table and the verdict line: {txt}")
         rc_pc, txt = compared({"alpha": h1, "beta": h2}, regs="13")
         expect(rc_pc == 3 and "alpha (regs:12->13)" in txt and "beta (regs:12->13)" in txt and "ptx-scan-md5" not in txt, f"ptx-compare: a moved column is rc 3: {rc_pc} {txt}")
+        expect("canon-check" not in txt, f"ptx-compare: a moved column alone points nowhere (canon-check reads digests): {txt}")
         rc_pc, txt = compared({"alpha": h1})
         expect(rc_pc == 4 and "  removed       1: beta" in txt and txt.endswith("ptx-compare: removed (rc 4)"), f"ptx-compare: a removed entry is rc 4: {rc_pc} {txt}")
+        expect("canon-check" not in txt, f"ptx-compare: a removed entry points nowhere: {txt}")
         rc_pc, txt = compared({"alpha": h3, "gamma": h1})
         expect(rc_pc == 5 and "  added         1: gamma" in txt and "  removed       1: beta" in txt and "alpha (ptx-scan-md5:" in txt and txt.endswith("ptx-compare: changed and removed (rc 5)"),
                f"ptx-compare: a changed and a removed entry are rc 5: {rc_pc} {txt}")
+        expect(txt.count("just canon-check B`") == 1, f"ptx-compare: a moved digest beside a removed entry points at canon-check once: {txt}")
+        got_pc = tried(lambda: ptx_compare(base, read_scan(scan(tmp, "pce.log", {"alpha": h3, "beta": h2}))))
+        expect(isinstance(got_pc, tuple) and any("`just canon-check BASE`" in l for l in got_pc[1]) and not any("canon-check base" in l for l in got_pc[1]),
+               f"ptx-compare: with no label the line says BASE, not the default label: {got_pc}")
         rc_pc, txt = compared({"alpha": h1, "beta": h2}, bundles=("bloomery-gpu", "bloomery-x"))
         expect(rc_pc == 3 and "  bundles       moved: bloomery-gpu -> bloomery-gpu bloomery-x" in txt, f"ptx-compare: a moved bundle set is rc 3: {rc_pc} {txt}")
         rc_pc, txt = compared({"alpha": h1, "beta": h2}, nojit=True)
