@@ -9,12 +9,13 @@
 //! the bias laid in:
 //!
 //! - the score of key `j` gains `bⱼ = Σ_{d < REL} rel_bias[d, distⱼ] · r_d`,
-//!   `distⱼ = live − 1 − key position`, the key positions of a tile being
-//!   consecutive so the tile's `[REL][KEY_TILE]` slice of the table is staged
-//!   in shared beside the key and value tiles. A distance at or past
-//!   `extent` reads 0 — the reference's pad column, which the caller does
-//!   not upload. The `REL` values of `r` and the row's sink `t` are plain
-//!   launch data, computed upstream;
+//!   `distⱼ = live − 1 − key position`. Lane `l` of a tile owns key `l`, so it
+//!   reads its own `REL` table entries straight from global memory (the
+//!   positions of a tile are consecutive, so a warp's read of one table row is
+//!   one coalesced line), one tile ahead of the score that uses them. A
+//!   distance at or past `extent` reads 0 — the reference's pad column, which
+//!   the caller does not upload. The `REL` values of `r` and the row's sink `t`
+//!   are plain launch data, computed upstream;
 //! - the sink joins the softmax as the partial `(t, 1, 0)` folded last by
 //!   the merge — one more logit in the denominator, nothing in the value —
 //!   read per (row, head), so the merge is this file's own: a sink that
@@ -24,24 +25,26 @@
 //! `exp(s − t) / (1 + Σ exp(s_k − t))` and this file's `exp(s) / (exp(t) +
 //! Σ exp(s_k))` are one distribution; the rounding points differ, and the
 //! owning gate bands that distance. The segment body is this file's own
-//! copy of the walk, not a `seg_h128` instance: a group of three or six
-//! leaves `KEY_TILE · ROW_QWORDS` key and value words uneven over the
-//! block's threads, so the even-division staging `seg_h128` asserts does not
-//! hold at 96 or 192 threads — the walk stays that body's, the staging is
-//! ragged here (the same reason `flash_gqa` keeps a body of its own for the
-//! group of five). The plane and ring forms and the two groups are one body
-//! under `RING` and `G`, as there; the merge takes the head count as data
-//! and serves both groups.
+//! copy of the walk, not a `seg_h128` instance: the block's key and value
+//! tiles are staged by 16-byte `cp.async` copies, a tile ahead of the one
+//! being scored and two tiles in flight at the start of a segment, so a
+//! segment of a few tiles costs one memory round trip, not one a tile. The
+//! plane and ring forms and the two groups are one body under `RING` and
+//! `G`, as there; the merge takes the head count as data and serves both
+//! groups.
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{MERGE_BATCH, half_bits_to_f32, online_fold};
 use crate::flash_gqa::{HEAD, KEY_TILE, SEG_KEYS, seg_span, window_cut, window_segments};
 use crate::flash_gqa_h128_swa::{
-    GROUP_3, GROUP_6, K_STRIDE, MERGE_THREADS, ROW_QWORDS, fold_tile, live_keys,
+    GROUP_3, GROUP_6, MERGE_THREADS, ROW_QWORDS, fold_tile, live_keys,
 };
 use crate::launch_u32;
+use crate::tensor::check_alignment;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
+use cuda_device::vector::{F32x4, U32x4};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
 };
@@ -57,7 +60,126 @@ const THREADS_G6_U32: u32 = (GROUP_6 * 32) as u32;
 // 96 threads, 6 and 192.
 const _: () =
     assert!(GROUP_3 == 3 && GROUP_6 == 6 && THREADS_G3_U32 == 96 && THREADS_G6_U32 == 192);
-const _: () = assert!(REL * KEY_TILE == 512 && K_STRIDE % 2 == 1 && REL <= 32);
+const _: () = assert!(KEY_TILE == 32 && REL <= 32);
+
+/// u32 words of one key row, the span the score loop's rounds walk.
+const ROW_WORDS: usize = HEAD / 2;
+/// 16-byte chunks of one key or value row, each one `cp.async` copy.
+const ROW_CHUNKS: usize = ROW_WORDS / 4;
+/// u32 words a staged key row takes: the row and one chunk of padding, so the
+/// eight lanes of a quarter-warp's 16-byte read land on eight distinct bank
+/// groups (lane `j` reads at chunk `17·j + c`, and 17 is odd).
+const K_ROW: usize = ROW_WORDS + 4;
+/// u32 words of one staged key tile, and of one value tile (`ROW_QWORDS` u64 a
+/// row).
+const K_TILE_WORDS: usize = KEY_TILE * K_ROW;
+const V_TILE_WORDS: usize = KEY_TILE * ROW_QWORDS * 2;
+/// Tiles staged at once: the one being scored and the one after it.
+const STAGES: usize = 2;
+const _: () =
+    assert!(ROW_WORDS.is_multiple_of(4) && ROW_CHUNKS == 16 && ROW_QWORDS * 2 == ROW_WORDS);
+const _: () = assert!(K_ROW.is_multiple_of(4) && (K_ROW / 4) % 2 == 1);
+
+/// Rows of a tile one pass of a block's copy threads covers (`32·G` threads,
+/// [`ROW_CHUNKS`] a row), and the passes a tile takes.
+const fn rows_a_pass(g: usize) -> usize {
+    2 * g
+}
+const fn copy_passes(g: usize) -> usize {
+    KEY_TILE.div_ceil(rows_a_pass(g))
+}
+
+/// Stage the key and value tile whose first key is `t0` into `dk` (stride
+/// [`K_ROW`]) and `dv` (a row is [`ROW_WORDS`] words), one commit group: row
+/// `r` is key `t0 + r`, held by the 16-byte copies of the block's threads,
+/// every chunk of a row by its own thread; a row at or past `hi` is zero. `sk`
+/// and `sv` are the key head's plane base, and on a ring (`RING`) a key's row
+/// is its position modulo `plane_rows`, found by stepping from the first
+/// thread row's slot (`plane_rows >= KEY_TILE`, so one subtraction wraps it).
+///
+/// Contract (the caller keeps it; rust-quality R28): `dk` and `dv` are the
+/// block's [`STAGES`] shared tiles (16-byte aligned, [`K_TILE_WORDS`] and
+/// [`V_TILE_WORDS`] words each) and `slot < STAGES` the one filled, which no
+/// warp reads until the wait and barrier that follow this commit; `sk` and
+/// `sv` are 16-byte aligned planes in which every key of `[t0, hi)` has its
+/// row (below `plane_rows` on a plane, any key on a ring); the block is
+/// `32·G` threads and `tid` the caller's thread index.
+#[inline(always)]
+fn stage_tile<const RING: bool, const G: usize>(
+    (dk, dv): (*mut u32, *mut u32),
+    (sk, sv): (*const u32, *const u32),
+    slot: usize,
+    t0: usize,
+    hi: usize,
+    plane_rows: u32,
+    tid: usize,
+) {
+    let chunk = tid % ROW_CHUNKS;
+    let mut row = tid / ROW_CHUNKS;
+    let first = (t0 + row) as u32;
+    let mut at = if RING { first % plane_rows } else { first };
+    let mut pass = 0usize;
+    while pass < copy_passes(G) {
+        cuda_device::thread::__unroll_config::<0>();
+        if row < KEY_TILE {
+            // SAFETY: row < KEY_TILE and chunk < ROW_CHUNKS: this thread's
+            // 16 aligned bytes of each tile, which no other thread names.
+            unsafe {
+                let k_at = dk.add(slot * K_TILE_WORDS + row * K_ROW + 4 * chunk);
+                let v_at = dv.add(slot * V_TILE_WORDS + row * ROW_WORDS + 4 * chunk);
+                if t0 + row < hi {
+                    // The key's row is inside the plane (the caller's
+                    // contract).
+                    let from = at as usize * ROW_WORDS + 4 * chunk;
+                    cp_async_cg_16(k_at, sk.add(from));
+                    cp_async_cg_16(v_at, sv.add(from));
+                } else {
+                    *k_at.cast::<U32x4>() = U32x4::splat(0);
+                    *v_at.cast::<U32x4>() = U32x4::splat(0);
+                }
+            }
+        }
+        row += rows_a_pass(G);
+        at += rows_a_pass(G) as u32;
+        if RING && at >= plane_rows {
+            at -= plane_rows;
+        }
+        pass += 1;
+    }
+    // SAFETY: closes this thread's copies above as one group.
+    unsafe { cp_async_commit_group() };
+}
+
+/// Lane `lane`'s `REL` bias values of the tile starting at `t0`: the table
+/// column of the lane's key distance, all 0 for a key the segment does not
+/// hold and past the extent (the pad rule).
+///
+/// Contract (the caller keeps it; rust-quality R28): `bias` holds `REL · extent` values and `hi <= limit`, so a held
+/// key's distance is below `limit` (the launch contract).
+#[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes"
+)]
+fn bias_lane(
+    bias: &[f32],
+    (t0, hi, limit, extent): (usize, usize, usize, usize),
+    lane: usize,
+) -> [f32; REL] {
+    let mut out = [0.0f32; REL];
+    let key = t0 + lane;
+    if key < hi {
+        let dist = limit - 1 - key;
+        if dist < extent {
+            for d in 0..REL {
+                cuda_device::thread::__unroll_config::<0>();
+                // SAFETY: d·extent + dist < REL·extent <= bias.len().
+                out[d] = unsafe { *bias.get_unchecked(d * extent + dist) };
+            }
+        }
+    }
+    out
+}
 
 /// The segment pass of this file's entries: `seg_h128`'s walk at `G`
 /// ([`GROUP_3`] or [`GROUP_6`]) query heads a key head with the bias laid
@@ -68,16 +190,17 @@ const _: () = assert!(REL * KEY_TILE == 512 && K_STRIDE % 2 == 1 && REL <= 32);
 /// The score's order is the gate: the f32 dot of `seg_h128` (its rotating
 /// ILP partials, combined `(a0 + a1) + (a2 + a3)`), one multiply by
 /// `scale`, then the bias dot added — `REL` fused multiply-adds ascending
-/// `d`, the r row one value a lane, read by shuffle.
+/// `d`, the r row one value a lane, read by shuffle. The tiles fold ascending
+/// through [`fold_tile`].
 ///
 /// SAFETY: the entry's launch contract at `G` query heads a key head
 /// (every buffer bound it names, the planes of `n_kv · plane_rows`
-/// rows, and under `RING` `plane_rows >= 1` with every key the row reads
-/// resident in the ring), a block of `G · 32` threads, and the five
-/// tiles this block's shared memory as the entry declared them: the group's
-/// query rows (`G · HEAD` f32), the key tile at stride `K_STRIDE`
-/// words, the value tile (`KEY_TILE · ROW_QWORDS` u64), the weight tile
-/// (`G · KEY_TILE` f32) and the bias tile (`REL · KEY_TILE` f32).
+/// rows 16-byte aligned, and under `RING` `plane_rows >= KEY_TILE` with every
+/// key the row reads resident in the ring), a block of `G · 32` threads, and
+/// the four tiles this block's shared memory as the entry declared them: the
+/// group's query rows (`G · HEAD` f32, 16-byte aligned), [`STAGES`] key tiles
+/// of [`K_TILE_WORDS`] words and value tiles of [`V_TILE_WORDS`] words (16-byte
+/// aligned), and the weight tile (`G · KEY_TILE` f32).
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
@@ -105,10 +228,8 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool, const G: usize>(
     ks: *mut u32,
     vs: *mut u64,
     ws: *mut f32,
-    bs: *mut f32,
 ) {
     const { assert!(G == GROUP_3 || G == GROUP_6) };
-    let threads = G * 32;
     let b = thread::blockIdx_x() as usize;
     let nkv = n_kv as usize;
     let n_seg = segs as usize;
@@ -143,6 +264,27 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool, const G: usize>(
         return; // block-uniform: the window cut is the block's
     }
     let hi = (lo + span).min(first + n_w);
+    let n_tiles = (hi - lo).div_ceil(KEY_TILE);
+    let extent = extent as usize;
+
+    // The key head's plane in u32 words, and the first two tiles in flight
+    // before anything else is read: tile `i` lives in buffer `i % STAGES`.
+    let plane = kh * plane_rows as usize * ROW_WORDS;
+    // SAFETY: the plane is inside kc and vc by the launch contract.
+    let (sk_base, sv_base) = unsafe {
+        (
+            (kc.as_ptr() as *const u32).add(plane),
+            (vc.as_ptr() as *const u32).add(plane),
+        )
+    };
+    let vs32 = vs as *mut u32;
+    // The first tile of the segment in buffer 0 and the second in buffer 1.
+    let planes = (sk_base, sv_base);
+    stage_tile::<RING, G>((ks, vs32), planes, 0, lo, hi, plane_rows, tid);
+    if n_tiles > 1 {
+        stage_tile::<RING, G>((ks, vs32), planes, 1, lo + KEY_TILE, hi, plane_rows, tid);
+    }
+    let mut bias_now = bias_lane(bias, (lo, hi, limit, extent), lane);
 
     let qb = (t * n_head + kh * G) * HEAD;
     let mut i = 0usize;
@@ -159,116 +301,107 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool, const G: usize>(
     // contract.
     let r_lane = unsafe { *r.get_unchecked((t * n_head + h) * REL + lane % REL) };
 
-    let plane_rows = plane_rows as usize;
-    let plane = kh * plane_rows * HEAD;
-    let k64 = kc.as_ptr() as *const u64;
-    let v64 = vc.as_ptr() as *const u64;
-    let extent = extent as usize;
     let mut mx = f32::NEG_INFINITY;
     let mut s_sum = 0.0f32;
     let mut acc = [0.0f32; 4];
-    let mut t0 = lo;
-    while t0 < hi {
-        thread::sync_threads();
-        let mut e = tid;
-        while e < KEY_TILE * ROW_QWORDS {
-            let key = e / ROW_QWORDS;
-            let word = e - key * ROW_QWORDS;
-            let (kw, vw) = if t0 + key < hi {
-                // SAFETY: t0 + key < hi <= limit <= ctx, so the row is
-                // inside key head kh's plane (below plane_rows = ctx), or
-                // mapped modulo plane_rows inside its ring. A row is 32 u64
-                // and the planes start 8-byte aligned (a device allocation).
-                unsafe {
-                    let at = if RING {
-                        (t0 + key) % plane_rows
-                    } else {
-                        t0 + key
-                    };
-                    let rw = (plane + at * HEAD) / 4 + word;
-                    (*k64.add(rw), *v64.add(rw))
-                }
+    let mut tile = 0usize;
+    while tile < n_tiles {
+        let t0 = lo + tile * KEY_TILE;
+        // SAFETY: waits for this thread's copies but the newest tile's, and
+        // the barrier publishes every thread's copies (and the query rows,
+        // on the first tile); every warp is past the tile that last shared
+        // the buffer the next tile's copies are about to fill.
+        unsafe {
+            if tile + 1 < n_tiles {
+                cp_async_wait_group(1);
             } else {
-                (0u64, 0u64)
-            };
-            // SAFETY: key < 32 and word < 32, inside the staged tiles.
-            unsafe {
-                *ks.add(key * K_STRIDE + 2 * word) = kw as u32;
-                *ks.add(key * K_STRIDE + 2 * word + 1) = (kw >> 32) as u32;
-                *vs.add(key * ROW_QWORDS + word) = vw;
+                cp_async_wait_group(0);
             }
-            e += threads;
-        }
-        // The bias tile: column `key` holds the table column of the key's
-        // distance, 0 past the extent (the pad rule) and 0 for a key the
-        // segment does not hold.
-        let mut e = tid;
-        while e < REL * KEY_TILE {
-            let d = e / KEY_TILE;
-            let key = e - d * KEY_TILE;
-            let val = if t0 + key < hi {
-                let dist = limit - 1 - (t0 + key);
-                if dist < extent {
-                    // SAFETY: d·extent + dist < REL·extent <= bias.len() by
-                    // the launch contract.
-                    unsafe { *bias.get_unchecked(d * extent + dist) }
-                } else {
-                    0.0
-                }
-            } else {
-                0.0
-            };
-            // SAFETY: e < REL·KEY_TILE, inside the staged bias tile.
-            unsafe { *bs.add(e) = val };
-            e += threads;
         }
         thread::sync_threads();
+        // The next tile's bias values are in flight under this tile's score.
+        let bias_next = if tile + 1 < n_tiles {
+            bias_lane(bias, (t0 + KEY_TILE, hi, limit, extent), lane)
+        } else {
+            [0.0f32; REL]
+        };
 
         let live = t0 + lane < hi;
         let mut a = [0.0f32; 4];
-        let mut wd = 0usize;
-        while wd < ROW_WORDS {
-            let mut p = 0usize;
-            while p < 4 {
-                // SAFETY: lane < 32 and wd + p < ROW_WORDS, inside the
-                // staged key tile. The query index is inside G·HEAD.
-                let (kw, q0, q1) = unsafe {
-                    (
-                        *ks.add(lane * K_STRIDE + wd + p),
-                        *qs.add(w * HEAD + 2 * (wd + p)),
-                        *qs.add(w * HEAD + 2 * (wd + p) + 1),
-                    )
-                };
-                let k0 = half_bits_to_f32(kw as u16);
-                let k1 = half_bits_to_f32((kw >> 16) as u16);
-                a[p] = f32::mul_add(q0, k0, a[p]);
-                a[p] = f32::mul_add(q1, k1, a[p]);
-                p += 1;
+        // SAFETY: lane < 32 and the buffer is this tile's, published by the
+        // barrier above: the key row at stride K_ROW (16-byte aligned, so is
+        // each chunk read), the query row of warp w (G·HEAD f32, chunks of
+        // four).
+        unsafe {
+            let krow = ks
+                .add((tile % STAGES) * K_TILE_WORDS + lane * K_ROW)
+                .cast::<U32x4>();
+            let qrow = qs.add(w * HEAD).cast::<F32x4>();
+            let mut c = 0usize;
+            while c < ROW_CHUNKS {
+                let kw = (*krow.add(c)).0;
+                let (q_lo, q_hi) = ((*qrow.add(2 * c)).0, (*qrow.add(2 * c + 1)).0);
+                let qv = [
+                    q_lo[0], q_lo[1], q_lo[2], q_lo[3], q_hi[0], q_hi[1], q_hi[2], q_hi[3],
+                ];
+                let mut p = 0usize;
+                while p < 4 {
+                    let k0 = half_bits_to_f32(kw[p] as u16);
+                    let k1 = half_bits_to_f32((kw[p] >> 16) as u16);
+                    a[p] = f32::mul_add(qv[2 * p], k0, a[p]);
+                    a[p] = f32::mul_add(qv[2 * p + 1], k1, a[p]);
+                    p += 1;
+                }
+                c += 1;
             }
-            wd += 4;
         }
         let dot = (a[0] + a[1]) + (a[2] + a[3]);
         // The bias dot's order is the gate: REL fused multiply-adds
-        // ascending d against the staged tile.
-        let mut b = 0.0f32;
+        // ascending d against the lane's own table entries.
+        let mut bsum = 0.0f32;
         let mut d = 0usize;
         while d < REL {
             let rd = warp::shuffle_f32(r_lane, d as u32);
-            // SAFETY: d·KEY_TILE + lane < REL·KEY_TILE, inside the staged
-            // bias tile, published by the barrier above.
-            b = f32::mul_add(rd, unsafe { *bs.add(d * KEY_TILE + lane) }, b);
+            bsum = f32::mul_add(rd, bias_now[d], bsum);
             d += 1;
         }
         let sc = if live {
-            dot * scale + b
+            dot * scale + bsum
         } else {
             f32::NEG_INFINITY
         };
 
-        // SAFETY: the weight and value tiles are this block's, the value
-        // tile was published by the barrier above, and w < G.
-        unsafe { fold_tile(sc, live, &mut mx, &mut s_sum, &mut acc, ws, vs, w, lane) };
-        t0 += KEY_TILE;
+        // SAFETY: the weight tile is this block's, the value tile of this
+        // tile's buffer was published by the barrier above, and w < G.
+        unsafe {
+            fold_tile(
+                sc,
+                live,
+                &mut mx,
+                &mut s_sum,
+                &mut acc,
+                ws,
+                vs.add((tile % STAGES) * (V_TILE_WORDS / 2)),
+                w,
+                lane,
+            )
+        };
+        bias_now = bias_next;
+        if tile + STAGES < n_tiles {
+            // Every warp is done with this tile's buffers before the tile
+            // two ahead is copied over them.
+            thread::sync_threads();
+            stage_tile::<RING, G>(
+                (ks, vs32),
+                planes,
+                tile % STAGES,
+                t0 + STAGES * KEY_TILE,
+                hi,
+                plane_rows,
+                tid,
+            );
+        }
+        tile += 1;
     }
 
     // SAFETY: idx is inside the partials. The four dims 4·lane .. +3 are
@@ -285,10 +418,6 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool, const G: usize>(
         }
     }
 }
-
-/// u32 words of one key row, the span the score loop's rounds walk.
-const ROW_WORDS: usize = HEAD / 2;
-const _: () = assert!(ROW_WORDS.is_multiple_of(4));
 
 #[cuda_module]
 mod rel_bias_kernels {
@@ -336,14 +465,13 @@ mod rel_bias_kernels {
         part_v: DisjointSlice<f32>,
         part_ms: DisjointSlice<f32>,
     ) {
-        static mut QS: SharedArray<f32, { GROUP_3 * HEAD }> = SharedArray::UNINIT;
-        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
-        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut QS: SharedArray<f32, { GROUP_3 * HEAD }, 16> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { STAGES * K_TILE_WORDS }, 16> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { STAGES * V_TILE_WORDS / 2 }, 16> = SharedArray::UNINIT;
         static mut WS: SharedArray<f32, { GROUP_3 * KEY_TILE }> = SharedArray::UNINIT;
-        static mut BS: SharedArray<f32, { REL * KEY_TILE }> = SharedArray::UNINIT;
 
         // SAFETY: each `static mut` above is this block's own shared
-        // allocation, sized for GROUP_3 query heads and the bias tile; the
+        // allocation, sized for GROUP_3 query heads and the two staged tiles; the
         // raw form reaches it without a reference. The launch contract is
         // `seg_h128_rel`'s on a plane, and the block is GROUP_3 · 32
         // threads.
@@ -370,7 +498,6 @@ mod rel_bias_kernels {
                 SharedArray::as_raw_mut_ptr(&raw mut KS),
                 SharedArray::as_raw_mut_ptr(&raw mut VS),
                 SharedArray::as_raw_mut_ptr(&raw mut WS),
-                SharedArray::as_raw_mut_ptr(&raw mut BS),
             )
         };
     }
@@ -391,7 +518,7 @@ mod rel_bias_kernels {
             n_keys_buf.len() >= m,
             segs >= 1,
             extent >= 1,
-            ring_rows >= 1,
+            ring_rows >= 32,
             q.len() >= m * n_kv * 3 * 128,
             kc.len() >= n_kv * ring_rows * 128,
             vc.len() >= n_kv * ring_rows * 128,
@@ -420,14 +547,13 @@ mod rel_bias_kernels {
         part_v: DisjointSlice<f32>,
         part_ms: DisjointSlice<f32>,
     ) {
-        static mut QS: SharedArray<f32, { GROUP_3 * HEAD }> = SharedArray::UNINIT;
-        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
-        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut QS: SharedArray<f32, { GROUP_3 * HEAD }, 16> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { STAGES * K_TILE_WORDS }, 16> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { STAGES * V_TILE_WORDS / 2 }, 16> = SharedArray::UNINIT;
         static mut WS: SharedArray<f32, { GROUP_3 * KEY_TILE }> = SharedArray::UNINIT;
-        static mut BS: SharedArray<f32, { REL * KEY_TILE }> = SharedArray::UNINIT;
 
         // SAFETY: each `static mut` above is this block's own shared
-        // allocation, sized for GROUP_3 query heads and the bias tile; the
+        // allocation, sized for GROUP_3 query heads and the two staged tiles; the
         // raw form reaches it without a reference. The launch contract is
         // `seg_h128_rel`'s under RING, and the block is GROUP_3 · 32
         // threads.
@@ -454,7 +580,6 @@ mod rel_bias_kernels {
                 SharedArray::as_raw_mut_ptr(&raw mut KS),
                 SharedArray::as_raw_mut_ptr(&raw mut VS),
                 SharedArray::as_raw_mut_ptr(&raw mut WS),
-                SharedArray::as_raw_mut_ptr(&raw mut BS),
             )
         };
     }
@@ -501,14 +626,13 @@ mod rel_bias_kernels {
         part_v: DisjointSlice<f32>,
         part_ms: DisjointSlice<f32>,
     ) {
-        static mut QS: SharedArray<f32, { GROUP_6 * HEAD }> = SharedArray::UNINIT;
-        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
-        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut QS: SharedArray<f32, { GROUP_6 * HEAD }, 16> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { STAGES * K_TILE_WORDS }, 16> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { STAGES * V_TILE_WORDS / 2 }, 16> = SharedArray::UNINIT;
         static mut WS: SharedArray<f32, { GROUP_6 * KEY_TILE }> = SharedArray::UNINIT;
-        static mut BS: SharedArray<f32, { REL * KEY_TILE }> = SharedArray::UNINIT;
 
         // SAFETY: each `static mut` above is this block's own shared
-        // allocation, sized for GROUP_6 query heads and the bias tile; the
+        // allocation, sized for GROUP_6 query heads and the two staged tiles; the
         // raw form reaches it without a reference. The launch contract is
         // `seg_h128_rel`'s on a plane, and the block is GROUP_6 · 32
         // threads.
@@ -535,7 +659,6 @@ mod rel_bias_kernels {
                 SharedArray::as_raw_mut_ptr(&raw mut KS),
                 SharedArray::as_raw_mut_ptr(&raw mut VS),
                 SharedArray::as_raw_mut_ptr(&raw mut WS),
-                SharedArray::as_raw_mut_ptr(&raw mut BS),
             )
         };
     }
@@ -556,7 +679,7 @@ mod rel_bias_kernels {
             n_keys_buf.len() >= m,
             segs >= 1,
             extent >= 1,
-            ring_rows >= 1,
+            ring_rows >= 32,
             q.len() >= m * n_kv * 6 * 128,
             kc.len() >= n_kv * ring_rows * 128,
             vc.len() >= n_kv * ring_rows * 128,
@@ -585,14 +708,13 @@ mod rel_bias_kernels {
         part_v: DisjointSlice<f32>,
         part_ms: DisjointSlice<f32>,
     ) {
-        static mut QS: SharedArray<f32, { GROUP_6 * HEAD }> = SharedArray::UNINIT;
-        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
-        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut QS: SharedArray<f32, { GROUP_6 * HEAD }, 16> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { STAGES * K_TILE_WORDS }, 16> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { STAGES * V_TILE_WORDS / 2 }, 16> = SharedArray::UNINIT;
         static mut WS: SharedArray<f32, { GROUP_6 * KEY_TILE }> = SharedArray::UNINIT;
-        static mut BS: SharedArray<f32, { REL * KEY_TILE }> = SharedArray::UNINIT;
 
         // SAFETY: each `static mut` above is this block's own shared
-        // allocation, sized for GROUP_6 query heads and the bias tile; the
+        // allocation, sized for GROUP_6 query heads and the two staged tiles; the
         // raw form reaches it without a reference. The launch contract is
         // `seg_h128_rel`'s under RING, and the block is GROUP_6 · 32
         // threads.
@@ -619,7 +741,6 @@ mod rel_bias_kernels {
                 SharedArray::as_raw_mut_ptr(&raw mut KS),
                 SharedArray::as_raw_mut_ptr(&raw mut VS),
                 SharedArray::as_raw_mut_ptr(&raw mut WS),
-                SharedArray::as_raw_mut_ptr(&raw mut BS),
             )
         };
     }
@@ -770,8 +891,9 @@ impl RelBiasKernels {
 
     /// Enqueue `m` rows at [`GROUP_3`] or [`GROUP_6`] query heads a key head
     /// (`n_head` must equal `3 · n_kv` or `6 · n_kv`; any other ratio is
-    /// refused by name, as a non-finite scale, a zero extent or count or a
-    /// short buffer is). A
+    /// refused by name, as a non-finite scale, a zero extent or count, a
+    /// ring of fewer rows than a key tile, a key or value plane not 16-byte
+    /// aligned or a short buffer is). A
     /// live count of zero or past `ctx` raises [`FaultSite::KeyCount`] and
     /// the row is NaN.
     pub fn enqueue(
@@ -829,6 +951,15 @@ impl RelBiasKernels {
                 format!("the score scale must be finite, got {scale}"),
             ));
         }
+        if let Some(rows) = ring_rows.filter(|&rows| rows < KEY_TILE) {
+            return Err(GpuError::shape(
+                what,
+                format!("a ring holds at least a key tile of {KEY_TILE} rows, got {rows}"),
+            ));
+        }
+        // The tiles are staged by 16-byte copies.
+        check_alignment::<U32x4, _>(what, "kc", kc)?;
+        check_alignment::<U32x4, _>(what, "vc", vc)?;
         let plane_rows = ring_rows.unwrap_or(ctx);
         let segs = window_segments(window);
         let lens = [

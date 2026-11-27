@@ -28,8 +28,10 @@
 //!    live counts 1, 511, 512, 1023, 1024 and 1025 (the last with the oldest key dropped), global
 //!    rows at 1, 1024 and 1100 (the last with 76 keys past the extent, where the bias reads 0) —
 //!    against an f64 re-dot within [`ATTN_BAND`], a rerun bit-identical, the ring form over a
-//!    ring of the full context the plane's bits, a live count past `ctx` raising `KeyCount` with
-//!    NaN rows, and the refusals by name.
+//!    ring of the full context the plane's bits, a ring of 1,030 rows whose window wraps (inside a
+//!    key tile for some counts, on a tile's edge for others) the plane's bits over the cache the
+//!    ring repeats, a live count past `ctx` raising `KeyCount` with NaN rows, and the refusals by
+//!    name (a ring of fewer rows than a key tile and a key plane off 16-byte alignment among them).
 //! 3. `sink`: a launch whose every sink is 30 above every logit leaves its rows at zero weight
 //!    within [`ATTN_BAND`] — the sink column the softmax's, not an afterthought.
 //! 4. `fx_a`: prompt a's windowed slot 1 — every (token, head) row — `Qcur` as the query rows,
@@ -53,7 +55,9 @@
 //! `fx_e`'s turnover rows; (b) a merge that drops the sink column — `sink`'s rows; (c) a clip
 //! threshold one ulp off — `epilogue`'s bit rule on the rows above the threshold; (d) a tau of 1
 //! on a global row — `epilogue`'s second token; (e) a pad rule that reads the table's last column
-//! — `attention`'s global 1,100 row and `fx_e`'s deep rows.
+//! — `attention`'s global 1,100 row and `fx_e`'s deep rows; (f) a ring step that does not wrap its
+//! slot past the ring's end — the wrapped ring's rows; (g) a launch that takes a ring under a key
+//! tile, and (h) one that takes a key plane off 16-byte alignment — the two refusals.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -65,7 +69,7 @@ mod gate {
     use bloomery_gpu::flash_gqa::window_segments;
     use bloomery_gpu::qk_clip::{HEAD, QkClipArgs, QkClipKernels, REL};
     use bloomery_gpu::rel_bias::{RelBiasArgs, RelBiasKernels};
-    use bloomery_gpu::{Gpu, GpuError};
+    use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
     use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{
         GateError, GateRng, RefManifest, bits_equal, checks_failed, load_ref_in, max_rel_err,
@@ -105,6 +109,9 @@ mod gate {
         (1.0 + TAU_ALPHA * ratio.ln()) as f32
     }
 
+    /// The wrapped ring's rows: past the window of 1,024 keys, below the count the clause's rows
+    /// reach.
+    const WRAP_RING: usize = 1030;
     /// A sink this far above every logit dominates the denominator: the row's weights all but
     /// vanish.
     const SINK_OVER: f32 = 30.0;
@@ -837,6 +844,71 @@ mod gate {
         Ok(ok)
     }
 
+    /// The ring that wraps: a ring of [`WRAP_RING`] rows against the plane over the same rows, the
+    /// plane a cache that repeats the ring's rows, so both read the same values at every key and
+    /// their output is the same bits. The counts put the ring's end inside a key tile (a count of
+    /// 1,041 starts its window at key 17, and its last tile, keys 1,009 to 1,040, spans key 1,030)
+    /// and, at 1,030, on a tile's edge.
+    fn wrap_clauses(dev: &Dev, rng: &mut GateRng, n_head: usize) -> Result<Vec<bool>, GateError> {
+        const CTX: usize = 1100;
+        let counts = [1030u32, 1031, 1041, 1055, 1100];
+        let m = counts.len();
+        let mut ring_planes = [Vec::new(), Vec::new()];
+        let mut planes = [vec![0u16; N_KV * CTX * HEAD], vec![0u16; N_KV * CTX * HEAD]];
+        for (ring, plane) in ring_planes.iter_mut().zip(planes.iter_mut()) {
+            *ring = (0..N_KV * WRAP_RING * HEAD)
+                .map(|_| f32_to_f16_bits(rng.uni(-1.0, 1.0)))
+                .collect();
+            for kh in 0..N_KV {
+                for p in 0..CTX {
+                    let from = (kh * WRAP_RING + p % WRAP_RING) * HEAD;
+                    plane[(kh * CTX + p) * HEAD..(kh * CTX + p + 1) * HEAD]
+                        .copy_from_slice(&ring[from..from + HEAD]);
+                }
+            }
+        }
+        let q: Vec<f32> = (0..m * n_head * HEAD)
+            .map(|_| rng.uni(-1.0, 1.0) * 3.0)
+            .collect();
+        let r: Vec<f32> = (0..m * n_head * REL).map(|_| rng.uni(-1.0, 1.0)).collect();
+        let sinks = vec![0.0f32; m * n_head];
+        let bias = seeded_bias(rng);
+        let on_plane = rel_launch(
+            dev,
+            &q,
+            &planes[0],
+            &planes[1],
+            &counts,
+            &r,
+            &bias,
+            WINDOW,
+            &sinks,
+            None,
+            (n_head, m, CTX),
+        )?;
+        let on_ring = rel_launch(
+            dev,
+            &q,
+            &ring_planes[0],
+            &ring_planes[1],
+            &counts,
+            &r,
+            &bias,
+            WINDOW,
+            &sinks,
+            Some(WRAP_RING),
+            (n_head, m, CTX),
+        )?;
+        Ok(vec![
+            clause(
+                &format!("attention {n_head} heads wrapped ring"),
+                bits_equal(&on_plane, &on_ring),
+                &format!("a ring of {WRAP_RING} rows at counts {counts:?}: the plane's bits"),
+            ),
+            dev.no_fault(&format!("attention {n_head} heads wrapped ring"))?,
+        ])
+    }
+
     /// A launch whose every sink is 30 above every logit: the rows' weights vanish.
     fn sink_clauses(dev: &Dev, rng: &mut GateRng, n_head: usize) -> Result<Vec<bool>, GateError> {
         let group = n_head / N_KV;
@@ -1001,6 +1073,54 @@ mod gate {
                 N_HEAD,
             );
             ok.push(refused(name, r2));
+        }
+        // A ring of fewer rows than a key tile, and a key plane 8 bytes into its allocation (the
+        // tiles are staged by 16-byte copies): refused by name before any launch.
+        let pad = DeviceBuffer::<u16>::zeroed(s, N_KV * ctx * HEAD + 8)?;
+        let off = DeviceTensor::<u16>::window_of(&pad, 8, N_KV * ctx, HEAD)?;
+        for (name, ring_rows, kc, want) in [
+            ("rel ring under a key tile", Some(16), &kc, "key tile"),
+            (
+                "rel key plane misaligned",
+                None,
+                off.buf(),
+                "16-byte aligned",
+            ),
+        ] {
+            let mut pv = DeviceBuffer::<f32>::zeroed(s, N_HEAD * 16 * HEAD)?;
+            let mut pm = DeviceBuffer::<f32>::zeroed(s, N_HEAD * 16 * 2)?;
+            let mut yy = DeviceBuffer::<f32>::zeroed(s, N_HEAD * HEAD)?;
+            let r3 = dev.rel.enqueue(
+                s,
+                RelBiasArgs {
+                    q: &q,
+                    kc,
+                    vc: &vc,
+                    n_keys: &nk,
+                    r: &r,
+                    bias: &bias,
+                    extent: EXTENT,
+                    scale: scale(),
+                    n_kv: N_KV,
+                    ctx,
+                    ring_rows,
+                    m: 1,
+                    window: WINDOW,
+                    sinks: &sinks,
+                    part_v: &mut pv,
+                    part_ms: &mut pm,
+                    fault: dev.gpu.unlabelled_sink(),
+                    y: &mut yy,
+                },
+                N_HEAD,
+            );
+            ok.push(clause(
+                &format!("refusal {name}"),
+                r3.as_ref().is_err_and(|e| {
+                    matches!(e, GpuError::Shape { .. }) && e.to_string().contains(want)
+                }),
+                &format!("{r3:?}"),
+            ));
         }
         // The epilogue's refusals.
         let (mut q, mut k, mut v, mut r) = (
@@ -1486,6 +1606,7 @@ mod gate {
         results.extend(file_clip_clauses(&dev, &mut rng)?);
         for n_head in [N_HEAD, N_HEAD_SMALL] {
             results.extend(attention_clauses(&dev, &mut rng, n_head)?);
+            results.extend(wrap_clauses(&dev, &mut rng, n_head)?);
             results.extend(sink_clauses(&dev, &mut rng, n_head)?);
         }
         results.extend(refusal_clauses(&dev, &mut rng)?);
