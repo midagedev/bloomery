@@ -1,27 +1,36 @@
 //! GPU gate for the card's IQ1_S and IQ2_XXS quantizer (`bloomery_gpu::iq_quant`) and the binary built on it
-//! (`bloomery-quantize`): its bytes are ggml's, the quantizer llama-quantize runs, row for row.
+//! (`bloomery-quantize`).
 //!
-//! The oracle is `iq_quant_ref` (`tools/ref/iq_quant_ref.cpp`, `just
+//!     gate_iq_quant [--ref]
+//!
+//! Without `--ref` (`just gate-gpu-iq-quant`) the gate needs no reference tree: it runs `bloomery-quantize` as a process
+//! over seeded inputs, clauses 5 to 7 below (in clause 5 the stacks' types the rules give instead of ggml's bytes).
+//! With `--ref` (`just lab-iq-quant-ref`: a lab, no landing selects it) it also holds the card's bytes and the tool's to
+//! ggml's, the quantizer llama-quantize runs, row for row: clauses 1 to 4, the stacks' bytes of clause 5 and clause 8.
+//! The inputs are the same either way: the cases of clauses 1 to 3 are drawn from the seeded generator in both modes, so
+//! the generator stands where it stood when the gate ran them before the set is built.
+//!
+//! The oracle of `--ref` is `iq_quant_ref` (`tools/ref/iq_quant_ref.cpp`, `just
 //! build-iq-quant-ref`), linked to the K3.1 quantization tree's libggml-base:
 //! it widens the source rows with ggml's `to_float` and quantizes each
 //! expert's rows with `ggml_quantize_chunk` and that expert's importance row.
 //! The card gets the same source bytes and importance matrix. Every input is
-//! fixed (seeded), so the gate is bit identity.
+//! fixed (seeded), so the comparison is bit identity.
 //!
-//! 1. mxfp4: MXFP4 rows (the K3.1 experts' file type) of 3584 values, two
+//! 1. mxfp4 (`--ref`): MXFP4 rows (the K3.1 experts' file type) of 3584 values, two
 //!    experts of 12 rows with their own importance rows, a zero in every 13
 //!    (a column the calibration never reached): E8M0 scales over 115..=126
 //!    and random codes, so a sub-block holds at most 15 distinct values and
 //!    its sort meets ties everywhere, `-0` beside `0`.
-//! 2. f32: 24 rows of 2048 values a case — uniform, a sum of four uniforms,
+//! 2. f32 (`--ref`): 24 rows of 2048 values a case — uniform, a sum of four uniforms,
 //!    zero sub-blocks between small integers, sub-blocks of 1e-14 (IQ1_S's
 //!    zero threshold but not IQ2_XXS's), one large value in eight,
 //!    importance with zeros, and values of three decimals (ties) under
 //!    importance with zeros: a weight of zero makes IQ1_S's split search
 //!    meet equal costs, so its pick depends on the sort's order of equal
 //!    values, ggml's stable one.
-//! 3. f16, bf16: four of the f32 cases rounded to F16 and to BF16 rows.
-//! 4. host: `gguf::iq_quant::quantize_row` on the first two rows of every case
+//! 3. f16, bf16 (`--ref`): four of the f32 cases rounded to F16 and to BF16 rows.
+//! 4. host (`--ref`): `gguf::iq_quant::quantize_row` on the first two rows of every case
 //!    is the same bytes, so the host rule is the card's.
 //! 5. set: `bloomery-quantize` (built beside this binary) over a two-shard
 //!    set — an MXFP4 and a BF16 gate stack, an MXFP4 and an F16 down stack
@@ -29,25 +38,25 @@
 //!    one the rules type Q4_K — with an imatrix whose counts round to 3, to
 //!    0 (importance all ones) and 5, at `--batch 2` and `--check 5`: the
 //!    output's shards hold the input's metadata as llama-quantize writes it,
-//!    the names, dims and order, the copied tensor's bytes, ggml's bytes for
-//!    the stacks under the importance llama-quantize computes, and the host
-//!    K-quant rule's bytes for the trunk weight. `--cpu` writes the same
-//!    bytes as the card; `--plan` writes nothing and names every tensor; an
-//!    existing output is refused.
+//!    the names, dims and order, the copied tensor's bytes, the stacks' types the
+//!    rules give (`--ref`: and ggml's bytes for the stacks under the importance
+//!    llama-quantize computes), and the host K-quant rule's bytes for the trunk
+//!    weight. `--cpu` writes the same bytes as the card; `--plan` writes nothing
+//!    and names every tensor; an existing output is refused.
 //! 6. check: the `--check` comparison names the tensor, expert, row, super-block
 //!    and byte of one flipped byte of the card's output, and passes the
 //!    unflipped bytes.
 //! 7. refusals: a llama plan that lacks a tensor or types a stack otherwise,
 //!    an Inf or NaN in an F32, F16 or BF16 row, an MXFP4 scale byte of 255, a
-//!    negative or Inf importance sum or count, and a source type the oracle
+//!    negative or Inf importance sum or count, and a source type the quantizer
 //!    does not cover each end the tool at 1 with the name in its message
 //!    and no file left.
-//! 8. e2e: the K3 fixture requantized to MXFP4 experts (llama-quantize), a
+//! 8. e2e (`--ref`): the K3 fixture requantized to MXFP4 experts (llama-quantize), a
 //!    synthetic imatrix over its stacks, then `bloomery-quantize`'s one pass
 //!    (the card for the stacks, `--check 2`) and the tree's `llama-quantize`
 //!    write the same file, byte for byte, with both IQ types among the
-//!    stacks. The host-only gates `gate-quantize-oracle`, `gate-quantize-e2e`
-//!    and `gate-quantize-plan` hold the K-quant rules, the whole file on the
+//!    stacks. The host-only labs `lab-quantize-oracle`, `lab-quantize-e2e`
+//!    and `lab-quantize-plan` hold the K-quant rules, the whole file on the
 //!    host and the plan.
 //!
 //! A row that differs prints its case, type, row and first differing
@@ -395,9 +404,10 @@ mod clauses {
             .collect()
     }
 
-    /// Whether the output set equals the input where it must and ggml's bytes where it quantized.
+    /// Whether the output set equals the input where it must, types the stacks as the rules say and, with the oracle
+    /// (`--ref`), holds ggml's bytes where it quantized.
     fn verify_set(
-        oracle_bin: &Path,
+        oracle_bin: Option<&Path>,
         dir: &Path,
         fix: &SetFix,
         out_first: &Path,
@@ -467,24 +477,32 @@ mod clauses {
             }
         }
         for s in &fix.stacks {
-            let case = Case {
-                name: s.name,
-                ty: s.ty,
-                src: input.data(s.name)?.to_vec(),
-                n_per_row: NE0,
-                rows: NE1 * N_EXP,
-                rows_per_expert: NE1,
-                qw: s.qw.clone(),
-            };
-            let want = oracle(oracle_bin, dir, &case, s.kind)?;
             let (_, t) = output.find(s.name).expect("names checked above");
             let want_ty = match s.kind {
                 IqKind::Iq1S => GgmlType::IQ1_S,
                 IqKind::Iq2Xxs => GgmlType::IQ2_XXS,
             };
-            let same = same_rows("set", s.kind, NE0, output.data(s.name)?, &want);
-            if t.ty != want_ty || !same {
-                println!("  set: {} type {:?}, bytes = ggml {same}", s.name, t.ty);
+            let same = match oracle_bin {
+                Some(bin) => {
+                    let case = Case {
+                        name: s.name,
+                        ty: s.ty,
+                        src: input.data(s.name)?.to_vec(),
+                        n_per_row: NE0,
+                        rows: NE1 * N_EXP,
+                        rows_per_expert: NE1,
+                        qw: s.qw.clone(),
+                    };
+                    let want = oracle(bin, dir, &case, s.kind)?;
+                    Some(same_rows("set", s.kind, NE0, output.data(s.name)?, &want))
+                }
+                None => None,
+            };
+            if t.ty != want_ty || same == Some(false) {
+                println!(
+                    "  set: {} type {:?} (the rules say {want_ty:?}), bytes = ggml {same:?}",
+                    s.name, t.ty
+                );
                 ok = false;
             }
         }
@@ -492,7 +510,7 @@ mod clauses {
             println!("  set: a.f32 is not copied byte for byte");
             ok = false;
         }
-        // the trunk weight: the host K-quant rule's bytes (`gate-quantize-oracle` holds that rule to ggml)
+        // the trunk weight: the host K-quant rule's bytes (`lab-quantize-oracle` holds that rule to ggml)
         let src = input.data("blk.0.attn_q.weight")?;
         let vals: Vec<f32> = src
             .as_chunks::<4>()
@@ -531,7 +549,7 @@ mod clauses {
     }
 
     pub(super) fn tool_clauses(
-        oracle_bin: &Path,
+        oracle_bin: Option<&Path>,
         dir: &Path,
         rng: &mut Rng,
     ) -> Result<bool, GateError> {
@@ -562,8 +580,13 @@ mod clauses {
         }
         let first_card = shard_files(&out_card)[0].clone();
         let ok = verify_set(oracle_bin, dir, &fix, &first_card)?;
+        let stacks = if oracle_bin.is_some() {
+            "the stacks have the types the rules give and equal ggml"
+        } else {
+            "the stacks have the types the rules give"
+        };
         println!(
-            "{} set: bloomery-quantize over two shards (MXFP4, BF16 and F16 stacks, --check 5, the llama.cpp plan): metadata, names, dims and the F32 copy equals the input, the stacks equal ggml, the trunk weight equals the host K-quant rule",
+            "{} set: bloomery-quantize over two shards (MXFP4, BF16 and F16 stacks, --check 5, the llama.cpp plan): metadata, names, dims and the F32 copy equals the input, {stacks}, the trunk weight equals the host K-quant rule",
             verdict(ok)
         );
         all &= ok;
@@ -1346,27 +1369,17 @@ fn same_rows(what: &str, kind: IqKind, n_per_row: usize, got: &[u8], want: &[u8]
     bad == 0
 }
 
+/// Clauses 1 to 4 (`--ref`): the card's rows and the host rule's first two rows of every case equal the oracle's, on both IQ types.
 #[cfg(feature = "gpu")]
-fn run() -> Result<(), GateError> {
-    let bin = data_dir().join("bin/iq_quant_ref");
-    if !bin.is_file() {
-        return Err(format!("no oracle at {} (just build-iq-quant-ref)", bin.display()).into());
-    }
-    let dir: PathBuf = std::env::temp_dir().join(format!("gate-iq-quant-{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
+fn card_cases(bin: &Path, dir: &Path, cases: &[Case]) -> Result<bool, GateError> {
     let gpu = Gpu::new()?;
     let stream = gpu.stream();
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    let mut cases = vec![mxfp4_case(&mut rng)];
-    let f32c = f32_cases(&mut rng);
-    cases.extend(half_cases(&f32c));
-    cases.extend(f32c);
     let mut ok = true;
     for kind in [IqKind::Iq1S, IqKind::Iq2Xxs] {
         let q = IqQuant::new(gpu.context(), stream, kind)?;
         let tables = GridTables::new(kind);
-        for case in &cases {
-            let want = oracle(&bin, &dir, case, kind)?;
+        for case in cases {
+            let want = oracle(bin, dir, case, kind)?;
             let qw = DeviceBuffer::from_host(stream, &case.qw)?;
             let t0 = std::time::Instant::now();
             let got = q.quantize(
@@ -1405,17 +1418,58 @@ fn run() -> Result<(), GateError> {
             ok &= card && host_ok;
         }
     }
-    ok &= clauses::tool_clauses(&bin, &dir, &mut rng)?;
-    ok &= clauses::e2e_clause(&dir, &mut rng)?;
+    Ok(ok)
+}
+
+#[cfg(feature = "gpu")]
+fn run() -> Result<(), GateError> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let reference = match args.as_slice() {
+        [] => false,
+        [a] if a.as_str() == "--ref" => true,
+        _ => {
+            return Err(
+                "usage: gate_iq_quant [--ref]  (--ref: the comparisons with ggml, `just lab-iq-quant-ref`)"
+                    .into(),
+            );
+        }
+    };
+    let bin = data_dir().join("bin/iq_quant_ref");
+    if reference && !bin.is_file() {
+        return Err(format!("no oracle at {} (just build-iq-quant-ref)", bin.display()).into());
+    }
+    let dir: PathBuf = std::env::temp_dir().join(format!("gate-iq-quant-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    // Drawn with or without `--ref`: the set's inputs come from this generator after the cases, so the mode moves none.
+    let mut cases = vec![mxfp4_case(&mut rng)];
+    let f32c = f32_cases(&mut rng);
+    cases.extend(half_cases(&f32c));
+    cases.extend(f32c);
+    let mut ok = true;
+    if reference {
+        ok &= card_cases(&bin, &dir, &cases)?;
+    }
+    ok &= clauses::tool_clauses(reference.then_some(bin.as_path()), &dir, &mut rng)?;
+    if reference {
+        ok &= clauses::e2e_clause(&dir, &mut rng)?;
+    }
     std::fs::remove_dir_all(&dir)?;
     if !ok {
         return Err(bloomery_gpu_gates::checks_failed());
     }
-    println!(
-        "PASSED: gate_iq_quant IQ1_S and IQ2_XXS bytes of the card equal ggml's (libggml-base of the K3.1 \
-         quantization tree) on MXFP4 rows over two experts, seven f32 cases and four each of f16 and bf16, and the host rule's on two rows of each; \
-         bloomery-quantize writes a set of the input's shards with the stacks ggml's (--cpu the same bytes), refuses what it must by name, \
-         and its output through llama-quantize equals llama-quantize alone on the K3 fixture"
-    );
+    if reference {
+        println!(
+            "PASSED: gate_iq_quant --ref IQ1_S and IQ2_XXS bytes of the card equal ggml's (libggml-base of the K3.1 \
+             quantization tree) on MXFP4 rows over two experts, seven f32 cases and four each of f16 and bf16, and the host rule's on two rows of each; \
+             bloomery-quantize writes a set of the input's shards with the stacks ggml's (--cpu the same bytes), refuses what it must by name, \
+             and its output through llama-quantize equals llama-quantize alone on the K3 fixture"
+        );
+    } else {
+        println!(
+            "PASSED: gate_iq_quant bloomery-quantize writes a set of the input's shards (--cpu the same bytes as the card), \
+             checks the card's rows against the host rule, and refuses what it must by name"
+        );
+    }
     Ok(())
 }

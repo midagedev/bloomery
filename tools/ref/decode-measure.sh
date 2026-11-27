@@ -21,6 +21,14 @@ TOKENS=${BLOOMERY_DECODE_TOKENS:-$REF_TOKENS}
 N=${BLOOMERY_DECODE_N:-8}
 BIN=${BLOOMERY_DECODE_BIN:-$DECODE_BIN}
 [ -x "$BIN" ] || { echo "no decode binary at $BIN — run: just build-decode" >&2; exit 2; }
+# The reference arms run ik's llama-bench (a live tree no gate reads): IK_ARMS=0 measures bloomery alone, and a missing tree is
+# refused by name here, before the lease, never a failed arm after ours was timed.
+IK_ARMS=${IK_ARMS:-1}
+if [ "$IK_ARMS" != 0 ]; then
+  # shellcheck source=tools/ref/need-tree.sh
+  source "${BASH_SOURCE[0]%/*}/need-tree.sh"
+  need_tree --rc 2 decode-measure.sh IKBIN "$IKBIN" "ik's llama-bench; IK_ARMS=0 measures bloomery alone"
+fi
 
 # The thread count changes the result, so the witness carries it: without it, a row from another
 # day could not say what differed.
@@ -86,18 +94,23 @@ if [ -n "${SPINS:-}" ]; then
   done
 fi
 
-echo
-echo "=== ik_llama.cpp, same file, same lease, CPU only ==="
-witness pre-ik
-lease_bounded "$LEASE_ARM_BOUND" env CUDA_VISIBLE_DEVICES= "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2
-witness post-ik
+if [ "$IK_ARMS" != 0 ]; then
+  echo
+  echo "=== ik_llama.cpp, same file, same lease, CPU only ==="
+  witness pre-ik
+  lease_bounded "$LEASE_ARM_BOUND" env CUDA_VISIBLE_DEVICES= "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2
+  witness post-ik
 
-# 기본 플래그의 ik는 ik의 천장이 아니다. 2026-09-21에 같은 임대에서 다섯 조합을 쟀고
-# (기본 82.66 / -fmoe 82.22 / -rtr 83.77 / -fmoe -rtr 84.03 / 아래 조합 84.55 tok/s)
-# 가장 빠른 조합을 같은 임대 안에서 한 번 더 잰다 — "넘었다"는 말은 이 행을 상대로만 한다.
-echo
-echo "=== ik_llama.cpp, fastest measured flags ($IK_BEST_FLAGS) ==="
-witness pre-ik-best
-# shellcheck disable=SC2086
-lease_bounded "$LEASE_ARM_BOUND" env CUDA_VISIBLE_DEVICES= "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2 $IK_BEST_FLAGS
-witness post-ik-best
+  # 기본 플래그의 ik는 ik의 천장이 아니다. 2026-09-21에 같은 임대에서 다섯 조합을 쟀고
+  # (기본 82.66 / -fmoe 82.22 / -rtr 83.77 / -fmoe -rtr 84.03 / 아래 조합 84.55 tok/s)
+  # 가장 빠른 조합을 같은 임대 안에서 한 번 더 잰다 — "넘었다"는 말은 이 행을 상대로만 한다.
+  echo
+  echo "=== ik_llama.cpp, fastest measured flags ($IK_BEST_FLAGS) ==="
+  witness pre-ik-best
+  # shellcheck disable=SC2086
+  lease_bounded "$LEASE_ARM_BOUND" env CUDA_VISIBLE_DEVICES= "$IKBIN" -m "$MODEL" -ngl 0 -t 32 -p 0 -n "$N" -r 2 $IK_BEST_FLAGS
+  witness post-ik-best
+else
+  echo
+  echo "=== ik_llama.cpp arms: off (IK_ARMS=0); no reference row in this lease ==="
+fi

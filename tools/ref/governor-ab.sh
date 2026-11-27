@@ -10,6 +10,10 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 TOKENS=$REF_TOKENS
 BIN=$DECODE_BIN
+# Both engines are timed in every round, and ik's llama-bench is a live tree no gate reads: refused by name before the lease and the governor change.
+# shellcheck source=tools/ref/need-tree.sh
+source "${BASH_SOURCE[0]%/*}/need-tree.sh"
+need_tree --rc 2 governor-ab.sh IKBIN "$IKBIN" "ik's llama-bench; this runner times both engines"
 G=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
 ORIG=$(cat "$G")
 setgov() { for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo "$1" > "$f"; done; }

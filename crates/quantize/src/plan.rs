@@ -173,8 +173,8 @@ const CARD_WEIGHTS_PER_S: [(IqKind, f64); 2] = [(IqKind::Iq1S, 1.09e9), (IqKind:
 /// The drive rates `--plan` derives its I/O terms from, bytes per second.
 const READ_BPS: f64 = 1.6e9;
 const WRITE_BPS: f64 = 1.5e9;
-/// The host rule's rate on one thread, weights per second, per target: measured by `gate-quantize-oracle`'s rate
-/// line on the box (docs/quantize.md), carried here as the plan's derived term.
+/// The host rule's rate on one thread, weights per second, per target: measured on the box (docs/quantize.md),
+/// carried here as the plan's derived term.
 const HOST_WEIGHTS_PER_S_PER_THREAD: f64 = 8.0e6;
 
 /// The derived wall's terms, seconds.

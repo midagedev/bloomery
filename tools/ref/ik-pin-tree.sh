@@ -26,6 +26,8 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../gate-bound.sh" || exit 70 # bounded, the one owner of a bounded child
 # shellcheck source=tools/grep-answer.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../grep-answer.sh" || exit 70 # grep's exit rule: 1 is an answer, 2 no verdict
+# shellcheck source=tools/ref/need-tree.sh
+source "$(dirname "${BASH_SOURCE[0]}")/need-tree.sh" || exit 70 # the named refusal of a missing tree
 SRC_TREE=/home/user/ik_llama.cpp
 JOBS=24 # of the box's 64 threads: other rounds build beside it
 BOUND=${BLOOMERY_BUILD_BOUND:-1800}
@@ -125,6 +127,8 @@ read -r PIN < "$pin_file" || { echo "ik-pin-tree: cannot read $pin_file" >&2; ex
 [[ $PIN =~ ^[0-9a-f]{40}$ ]] || { echo "ik-pin-tree: $pin_file holds '$PIN', not a 40-digit lower-case commit" >&2; exit 64; }
 name=$(basename "$pin_file" -ik.pin)
 IK=/home/user/ik-$name-${PIN:0:8}
+# The shared repo every pinned tree is a worktree of, and whose build the pinned tree's cache is compared with.
+need_tree ik-pin-tree SRC_TREE "$SRC_TREE" "clone ik_llama.cpp there and build it first"
 
 # From the user's home: box.sh runs this in root's remote directory, which the user cannot stat.
 export USER_PATH=/usr/local/bin:/usr/bin:/bin

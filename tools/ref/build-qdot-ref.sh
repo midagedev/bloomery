@@ -95,9 +95,11 @@ chmod +x "$out"
 EOF
   chmod +x "$t/stub/g++"
   # run ARGS…: the script with those arguments in a fresh output directory; RC and BUILT (what it built there).
+  # The ik tree the harness flags name: the directories ref_cxx checks, empty (the stub g++ reads none).
+  mkdir -p "$t/ik/ggml/include" "$t/ik/ggml/src/iqk" "$t/ik/build/ggml/src"
   run() {
     rm -rf "${t:?}/bin" "${t:?}/data"
-    PATH=$t/stub:$PATH BLOOMERY_V41_MODEL=x BLOOMERY_DATA=$t/data Q3K_OUT=$t/bin bash "${BASH_SOURCE[0]}" "$@" > "$t/out" 2>&1
+    IK=${IK:-$t/ik} PATH=$t/stub:$PATH BLOOMERY_V41_MODEL=x BLOOMERY_DATA=$t/data Q3K_OUT=$t/bin bash "${BASH_SOURCE[0]}" "$@" > "$t/out" 2>&1
     RC=$?
     BUILT=$(find "$t/bin" -type f ! -name '*.args' -exec basename {} \; 2> /dev/null | sort | tr '\n' ' ')
   }
@@ -122,6 +124,11 @@ EOF
   check files-built "$BUILT" 'iq3xxs_ref mxfp4_x4_ref '
   check iq3xxs-file "$(cat "$t/bin/iq3xxs_ref.args" 2> /dev/null)" /x/iq3.gguf
   check mxfp4-file "$(cat "$t/bin/mxfp4_x4_ref.args" 2> /dev/null)" /x/mx.gguf
+  # No ik tree: refused by name (66, one line naming IK), nothing built, whatever the harness.
+  IK=$t/no-ik run q4k_x4_ref
+  check no-tree-rc "$RC" 66
+  check no-tree-built "$BUILT" ''
+  check no-tree-named "$(grep -c 'no live reference tree: IK=' "$t/out")" 1
   # The retired one-file name is refused by name, whatever its value, before anything is built.
   for v in x ''; do
     export BLOOMERY_V4_MODEL=$v

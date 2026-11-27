@@ -113,9 +113,9 @@ process starts = ~75 min, plus the copy (167 GB at the HDD's read rate: [placeho
 
 Question: are the bytes the bytes `llama-quantize` writes? The frame shows identity, not closeness.
 
-- **Fixture, already proved**: `just gate-gpu-iq-quant`'s end-to-end clause on the K3 fixture: `bloomery-quantize` then
+- **Fixture, already proved**: `just lab-iq-quant-ref`'s end-to-end clause on the K3 fixture (a lab: it needs the K3.1 quantization tree): `bloomery-quantize` then
   `llama-quantize` equals `llama-quantize` alone, byte for byte. The frame is two `sha256sum` lines (whole file) that match,
-  next to the gate's green line. The box run is the gate's: [placeholder: filled from the lead's next `gate-gpu-iq-quant`
+  next to the gate's green line. The box run is the lab's: [placeholder: filled from the lead's next `lab-iq-quant-ref`
   record, with its commit and card line].
 - **At scale**: the mid-size run's three finals, `sha256sum` of A, B and C: the same hash three times (63 GB each, cached or
   read at the drive's rate; ~40 s each at ~1.5 GB/s single-thread SHA-NI [derived: assumed rate, unmeasured]). This is the whole-file
@@ -182,7 +182,7 @@ box's serving path; the source (1.56 TB) fits no tier but the drive. Placement n
    while the page cache is clean, the reference before the host rule) with the output drive emptied between arms.
 5. **Quality (Q1)**: v0 is the production set, so only the scoring pass is new; v1 needs its own card set + trunk run (91 min each
    on the card path) and the scoring pass; the lead scores and fills chart 5.
-6. `just gate-gpu-iq-quant` (fixture frame) with its record line, and `bloomery-quantize --plan` on K3.1 for the frame's plan
+6. `just lab-iq-quant-ref` (fixture frame) with its record line, and `bloomery-quantize --plan` on K3.1 for the frame's plan
    lines (reads headers only, no write).
 
 Sittings S1 and S2 can share one lease window per card; they need the A6000 and the whole host, so they do not overlap each

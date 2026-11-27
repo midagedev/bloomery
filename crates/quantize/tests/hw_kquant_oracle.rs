@@ -2,7 +2,7 @@
 //! linked to the K3.1 quantization tree's libggml-base, the library llama-quantize calls. For each of Q3_K, Q4_K,
 //! Q5_K, Q6_K and Q8_0 and for each of a set of seeded row families, every row quantized with an importance row per
 //! expert (ggml's `_impl` rules) and without (its `_ref` rules) must equal the oracle's bytes. Run by
-//! `just gate-quantize-oracle` (the box, no card).
+//! `just lab-quantize-oracle` (the box, no card; it needs the K3.1 quantization tree and `iq_quant_ref`).
 
 mod common;
 

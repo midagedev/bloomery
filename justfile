@@ -829,14 +829,27 @@ gate-gpu-iq:
 gate-gpu-iq-sel *ARGS:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_sel {{ARGS}}'
 
-# The card's IQ1_S and IQ2_XXS quantizer (bloomery_gpu::iq_quant) against ggml's bytes: iq_quant_ref linked to the K3.1
-# quantization tree's libggml-base (just build-iq-quant-ref) on MXFP4 rows over two experts and seven f32 cases, row for
-# row, on F32, F16, BF16 and MXFP4 sources; the host rule (gguf::iq_quant) on two rows of each; bloomery-quantize over a
-# two-shard set (metadata, order and copies the input's, the stacks ggml's on the card and with --cpu, --check on and
-# its mismatch named, Inf, NaN, negative-importance and uncovered-type refusals named with no file left), and over the K3
-# fixture's set then the K3.1 quantization tree's llama-quantize equal to llama-quantize alone, byte for byte.
+# bloomery-quantize (the card's IQ1_S and IQ2_XXS quantizer, bloomery_gpu::iq_quant) as a process over seeded inputs: a two-shard set
+# (metadata, order and copies the input's, the stacks' types the rules give, the host K-quant rule's trunk bytes, `--cpu` equal to the card, `--check` on
+# and its mismatch named, a plan that lacks a tensor, Inf, NaN, negative-importance and uncovered-type refusals named with no file left).
+# 2026-11-27: the comparisons with ggml moved to `just lab-iq-quant-ref` below with the reference trees gone (no live reference trees, 2026-11-24): the
+# card's IQ1_S and IQ2_XXS bytes row for row against iq_quant_ref (linked to the K3.1 quantization tree's libggml-base) on MXFP4, F32, F16 and BF16
+# sources, the host rule (gguf::iq_quant) on two rows of each, the set's stacks against ggml's bytes, and the K3 fixture's set equal to llama-quantize's
+# alone byte for byte. No gate pins the card's IQ bytes against ggml's now; the unit tests of gguf::iq_quant (the host rule) and this gate's `--cpu` = card
+# clause (the card against the host rule) pin them against themselves. Follow-up: freeze iq_quant_ref's outputs over the seeded row families and
+# llama-quantize's output over the K3 fixture as stored sets (a refset family) and read them back here.
 gate-gpu-iq-quant:
-    ./tools/box.sh '. tools/ref/ref-paths.sh && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_quant && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,ernie55,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && K3Q_TREE=$K3QUANT BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_quant'
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_quant && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,ernie55,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_quant'
+
+# gate-gpu-iq-quant's live part (`gate_iq_quant --ref`, which runs every clause of the gate and these besides): the card's IQ1_S and IQ2_XXS bytes (bloomery_gpu::iq_quant) against ggml's, iq_quant_ref linked to
+# the K3.1 quantization tree's libggml-base (just build-iq-quant-ref), on MXFP4 rows over two experts and seven f32 cases, row for row, on F32, F16, BF16 and
+# MXFP4 sources; the host rule (gguf::iq_quant) on two rows of each; bloomery-quantize over a two-shard set with the stacks ggml's on the card and with
+# --cpu; and the K3 fixture's set, then the K3.1 quantization tree's llama-quantize, equal to llama-quantize alone, byte for byte (`gate_iq_quant --ref`, the
+# bin's doc). A lab-* recipe: no landing selects it. Opens with one named refusal (tools/ref/need-tree.sh, rc 66) for a missing tree or oracle:
+# `just build-k3-quant-tree` builds the tree, `just build-iq-quant-ref` the oracle.
+lab-iq-quant-ref:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && bash tools/ref/need-tree.sh --check lab-iq-quant-ref K3QUANT "$K3QUANT/build/bin/llama-quantize" "just build-k3-quant-tree builds the tree" && bash tools/ref/need-tree.sh --check lab-iq-quant-ref iq_quant_ref "$BLOOMERY_DATA/bin/iq_quant_ref" "just build-iq-quant-ref builds the oracle" && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_quant && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,ernie55,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && K3Q_TREE=$K3QUANT BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_quant --ref'
+
 
 # bloomery-quantize's host side (crates/quantize, no card): the type-rule matcher on llama-quantize's K3.1 rule shapes, the
 # finite scan of every source type, --check's row comparison, the plan's per-tensor decisions and refusals, the argument parser,
@@ -845,30 +858,34 @@ gate-gpu-iq-quant:
 gate-quantize:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-quantize --lib --test check --test fit --test resolve --test rules --test resume'
 
+# The host K-quant rules, the K3 fixture's whole file and the resolved plan against ggml itself: the only proof that the GGUFs we publish
+# carry ggml's bytes. 2026-11-27: gate-quantize-oracle, gate-quantize-e2e and gate-quantize-plan became these lab recipes when no gate may read a live
+# reference tree (no live reference trees, 2026-11-24): each runs a binary of the K3.1 quantization tree (and, for the oracle, `iq_quant_ref`), which
+# the box does not keep. A lab-* recipe, so no landing selects it. Each opens with one named refusal (tools/ref/need-tree.sh, rc 66) naming the
+# script that builds what is missing: `just build-k3-quant-tree`, `just build-iq-quant-ref`. Until ggml's outputs are frozen as a set (a refset family,
+# per quant type and fixture), nothing pins these bytes in a gate; run a lab before a quantizer change ships a file.
+# lab-quantize-oracle: the host K-quant rules (gguf::kquant: Q3_K, Q4_K, Q5_K, Q6_K, Q8_0) against iq_quant_ref's ggml bytes, with and without an
+# importance matrix, row for row over seeded row families. No card; the box's cores.
+lab-quantize-oracle:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && bash tools/ref/need-tree.sh --check lab-quantize-oracle K3QUANT "$K3QUANT/build/bin/llama-quantize" "just build-k3-quant-tree builds the tree" && bash tools/ref/need-tree.sh --check lab-quantize-oracle iq_quant_ref "$BLOOMERY_DATA/bin/iq_quant_ref" "just build-iq-quant-ref builds the oracle" && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_kquant_oracle -- --ignored --nocapture --test-threads=1'
+
+# The K3 fixture end to end through the host writer (--cpu): bloomery-quantize's output equals llama-quantize's, whole file by sha256. No card; the
+# box's cores.
+lab-quantize-e2e:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && bash tools/ref/need-tree.sh --check lab-quantize-e2e K3QUANT "$K3QUANT/build/bin/llama-quantize" "just build-k3-quant-tree builds the tree" && bash tools/ref/need-tree.sh --check lab-quantize-e2e K3QUANT "$K3QUANT/build/bin/llama-gguf-split" "just build-k3-quant-tree builds the tree" && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_fixture_e2e -- --ignored --nocapture --test-threads=1'
+
+# Plan equality: bloomery-quantize's resolution of every tensor's type and size against llama-quantize --dry-run's, tensor for tensor, on the K3 fixture
+# and, when K3Q_PLAN_IN (the K3-shaped set's first shard) and K3Q_PLAN_RULES (the tight map's rules file) name files on the box, the K3.1 type maps
+# over that set. Headers only; no card.
+lab-quantize-plan:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && bash tools/ref/need-tree.sh --check lab-quantize-plan K3QUANT "$K3QUANT/build/bin/llama-quantize" "just build-k3-quant-tree builds the tree" && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_plan_equal -- --ignored --nocapture --test-threads=1'
+
 # bloomery-quantize --fit's measurement driver (tools/ref/qfit.py, docs/research/quant-fit.md §2): builds the quantizer, the
 # loss tool (ppl_exaone) and kld_diff, then runs `qfit.py ARGS` (`measure` writes the sensitivity table `--fit` reads, `verify`
 # scores the picked mix against it). The loss tool walks on the A6000 under a card's gate lock, not the timing lease; no number
 # of it is a timing. Its outputs go where ARGS say (--work, --out): the box's disk is the caller's to name.
 qfit *ARGS:
     BLOOMERY_MODEL=exaone-moe BLOOMERY_CARD=a6000 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,ernie55,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin ppl_exaone && cargo build --release -p bloomery-gpu-gates --bin kld_diff && python3 tools/ref/qfit.py {{ARGS}}'
-
-# The host K-quant rules (gguf::kquant: Q4_K, Q5_K, Q6_K, Q8_0) against ggml's own quantizer (iq_quant_ref, just
-# build-iq-quant-ref) with and without an importance matrix, row for row over seeded row families, and the K3 fixture
-# end to end through the host writer (--cpu): bloomery-quantize's output equals llama-quantize's, whole file by sha256,
-# the plan equal to llama-quantize's own --dry-run. No card; the box's cores.
-gate-quantize-oracle:
-    ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_kquant_oracle -- --ignored --nocapture --test-threads=1'
-
-# The K3 fixture end to end through the host writer (--cpu): bloomery-quantize's output equals llama-quantize's, whole
-# file by sha256. No card; the box's cores.
-gate-quantize-e2e:
-    ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_fixture_e2e -- --ignored --nocapture --test-threads=1'
-
-# Plan equality: bloomery-quantize's resolution of every tensor's type and size against llama-quantize --dry-run's, tensor
-# for tensor, on the K3 fixture and, when K3Q_PLAN_IN (the K3-shaped set's first shard) and K3Q_PLAN_RULES (the tight map's
-# rules file) name files on the box, the K3.1 type maps over that set. Headers only; no card.
-gate-quantize-plan:
-    ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_plan_equal -- --ignored --nocapture --test-threads=1'
 
 # The 2-layer cut of the real Kimi K3.1 folder (layers 0 and 3, the routed width 256, tools/quant-fixture-cuts/kimik31q.json)
 # into /models/fixtures/kimik31q (nvme0, about 9 GB; `fixture cut` refuses an existing directory): what gate-quantize-hf reads.
@@ -883,8 +900,9 @@ cut-kimik31q:
 gate-quantize-hf:
     ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_WORK=/models/qhf-work && mkdir -p "$K3Q_WORK" && bash tools/gate.sh --release -p bloomery-model-hf --test quantize_hf -- --include-ignored --nocapture --test-threads=1'
 
-# gate-gpu-iq-quant's oracle: tools/ref/iq_quant_ref.cpp linked to the K3.1 quantization tree's libggml-base, into
-# $BLOOMERY_DATA/bin with the tree's commit and the library's md5 beside it. CPU only, no lease.
+# The IQ quantizer's ggml oracle for `lab-iq-quant-ref`, `lab-quantize-oracle`, `iq-quant-probe --check` and a session that freezes ggml's outputs as
+# stored sets: tools/ref/iq_quant_ref.cpp linked to the K3.1 quantization tree's libggml-base (just build-k3-quant-tree; ends 66 by name while the
+# tree is not there), into $BLOOMERY_DATA/bin with the tree's commit and the library's md5 beside it. CPU only, no lease.
 build-iq-quant-ref:
     ./tools/box.sh 'bash tools/ref/build-iq-quant-ref.sh'
 
@@ -3396,15 +3414,30 @@ gate-gpu-ple:
 # batch is held to the reference in bands, so a near-tie flip is the oracle's known one); a file with a tensor neither the
 # batch nor the step reads is fed as steps, `Body::batch_refusal` names a tensor that decided it. Under
 # BLOOMERY_FIXTURE_VARIANT=istadense every clause above reads that file's own oracle sets, `fx_istadense_...`.
-# --imatrix DIR, alone after --feed (fixture tier; the real tier prints its two oracle clauses as left to the fixture): the V4.1 importance
-# collection (ppl_ds41 --imatrix, shared/ds41_imatrix.rs: the prompt batch with the prompt triangle off) over two chunks of 512 ids of AGENTS.md
-# against ik's llama-imatrix on the same fixture and text (IK, the oracle tree; the CPU reads it while the card walks): ours opens through the
-# quantizer's reader and holds every weight of ik's but the listed ones, none of ik's lacks but the listed ones (names); a dense weight's count
-# is the rows walked, a routed stack's the rows times the picks, a gate weight is its up weight (counts); every column of the means within the
-# band ik's mean-of-squares allows (means); and a second identical walk doubles every count and sum exactly (repeat). One load.
+# --imatrix DIR, alone after --feed (fixture tier; the real tier decides nothing here): the V4.1 importance collection (ppl_ds41 --imatrix,
+# shared/ds41_imatrix.rs: the prompt batch with the prompt triangle off) over two chunks of 512 ids of AGENTS.md: ours opens through the
+# quantizer's reader, a dense weight's count is the rows walked, a routed stack's the rows times the picks, a gate weight is its up weight
+# (counts); and a second walk from a reset collector writes the first's bytes (repeat). One load.
+# 2026-11-27: the live comparison with ik's llama-imatrix on the same fixture and text (names: the weights both files hold; means: every column
+# within the band ik's mean-of-squares allows) moved to `just lab-ds41-imatrix-ref` with the reference trees gone (no live reference trees,
+# 2026-11-24: the box keeps no ik tree, and this tail ended 1 with llama-imatrix missing). No gate pins our V4.1 importance matrix against ik's now;
+# counts and repeat are what still pin the collector. Follow-up: freeze ik's imatrix of the V4.1 fixture over this text (a refset family) and put
+# names and means back against the file.
 [group('v41-load')]
 gate-gpu-ds41-step *ARGS='--structure --sets --select --kld-walk --skew-structure --skew-sets --skew-api':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --feed && . tools/ref/ref-paths.sh && export IK && D=target/ds41-imatrix-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --imatrix $D'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --feed && D=target/ds41-imatrix-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --imatrix $D'
+
+# gate-gpu-ds41-step's `--imatrix DIR` with the live part (`--imatrix DIR --ref`: shared/ds41_imatrix_gate.rs): the V4.1 importance collection over two chunks of
+# 512 ids of AGENTS.md against ik's llama-imatrix on the same fixture and text (IK, the V4.1 oracle tree; the CPU reads it while the card walks): ours opens
+# through the quantizer's reader and holds every weight of ik's but the listed ones, none of ik's lacks but the listed ones (names); a dense weight's count
+# is the rows walked, a routed stack's the rows times the picks, a gate weight is its up weight (counts); every column of the means within the band ik's
+# mean-of-squares allows (means); and a second walk from a reset collector writes the first's bytes (repeat). Fixture tier. A lab-* recipe: no landing
+# selects it. Opens with one named refusal (tools/ref/need-tree.sh, rc 66) when the ik tree has no llama-imatrix: the tree is models/deepseek41.sh's IK
+# (ik-idxkey, a worktree of ik_llama.cpp on v41/idxkey-fix) and `cmake --build build --target llama-imatrix` in it builds the binary. One load.
+[group('v41-load')]
+lab-ds41-imatrix-ref:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '. tools/ref/ref-paths.sh && bash tools/ref/need-tree.sh --check lab-ds41-imatrix-ref IK "$IK/build/bin/llama-imatrix" "the V4.1 oracle tree (models/deepseek41.sh IK) needs llama-imatrix built in it: cmake --build build --target llama-imatrix" && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && export IK && D=target/ds41-imatrix-ref && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --imatrix $D --ref'
+
 
 # The tensor-parallel V4.1 body (`body::open_rank`) on the original-format fixture folder, one, two and four ranks on
 # the one visible card, past one rank each a process of its own in a rank group over TCP ends on the loopback (the
@@ -5240,17 +5273,30 @@ gate-gpu-kimik3-serve:
 # --- end kimik3serve ---
 # --- kimik3imatrix ---
 
-# Kimi K3's own importance matrix (generate_kimi_k3 --imatrix, bloomery_gpu::imatrix) against llama-imatrix's on the K3 fixture (gate_kimi_k3_imatrix's
-# doc): two chunks of 512 ids of one text; names (the reader opens both, every weight but the listed fused ones), counts equal exactly, every column of
-# in_sum2 within the derived band, and bloomery-quantize over our file writes a set that opens. The recipe's `arms` picks the walks: `a` (the whole-card
-# load, the prompt stepped) and `bp` (the placed load, --walk pass; BLOOMERY_CARD=both). Fixture-only.
+# Kimi K3's own importance matrix (generate_kimi_k3 --imatrix, bloomery_gpu::imatrix) on the K3 fixture (gate_kimi_k3_imatrix's doc): two chunks of 512 ids
+# of one text; the file opens through the quantizer's reader, a dense weight's count is the rows walked, every routed stack's counts total the same whole
+# number of picks per row, and the fused weights stay uncollected. The recipe's `arms` picks the walks: `a` (the whole-card load, the prompt stepped) and
+# `bp` (the placed load, --walk pass; BLOOMERY_CARD=both). Fixture-only.
+# 2026-11-27: the live comparison moved to `just lab-kimik3-imatrix-ref` below with the reference trees gone (no live reference trees, 2026-11-24): the
+# names, counts and in_sum2 clauses against the K3.1 quantization tree's llama-imatrix (the bands PIN(2026-11-07), measured over this text on the
+# fixture) and the `quantize` clause. No gate pins K3's collected sums, or its expert counts beyond their total, against llama's now; this gate's
+# counts clause pins the rows, the picks per row and the file's reader. Follow-up: freeze llama-imatrix's file over this text and the fixture as a
+# stored set and read it back here.
 # PIN(2026-11-08): the default runs the `a` arm alone; `bp` is opt-in (`just gate-gpu-kimik3-imatrix a,bp`) until the pass tells
 # the tier card's experts from the host's: its collection check reads `Side::hosted` (any expert off the stage card), so the
 # window's split (experts on both cards, none on the host; the precondition clause is green) is refused by name.
-# [predicted wall: llama-imatrix 2 chunks on the CPU ~1 min, our two chunks stepped ~1 min, the requantize and the quantize ~1 min; under 6 min after a warm build]
+# [predicted wall: our two chunks stepped ~1 min, the walk and the plan-only start of the `bp` arm ~1 min; under 3 min after a warm build]
 [group('solo')]
 gate-gpu-kimik3-imatrix arms='a':
-    BLOOMERY_MODEL=kimi-k3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-imatrix && . tools/ref/ref-paths.sh && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_imatrix --bin generate_kimi_k3 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,ernie55,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && D=target/kimik3-imatrix-gate && rm -rf $D && mkdir -p $D && K3Q_TREE=$K3QUANT BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_kimi_k3_imatrix --dir $D --arms {{arms}}'
+    BLOOMERY_MODEL=kimi-k3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-imatrix && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_imatrix --bin generate_kimi_k3 && D=target/kimik3-imatrix-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_kimi_k3_imatrix --dir $D --arms {{arms}}'
+
+# gate-gpu-kimik3-imatrix with `--ref`: the live part. Kimi K3's own importance matrix against llama-imatrix's on the K3 fixture (names, counts, in_sum2 within
+# the derived bands, and bloomery-quantize over our file writes a set that opens: gate_kimi_k3_imatrix's doc). A lab-* recipe: no landing selects it. Opens
+# with one named refusal (tools/ref/need-tree.sh, rc 66) when the K3.1 quantization tree is not there: `just build-k3-quant-tree` builds it. Fixture-only.
+# [predicted wall: llama-imatrix 2 chunks on the CPU ~1 min, our two chunks stepped ~1 min, the requantize and the quantize ~1 min; under 6 min after a warm build]
+lab-kimik3-imatrix-ref arms='a':
+    BLOOMERY_MODEL=kimi-k3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh lab-kimik3-imatrix-ref && . tools/ref/ref-paths.sh && bash tools/ref/need-tree.sh --check lab-kimik3-imatrix-ref K3QUANT "$K3QUANT/build/bin/llama-imatrix" "just build-k3-quant-tree builds the tree" && bash tools/ref/need-tree.sh --check lab-kimik3-imatrix-ref K3QUANT "$K3QUANT/build/bin/llama-quantize" "just build-k3-quant-tree builds the tree" && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_imatrix --bin generate_kimi_k3 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,ernie55,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && D=target/kimik3-imatrix-ref && rm -rf $D && mkdir -p $D && K3Q_TREE=$K3QUANT BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_kimi_k3_imatrix --dir $D --arms {{arms}} --ref'
+
 
 # --- end kimik3imatrix ---
 # --- hy4-tokenizer ---

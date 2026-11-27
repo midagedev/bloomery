@@ -21,6 +21,8 @@
 # shellcheck disable=SC2034,SC2054
 # shellcheck source=tools/ref/ref-paths.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-paths.sh"
+# shellcheck source=tools/ref/need-tree.sh
+source "$(dirname "${BASH_SOURCE[0]}")/need-tree.sh"
 # Default output directory of the installed reference binaries.
 REF_BIN=$BLOOMERY_DATA/bin
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -38,5 +40,14 @@ REF_LLAMA_LINK=(-L"$IK/build/common" -L"$IK/build/src" -L"$REF_GGML_LIB"
   -lcommon -lllama -lggml
   -Wl,-rpath,"$IK/build/src" -Wl,-rpath,"$REF_GGML_LIB")
 
-# ref_cxx <flags...>: the one compiler invocation every harness goes through.
-ref_cxx() { g++ -std=c++17 -O2 "$@"; }
+# ref_cxx <flags...>: the one compiler invocation every harness goes through. A harness that reads the ik tree's headers or
+# libraries (an -I or -L under $IK) is refused by name when the tree is not there (need-tree.sh), not by a failed g++.
+ref_cxx() {
+  local a
+  for a in "$@"; do
+    case $a in
+      -I"$IK"/* | -L"$IK"/*) need_tree "${0##*/}" IK "${a:2}" "the harness links the ik tree; check ik_llama.cpp out at IK and build it first" ;;
+    esac
+  done
+  g++ -std=c++17 -O2 "$@"
+}

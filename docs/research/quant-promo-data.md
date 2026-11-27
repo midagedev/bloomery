@@ -82,7 +82,7 @@ Columns: `frame` (`fixture_whole`|`mid_whole`|`k31_check`), `file_a`, `file_b` (
 
 | frame | what | status |
 |---|---|---|
-| fixture_whole | K3 fixture: `bloomery-quantize` + `llama-quantize` against `llama-quantize` alone | proved by `gate-gpu-iq-quant`'s end-to-end clause; `placeholder` for the two hashes (the lead's gate record) |
+| fixture_whole | K3 fixture: `bloomery-quantize` + `llama-quantize` against `llama-quantize` alone | proved by `lab-iq-quant-ref`'s end-to-end clause; `placeholder` for the two hashes (the lead's lab record) |
 | mid_whole | MiMo finals A, B, C: three sha256 | `placeholder`: S2, predicted equal |
 | k31_check | `bloomery-quantize --check N` over K3.1's stacks, and the gate's flipped-byte stop | `placeholder`: N and the tensor count |
 
