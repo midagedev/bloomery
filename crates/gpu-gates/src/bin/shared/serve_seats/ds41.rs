@@ -173,7 +173,7 @@
 //! whose card's placement row holds its resident bytes as the class `draft`.
 //! Both drafts' arms of every one of these calls, the draft word and the
 //! slot rule are `served`'s, the serve seats' one owner of the draft; the
-//! lookup's context (`drafted::Lookups`, one a slot) is rebuilt from the V4.1
+//! lookup's context (`drafted::HistoryDrafts`, one a slot) is rebuilt from the V4.1
 //! body's token history when it falls behind the target.
 //!
 //! The prompt cache under the DSpark draft: the draft keeps no state of its
@@ -477,7 +477,7 @@ fn slot_count(
     draft: Draft,
     traced: bool,
 ) -> Result<(NonZeroUsize, SlotsFrom), GateError> {
-    let (n, from) = match served::draft_slots(parallel, draft, true)? {
+    let (n, from) = match served::draft_slots(parallel, draft == Draft::Dspark, true)? {
         Some(decided) => decided,
         None => match parallel {
             Some(n) => (n, SlotsFrom::Flag),
@@ -618,7 +618,6 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let draft_file = match draft {
         Draft::Dspark => Some(dspark::draft_hparams()?),
         Draft::Off | Draft::Lookup => None,
-        Draft::Recall => return Err(Draft::RECALL_REFUSED.into()),
     };
     let path = ref_model_path()?;
     let reserve = match &draft_file {
@@ -795,7 +794,6 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let window = match draft {
         Draft::Off => None,
         Draft::Lookup => Some(LOOKUP_ROWS),
-        Draft::Recall => return Err(Draft::RECALL_REFUSED.into()),
         Draft::Dspark => Some(PAIR_ROWS),
     };
     let pass = Pass::of_body::<Body>(slots.get(), true, window);
@@ -1361,7 +1359,6 @@ impl V41 {
             (Draft::Dspark, None) => {
                 return Err("bloomery-serve-ds41: the DSpark draft did not load".into());
             }
-            (Draft::Recall, _) => return Err(Draft::RECALL_REFUSED.into()),
         };
         // The resident sequences, made after the captures: the live slot's
         // chains stay with it, each other slot capturing on its first use.

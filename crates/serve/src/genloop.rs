@@ -31,7 +31,8 @@
 //! [`Engine::advance_slots`] with its draw ([`Gen::pass_row`]), its ids the
 //! ones its pass alone draws. On another drafting engine such a request
 //! reads the logits row every token, which a pass does not give, so it
-//! takes one [`Engine::next`] a token and carries no draft counts.
+//! takes one [`Engine::next`] a token and carries no draft counts; its
+//! `timings` say why instead ([`Timings::draft_off`]).
 //!
 //! A request that asks for probabilities ([`GenParams::logprobs`]) reads the
 //! row of every token, a step's or a pass's: each row is read before the
@@ -209,6 +210,13 @@ pub(crate) struct Timings {
     /// pass (llama-server's `draft_n`, `draft_n_accepted`).
     pub draft_n: usize,
     pub draft_n_accepted: usize,
+    /// Why a request a drafting engine would have drafted ran plain steps
+    /// instead (ours; llama-server has no such field): the first of
+    /// `ignore_eos`, `logit_bias`, `sampling`, `logprobs` and `constraint`
+    /// that holds, on an engine that does not draft sampled requests
+    /// ([`Engine::drafts_sampled`]). `None` for a request that took passes
+    /// and on an engine that does not draft.
+    pub draft_off: Option<&'static str>,
     /// The passes that verified a proposal (llama-server's
     /// `n_draft_verif_steps`; not a `timings` field).
     pub draft_passes: usize,
@@ -247,8 +255,9 @@ impl Timings {
     /// The JSON llama-server emits, and `cache_ms`. A zero count gives NaN
     /// per-token fields, which serialize as `null` exactly as nlohmann writes
     /// them. The draft's two counts are there once a pass proposed, as
-    /// llama-server's are; a request that follows a program adds
-    /// `constrained`, its [`Jump`] counts.
+    /// llama-server's are; `draft_off` is there when the request ran plain
+    /// steps on a drafting engine, naming why; a request that follows a
+    /// program adds `constrained`, its [`Jump`] counts.
     pub(crate) fn to_json(&self) -> Value {
         let (pn, dn) = (self.prompt_n as f64, self.predicted_n as f64);
         let mut v = json!({
@@ -268,6 +277,9 @@ impl Timings {
         if self.draft_n > 0 {
             v["draft_n"] = json!(self.draft_n);
             v["draft_n_accepted"] = json!(self.draft_n_accepted);
+        }
+        if let Some(why) = self.draft_off {
+            v["draft_off"] = json!(why);
         }
         if let Some(j) = &self.jump {
             v["constrained"] = json!({
@@ -779,6 +791,23 @@ fn special_at(
 /// each kept id its pick from its verified row.
 fn takes_passes(reads_rows: bool, engine: &dyn Engine) -> bool {
     !reads_rows || engine.drafts_sampled()
+}
+
+/// Why `p`'s request, which reads its rows, takes a drafting engine's steps
+/// ([`Timings::draft_off`]): `greedy` is whether it draws with no sampler of
+/// its own, `pick` what it reads.
+fn plain_why(p: &GenParams, greedy: bool, pick: &Pick) -> &'static str {
+    if p.ignore_eos {
+        "ignore_eos"
+    } else if !p.logit_bias.is_empty() {
+        "logit_bias"
+    } else if !greedy {
+        "sampling"
+    } else if pick.probs.is_some() {
+        "logprobs"
+    } else {
+        "constraint"
+    }
 }
 
 /// The engine and its slots: what each slot's cache holds — the ids, one per
@@ -2456,11 +2485,10 @@ impl Gen {
         let reads = pick.reads_rows();
         let holds = pick.held.is_some();
         let logits = vec![0.0f32; if reads { slot.vocab.n_vocab() } else { 0 }];
-        let rows = if takes_passes(reads, slot.engine.as_ref()) {
-            slot.engine.advance_rows()
-        } else {
-            1
-        };
+        let engine_rows = slot.engine.advance_rows();
+        let passes = takes_passes(reads, slot.engine.as_ref());
+        let rows = if passes { engine_rows } else { 1 };
+        let draft_off = (engine_rows > 1 && !passes).then(|| plain_why(p, greedy, &pick));
         let lent = Arc::new(Mutex::new(Pick::default()));
         let draw: Sampler = {
             let lent = Arc::clone(&lent);
@@ -2478,7 +2506,10 @@ impl Gen {
             best,
             stops,
             logits,
-            tim: Timings::default(),
+            tim: Timings {
+                draft_off,
+                ..Timings::default()
+            },
             depths: Vec::new(),
             t1: Instant::now(),
             budget: usize::try_from(p.n_predict).unwrap_or(usize::MAX),
@@ -2827,6 +2858,7 @@ impl Gen {
         let ends = quantum_ends(kept.cache_n, to, &cuts, &media, q.get());
         self.tim = Timings {
             prompt_ms: ms_since(t),
+            draft_off: self.tim.draft_off,
             n_ctx: self.ctx_max,
             n_past: kept.cache_n,
             cache_n: kept.cache_n,
@@ -2906,6 +2938,7 @@ impl Gen {
         self.tim = Timings {
             prompt_n: n - kept.cache_n,
             prompt_ms: self.tim.prompt_ms + ms_since(t),
+            draft_off: self.tim.draft_off,
             n_ctx: self.ctx_max,
             n_past: slot.held.len(),
             cache_n: kept.cache_n,
@@ -5448,7 +5481,7 @@ mod sampled_tests {
 
     use super::{Bias, GenError, GenParams, Outcome, Slot, Timings, biased, generate};
     use crate::engine::{Drafted, Engine, EngineError, Sampler, SamplingParams, Tokenizer};
-    use crate::mock::{DraftMock, MockTokenizer};
+    use crate::mock::{DraftMock, MockEngine, MockTokenizer};
     use crate::reasoning::{ThinkEntry, ThinkTags};
     use crate::sampling;
 
@@ -5591,6 +5624,74 @@ mod sampled_tests {
             .expect("a generation");
         }
         assert_eq!(*replies.lock().expect("the replies"), [Some(7), Some(7)]);
+    }
+
+    /// On a drafting engine that declines sampled requests, a request that
+    /// reads its rows runs plain steps and its `timings` name why
+    /// (`draft_off`, the first of ignore_eos, logit_bias and sampling that
+    /// holds, no draft counts); a greedy request drafts and carries the counts
+    /// instead; an engine that drafts sampled requests takes the ignore_eos
+    /// request in passes, and an engine that does not draft names nothing.
+    #[test]
+    fn a_request_a_drafting_engine_steps_says_why_in_its_timings() {
+        let ids = MockTokenizer.encode("abacadaeabacada");
+        let run = |engine: Box<dyn Engine>, ignore_eos: bool, temperature: f32| {
+            let mut slot = Slot::new(engine);
+            let p = GenParams {
+                n_predict: 8,
+                sampling: SamplingParams {
+                    temperature,
+                    seed: 3,
+                    ..SamplingParams::default()
+                },
+                stop: Vec::new(),
+                ignore_eos,
+                stream: false,
+                timings_per_token: false,
+                return_progress: false,
+                include_usage: false,
+                cache_prompt: true,
+                reasoning_budget: None,
+                reasoning_loop: false,
+                think_entry: ThinkEntry::Closed,
+                think: ThinkTags::THINK,
+                think_split: None,
+                logprobs: None,
+                constraint: None,
+                logit_bias: Vec::new(),
+            };
+            let mut tim = Timings::default();
+            generate(
+                &mut slot,
+                &sampling::reference_factory(),
+                &ids,
+                &p,
+                &mut |_| Ok(()),
+                &mut |_| {},
+                &mut tim,
+            )
+            .expect("a generation");
+            tim
+        };
+        let declining = || Box::new(DraftMock::new(4096).without_sampled()) as Box<dyn Engine>;
+        for (ignore_eos, temperature, why) in [(true, 0.0, "ignore_eos"), (false, 0.8, "sampling")]
+        {
+            let tim = run(declining(), ignore_eos, temperature);
+            assert_eq!(tim.draft_off, Some(why), "{ignore_eos} {temperature}");
+            assert_eq!(tim.draft_n, 0, "plain steps propose nothing");
+            let v = tim.to_json();
+            assert_eq!(v["draft_off"], why, "{v}");
+            assert!(v.get("draft_n").is_none(), "{v}");
+        }
+        let greedy = run(declining(), false, 0.0);
+        assert_eq!(greedy.draft_off, None);
+        assert!(greedy.draft_n > 0, "a greedy request drafts");
+        assert!(greedy.to_json().get("draft_off").is_none());
+        let sampled = run(Box::new(DraftMock::new(4096)), true, 0.0);
+        assert_eq!(sampled.draft_off, None, "an engine that drafts it passes");
+        assert!(sampled.draft_n > 0);
+        let plain = run(Box::new(MockEngine::new(4096)), true, 0.0);
+        assert_eq!(plain.draft_off, None, "an engine with no draft names none");
     }
 
     /// A llama-bpe vocabulary as the server loads one (`tokenizer::Tokenizer::from_keys`

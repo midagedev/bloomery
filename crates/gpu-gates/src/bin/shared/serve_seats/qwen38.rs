@@ -207,9 +207,9 @@
 //! round of the busy slots' steps runs as one pass of their rows (`GpuModel::step_slots`,
 //! each row bit for bit its step alone). A lookup load runs its rounds as
 //! one pass too: every busy slot's lookup window verified together
-//! (`rounds::pass_rows_lookup`, two rows a slot) and its plain rounds as
+//! (`rounds::pass_rows_history`, two rows a slot) and its plain rounds as
 //! one pass of their rows, each slot's context told of its row
-//! (`rounds::step_rows_lookup`). The
+//! (`rounds::step_rows_history`). The
 //! sequences are switched by pointer exchange, and one draft is held a
 //! resident slot — its host state never moved, its device side parking
 //! with the sequence on every switch — so each request's tokens are its
@@ -1103,7 +1103,7 @@ fn draft_asked(levers: &bloomery_levers::Levers) -> Result<Option<DraftWord>, Ga
 /// the draft borrows are not its format (`PlanInputs::mtp_borrows`, which
 /// refuses a set `mtp` at `MtpInputs::read`); and, drafting nothing, why (the
 /// `load draft=off` record's); `lookup` the lookup draft in its place
-/// (`drafted::Lookups`), the MTP draft off with no why. This is the rule
+/// (`drafted::HistoryDrafts`), the MTP draft off with no why. This is the rule
 /// before the plan: the unset draft's yield to the context
 /// (`generate::draft_yield`, the module doc) is decided after the
 /// context choice, at the caller. `dspark` and any other word are refused by
@@ -2776,7 +2776,7 @@ struct SeatArgs {
     folder: Option<Folder38>,
     /// `BLOOMERY_DRAFT=mtp`, the MTP draft; unset the plain path.
     mtp: bool,
-    /// `BLOOMERY_DRAFT=lookup`, the lookup draft (`drafted::Lookups`).
+    /// `BLOOMERY_DRAFT=lookup`, the lookup draft (`drafted::HistoryDrafts`).
     lookup: bool,
     /// The draft's head under `mtp` (`head_list::head_rows_of`), which the
     /// load prints.
@@ -2863,7 +2863,7 @@ struct Q38 {
     /// plain rounds (the steps of requests that take no pass) tell each row
     /// to its slot's draft around the pass
     /// ([`super::rounds::step_rows_drafted`],
-    /// [`super::rounds::step_rows_lookup`]).
+    /// [`super::rounds::step_rows_history`]).
     step_pass: bool,
     /// Whether a plain step reads the PLE rows of the id it answers ahead
     /// ([`Q38::read_ahead`]): the body's next call is then that slot's, on
@@ -3985,8 +3985,8 @@ impl Seat for Q38 {
                 }
                 if q.drafts.mtp() {
                     super::rounds::step_rows_drafted(&mut q.s, rows, &mut q.drafts)
-                } else if let Some(l) = q.drafts.lookups_mut() {
-                    super::rounds::step_rows_lookup(&mut q.s, rows, l)
+                } else if let Some(l) = q.drafts.history_drafts_mut() {
+                    super::rounds::step_rows_history(&mut q.s, rows, l)
                 } else {
                     super::rounds::step_rows_one_pass(&mut q.s, rows)
                 }
@@ -4023,8 +4023,8 @@ impl Seat for Q38 {
                 for r in rows.iter() {
                     q.before_call_at(r.slot);
                 }
-                match q.drafts.lookups_mut() {
-                    Some(l) => super::rounds::pass_rows_lookup(&mut q.s, rows, l),
+                match q.drafts.history_drafts_mut() {
+                    Some(l) => super::rounds::pass_rows_history(&mut q.s, rows, l),
                     None => super::rounds::pass_rows_one_pass(
                         &mut q.s,
                         rows,
@@ -4100,8 +4100,8 @@ impl Seat for Q38 {
     /// class.
     fn props(&self, mut p: EngineProps) -> EngineProps {
         p.autotune = Some(self.autotune.clone());
-        if self.drafts.looks_up() {
-            return self.drafts.lookup_props(p);
+        if self.drafts.serves_history() {
+            return self.drafts.history_props(p);
         }
         if !self.drafts.drafts() {
             return p;

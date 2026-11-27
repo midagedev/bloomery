@@ -97,7 +97,7 @@ fn slots_under(
     given: impl FnOnce() -> Result<(usize, SlotsFrom), GateError>,
 ) -> Result<(usize, SlotsFrom), GateError> {
     let decided = match drafting {
-        Some(d) => served::draft_slots(parallel, d.word, true)?,
+        Some(d) => served::draft_slots(parallel, d.word == Draft::Dspark, true)?,
         None => None,
     };
     match decided {
@@ -816,7 +816,7 @@ pub fn check<S: Tiered>(
             if S::DRAFTS
                 && let Some(d) = drafting_of(levers)?
             {
-                served::draft_slots(a.0.parallel, d.word, true)?;
+                served::draft_slots(a.0.parallel, d.word == Draft::Dspark, true)?;
             }
         }
         // The check before the fetch cannot know whether an `--hf` repo will supply the

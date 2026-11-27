@@ -269,10 +269,10 @@ use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{CacheNote, DraftProps, Drafted, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
-use super::drafted::{LOOKUP_ROWS, Lookups, RECALL_ROWS, SlotDrafts};
+use super::drafted::{HistoryDrafts, LOOKUP_ROWS, SlotDrafts};
+use super::recalled::RECALL_ROWS;
 use super::served::{self, ServedDraft};
 use super::{folder, qwen3_folder};
-use crate::draft::Draft;
 use crate::dspark_hf;
 use crate::quiet::Quiet;
 
@@ -638,29 +638,35 @@ trait Body3: SlotRows<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static 
         let _ = (s, rows);
         Err("a round of several slots as one pass: this body runs its slots in turns".into())
     }
-    /// [`Body3::one_pass_round`] on a lookup load, each slot's lookup
-    /// context told of its row ([`super::rounds::step_rows_lookup`]).
-    /// Refused by the default: only `Body35` verifies several slots' lookup
-    /// windows together (`bind::verifies_slots`), so only its lookup load
-    /// runs one pass.
-    fn lookup_step_round(
+    /// [`Body3::one_pass_round`] on a history-draft load, each slot's
+    /// context told of its row ([`super::rounds::step_rows_history`]).
+    /// Refused by the default: only `Body35` verifies several slots' history
+    /// windows together (`bind::verifies_slots`), so only its load runs one
+    /// pass.
+    fn history_step_round(
         s: &mut app::Session<Self>,
         rows: &mut [SlotStep],
-        lookups: &mut Lookups<app::Session<Self>>,
+        history_drafts: &mut HistoryDrafts<app::Session<Self>>,
     ) -> Result<usize, GateError> {
-        let _ = (s, rows, lookups);
-        Err("a lookup round of several slots as one pass: this body runs its slots in turns".into())
+        let _ = (s, rows, history_drafts);
+        Err(
+            "a history-draft round of several slots as one pass: this body runs its slots in turns"
+                .into(),
+        )
     }
-    /// One round of several slots' lookup windows as passes of
-    /// `GpuModel::verify_slots` ([`super::rounds::pass_rows_lookup`]).
-    /// Refused by the default, as [`Body3::lookup_step_round`] is.
-    fn lookup_pass_round(
+    /// One round of several slots' history-draft windows as passes of
+    /// `GpuModel::verify_slots` ([`super::rounds::pass_rows_history`]).
+    /// Refused by the default, as [`Body3::history_step_round`] is.
+    fn history_pass_round(
         s: &mut app::Session<Self>,
         rows: &mut [SlotPassRow],
-        lookups: &mut Lookups<app::Session<Self>>,
+        history_drafts: &mut HistoryDrafts<app::Session<Self>>,
     ) -> Result<usize, GateError> {
-        let _ = (s, rows, lookups);
-        Err("a lookup round of several slots as one pass: this body runs its slots in turns".into())
+        let _ = (s, rows, history_drafts);
+        Err(
+            "a history-draft round of several slots as one pass: this body runs its slots in turns"
+                .into(),
+        )
     }
     /// One prompt call of `ids` with the `encoded` rows of the call's images spliced in, each
     /// span carrying its image's token grid ([`vision_seat::SpanRows::image_spans`]); the greedy
@@ -1093,25 +1099,25 @@ impl Body3 for Body35 {
         super::rounds::step_rows_one_pass(s, rows)
     }
 
-    /// The busy rows as one pass, each slot's lookup context told of its row
-    /// ([`super::rounds::step_rows_lookup`]).
-    fn lookup_step_round(
+    /// The busy rows as one pass, each slot's history-draft context told of
+    /// its row ([`super::rounds::step_rows_history`]).
+    fn history_step_round(
         s: &mut app::Session<Body35>,
         rows: &mut [SlotStep],
-        lookups: &mut Lookups<app::Session<Body35>>,
+        history_drafts: &mut HistoryDrafts<app::Session<Body35>>,
     ) -> Result<usize, GateError> {
-        super::rounds::step_rows_lookup(s, rows, lookups)
+        super::rounds::step_rows_history(s, rows, history_drafts)
     }
 
-    /// Every slot's lookup window verified together
-    /// ([`super::rounds::pass_rows_lookup`]): the body settles each slot's
+    /// Every slot's history-draft window verified together
+    /// ([`super::rounds::pass_rows_history`]): the body settles each slot's
     /// partial keep at the commit (`SlotRows::keep_slot`).
-    fn lookup_pass_round(
+    fn history_pass_round(
         s: &mut app::Session<Body35>,
         rows: &mut [SlotPassRow],
-        lookups: &mut Lookups<app::Session<Body35>>,
+        history_drafts: &mut HistoryDrafts<app::Session<Body35>>,
     ) -> Result<usize, GateError> {
-        super::rounds::pass_rows_lookup(s, rows, lookups)
+        super::rounds::pass_rows_history(s, rows, history_drafts)
     }
 
     /// The session's media call ([`vision_seat::Encoded::prompt`]): each image's span of the call
@@ -1470,7 +1476,7 @@ impl<B: Body3> Seat for Q3<B> {
         self.s.slots()
     }
 
-    /// Whether the seat keeps its draft's state per slot: the lookup draft's
+    /// Whether the seat keeps its draft's state per slot: a history draft's
     /// context is a slot's own ([`ServedDraft::slot_drafts`]), the DSpark
     /// draft's is one sequence's.
     fn slot_drafts(&self) -> bool {
@@ -1498,7 +1504,7 @@ impl<B: Body3> Seat for Q3<B> {
     /// of the busy rows while the open decided so ([`Q3::one_pass`], through
     /// [`Body3::one_pass_round`] — the rows' answers and lent logits rows
     /// from the pass's own per-row heads, slot 0 left selected — or on a
-    /// lookup load [`Body3::lookup_step_round`]), else the seat's fallback —
+    /// history-draft load [`Body3::history_step_round`]), else the seat's fallback —
     /// a select and a step a row — every round of a body with no one pass of
     /// its slots, and the round a load of one slot never runs.
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
@@ -1507,8 +1513,8 @@ impl<B: Body3> Seat for Q3<B> {
             self,
             one_pass,
             rows,
-            |q, rows| match q.draft.lookups_mut() {
-                Some(l) => B::lookup_step_round(&mut q.s, rows, l),
+            |q, rows| match q.draft.history_drafts_mut() {
+                Some(l) => B::history_step_round(&mut q.s, rows, l),
                 None => B::one_pass_round(&mut q.s, rows),
             },
             |_| Ok(()),
@@ -1516,9 +1522,9 @@ impl<B: Body3> Seat for Q3<B> {
     }
 
     /// One round of several slots' drafted passes
-    /// ([`super::rounds::pass_round`]): on a lookup load the open decided to
+    /// ([`super::rounds::pass_round`]): on a history-draft load the open decided to
     /// run as one pass ([`Q3::one_pass`]), every slot's window verified
-    /// together ([`Body3::lookup_pass_round`]); else the fallback loop (a
+    /// together ([`Body3::history_pass_round`]); else the fallback loop (a
     /// select and a pass a row). The DSpark draft serves one slot, so no
     /// other drafted load runs a round of several.
     fn pass_slots(&mut self, rows: &mut [SlotPassRow]) -> Result<(), String> {
@@ -1527,8 +1533,8 @@ impl<B: Body3> Seat for Q3<B> {
             self,
             one_pass,
             rows,
-            |q, rows| match q.draft.lookups_mut() {
-                Some(l) => B::lookup_pass_round(&mut q.s, rows, l),
+            |q, rows| match q.draft.history_drafts_mut() {
+                Some(l) => B::history_pass_round(&mut q.s, rows, l),
                 None => Err(
                     "a drafted round of several slots as one pass: only the lookup \
                              draft serves several slots"
@@ -2549,10 +2555,25 @@ fn verdict_drafts(word: Word, f: DraftFacts) -> Drafts {
     }
 }
 
+/// The draft a load serves, [`Word`] as [`served_draft`] reads it: none, or one this seat opens.
+/// The recall draft is this seat's alone (its window is a whole pass of the body), so the V4.1
+/// and tiered seats' [`crate::draft::Draft`] has no such word and refuses it by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Draft {
+    /// The plain path, or the file's own next-token layer ([`decide_q35`] decides it apart).
+    Off,
+    /// The n-gram lookup.
+    Lookup,
+    /// The draft of the longest earlier match of the context's tail.
+    Recall,
+    /// The DSpark draft.
+    Dspark,
+}
+
 /// `BLOOMERY_DRAFT` as this seat reads it. Unset and `off` are
 /// [`Word::Off`] here; the seat decides afterwards whether a qwen35moe file's
 /// in-file layer drafts. `lookup`, `recall` and `dspark` stay the served
-/// drafts ([`crate::draft::Draft`]). (`Draft::from_levers` is the V4.1 binaries'
+/// drafts ([`Draft`]). (`crate::draft::Draft::from_levers` is the V4.1 binaries'
 /// parse, which refuses `off` and registers the V4.1 draft record; this one
 /// needs neither.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2708,7 +2729,7 @@ pub(crate) fn check(
                     levers,
                     (draft_asked(levers)? == Some(DraftWord::Off)).then_some("BLOOMERY_DRAFT=off"),
                 )?;
-                served::draft_slots(a.parallel, served_draft(word), true)?;
+                served::draft_slots(a.parallel, served_draft(word) == Draft::Dspark, true)?;
                 if word == Word::Mtp {
                     let auto = a.auto.is_some();
                     let (slots, _) = slots_given(a.parallel, a.ctx, auto, DEFAULT_SLOTS)?;
@@ -2809,7 +2830,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let (slots, from) = slots_given(a.parallel, a.ctx, a.auto.is_some(), DEFAULT_SLOTS)?;
     // The DSpark draft's window is one sequence's: several slots are refused by name.
     // `mtp` decides no count here.
-    let (slots, from) = served::draft_slots(a.parallel, served, true)?.unwrap_or((slots, from));
+    let (slots, from) =
+        served::draft_slots(a.parallel, served == Draft::Dspark, true)?.unwrap_or((slots, from));
     // The verify record rows the seat's whole-card qwen35 family load keeps
     // ([`verdict_drafts`]): every whole-fit verdict below prices the load
     // with them, before the load is known.

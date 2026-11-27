@@ -26,6 +26,14 @@
 //!   template's rendered ids with the same completion the drafted server's `/completion`
 //!   gives, its usage counts and its text inside the ids' text;
 //!
+//! - `odd_n_is_the_plain_ids`: the repeating prompt at [`N_ODD`] tokens, a length that is not a
+//!   whole number of passes of the body's eight rows, answers the plain run's ids and exactly
+//!   that many, on every drafted arm. The engine runs only the passes the request's budget
+//!   still holds and ends the request on the rest. The fixture's random-weight target repeats no
+//!   id and its drafts propose nothing, so there the clause holds the length and the ids; a file
+//!   whose weights repeat the phrase runs the passes up to the end (`gate_inkling2_recall` holds
+//!   that case);
+//!
 //! then the lookup draft on the target: one server with the lookup and one without,
 //! the lookup's ids are the plain run's (`ids_are_the_plain_ids`) and `/props` names the
 //! lookup as the draft the seat serves (`lookup_is_served`), and a prompt that repeats
@@ -105,6 +113,9 @@ mod gate {
         "one two three four five one two three four five one two three four five one two";
     /// The ids compared and the tokens the any-draft arms decode.
     const N: usize = 16;
+    /// The tokens of a request that does not end on a pass: the first comes from the prompt's
+    /// pass, and the 12 more are not a multiple of the eight rows of a pass.
+    const N_ODD: usize = 13;
 
     /// The most ids the recall draft proposes a pass: the qwen35moe body's pass of eight rows
     /// less the token at the position.
@@ -310,10 +321,12 @@ mod gate {
         text.contains(want)
     }
 
-    /// What one arm answered: the ids of [`PROMPT`] and of [`REPEATS`].
+    /// What one arm answered: the ids of [`PROMPT`] and of [`REPEATS`], and of [`REPEATS`] again
+    /// at [`N_ODD`] tokens.
     struct Ids {
         prompt: Vec<u32>,
         repeats: Vec<u32>,
+        odd: Vec<u32>,
     }
 
     /// One arm's ids: the plain arm's, the drafted arm's, and the drafted arm's
@@ -341,6 +354,8 @@ mod gate {
             .is_some_and(|n| n > 0);
         let repeat_ids = ids_of(&repeats["tokens"])?;
         println!("{tag} {} repeats {repeat_ids:?}", case.name);
+        let odd = ids_of(&completion(&url, &tokenized(&url, REPEATS)?, N_ODD, false)?["tokens"])?;
+        println!("{tag} {} repeats at {N_ODD} {odd:?}", case.name);
         match arm {
             Some(Arm::Dspark(_)) => {
                 let log = server_log(&err, &[&record::LOAD_DRAFT])?;
@@ -399,7 +414,13 @@ mod gate {
         Ok(Ids {
             prompt: tokens,
             repeats: repeat_ids,
+            odd,
         })
+    }
+
+    /// A drafted arm's [`N_ODD`] ids are the plain arm's, and exactly that many.
+    fn odd_is_plain(drafted: &Ids, plain: &Ids) -> bool {
+        drafted.odd == plain.odd && drafted.odd.len() == N_ODD
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -433,6 +454,11 @@ mod gate {
                 "ids_are_the_plain_ids",
                 drafted.prompt == plain.prompt,
             );
+            check(
+                &mut ok,
+                "odd_n_is_the_plain_ids",
+                odd_is_plain(&drafted, &plain),
+            );
             plains.push(plain);
         }
         // The lookup draft on the target: the same target, the other draft.
@@ -442,6 +468,11 @@ mod gate {
             &mut ok,
             "ids_are_the_plain_ids",
             lookup.prompt == plains[0].prompt,
+        );
+        check(
+            &mut ok,
+            "odd_n_is_the_plain_ids",
+            odd_is_plain(&lookup, &plains[0]),
         );
         // The recall draft on the same target: a window of the body's whole pass of rows, its
         // ids the plain run's on both prompts.
@@ -455,6 +486,11 @@ mod gate {
             &mut ok,
             "recall_repeats_are_the_plain_ids",
             recall.repeats == plains[0].repeats,
+        );
+        check(
+            &mut ok,
+            "odd_n_is_the_plain_ids",
+            odd_is_plain(&recall, &plains[0]),
         );
         // The mismatched draft beside the target: the ids line of a draft written for another
         // vocabulary, refused before any weight is read.

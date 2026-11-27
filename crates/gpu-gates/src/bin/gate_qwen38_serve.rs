@@ -7001,7 +7001,7 @@ mod gate {
     /// `BLOOMERY_STEP_STATS=1`, into `<dir>/cost`: the two `texts` (the arm's
     /// code and prose requests) run together, so their slots' windows are
     /// verified in one pass a round (a `slots round` of two rows in one
-    /// pass, `rounds::pass_rows_lookup`; none of two rows in two, the slot
+    /// pass, `rounds::pass_rows_history`; none of two rows in two, the slot
     /// at a time the body no longer needs), and their ids are `plain`, the
     /// draft-off server's. The round's wall is read by the round's chooser
     /// (`runtime::width::Batch`), each slot's own chooser counting the

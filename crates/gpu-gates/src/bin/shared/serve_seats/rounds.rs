@@ -3,9 +3,9 @@
 //! (`bind::Pass::of_body`, by what the body can run) overrides
 //! [`Seat::step_slots`] through [`step_round`] with [`step_rows_one_pass`]
 //! ([`step_rows_drafted`] on a load that drafts with the MTP draft,
-//! [`step_rows_lookup`] with the lookup) and its drafted twin
+//! [`step_rows_history`] with a draft of the token history) and its drafted twin
 //! [`Seat::pass_slots`] through [`pass_round`] with [`pass_rows_one_pass`]
-//! (the MTP draft) or [`pass_rows_lookup`] (the lookup), both one round of
+//! (the MTP draft) or [`pass_rows_history`] (a history draft), both one round of
 //! any draft's windows ([`pass_windows`] over [`RoundDrafts`]); any other
 //! seat keeps the defaults, [`bind::step_rows_in_turn`] and
 //! [`bind::pass_rows_in_turn`].
@@ -26,7 +26,7 @@ use runtime::width::{Mode as WidthMode, WidthError};
 use runtime::{Committed, Target, Widths, Window};
 use serve::Drafted;
 
-use super::drafted::{Lookups, SlotDrafts, reads_best};
+use super::drafted::{HistoryDrafts, SlotDrafts, reads_best};
 
 /// One round of several slots' steps, a seat's [`Seat::step_slots`]
 /// override, its one owner: the fallback loop ([`step_rows_in_turn`], which
@@ -213,17 +213,17 @@ where
     Ok(passes)
 }
 
-/// One round of several slots' plain steps on a load that drafts with the
-/// lookup as passes of `GpuModel::step_slots` ([`step_rows_one_pass`]), each
-/// slot's lookup context told of its row as a step alone tells it
-/// ([`Lookups::stepped_at`], from the position the row ran at): a lookup
-/// load's plain rounds run as one pass as a plain load's do, its contexts
-/// following each row at its own slot's position. Returns the passes it
-/// ran; refused as [`step_rows_one_pass`] refuses.
-pub(crate) fn step_rows_lookup<B>(
+/// One round of several slots' plain steps on a load that drafts from the
+/// token history as passes of `GpuModel::step_slots` ([`step_rows_one_pass`]),
+/// each slot's context told of its row as a step alone tells it
+/// ([`HistoryDrafts::stepped_at`], from the position the row ran at): a
+/// history-draft load's plain rounds run as one pass as a plain load's do, its
+/// contexts following each row at its own slot's position. Returns the passes
+/// it ran; refused as [`step_rows_one_pass`] refuses.
+pub(crate) fn step_rows_history<B>(
     s: &mut app::Session<B>,
     rows: &mut [SlotStep],
-    lookups: &mut Lookups<app::Session<B>>,
+    history_drafts: &mut HistoryDrafts<app::Session<B>>,
 ) -> Result<usize, GateError>
 where
     B: SlotRows + Prompt + Keep + Rows + Rollback,
@@ -236,7 +236,7 @@ where
     }
     let passes = step_rows_one_pass(s, rows)?;
     for (r, &p) in rows.iter().zip(&p0) {
-        lookups.stepped_at(s, r.slot, p as usize, r.last, r.next)?;
+        history_drafts.stepped_at(s, r.slot, p as usize, r.last, r.next)?;
     }
     Ok(passes)
 }
@@ -255,7 +255,7 @@ pub(crate) struct RoundRow<'a> {
 
 /// A seat's table of drafts, one a resident slot, that runs a round of
 /// several slots' windows verified together: the MTP table
-/// ([`SlotDrafts`]) and the lookup's ([`Lookups`]). Each slot's width
+/// ([`SlotDrafts`]) and the history drafts' ([`HistoryDrafts`]). Each slot's width
 /// chooser stands aside for the round, the round's batch chooser
 /// (`runtime::width::Batch`) cutting the windows' widths from each slot's
 /// acceptance profile and the round's own wall; [`pass_windows`] drives it.
@@ -358,25 +358,25 @@ where
 /// One round of several slots' history-draft passes as passes of
 /// `GpuModel::verify_slots`: every row a window of [`pass_windows`] over
 /// its slot's context, proposing at most the draft's width
-/// ([`Lookups::rows`] less the token at the position), or none where the
+/// ([`HistoryDrafts::rows`] less the token at the position), or none where the
 /// round's chooser holds it back (a width of 0, which the cost mode picks
 /// when the proposal does not pay). The draft is never off, so no row runs
 /// alone. Returns the passes it ran.
-pub(crate) fn pass_rows_lookup<B>(
+pub(crate) fn pass_rows_history<B>(
     s: &mut app::Session<B>,
     rows: &mut [SlotPassRow],
-    lookups: &mut Lookups<app::Session<B>>,
+    history_drafts: &mut HistoryDrafts<app::Session<B>>,
 ) -> Result<usize, GateError>
 where
     B: SlotRows + Prompt + Keep + Rows + Rollback,
     B::Seq: 'static,
 {
-    let depth = lookups.rows() - 1;
+    let depth = history_drafts.rows() - 1;
     pass_windows(
         s,
         rows,
         (0..rows.len()).collect(),
-        lookups,
+        history_drafts,
         depth,
         0..=depth,
     )

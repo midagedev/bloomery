@@ -28,7 +28,9 @@ A checklist for a person or a coding agent (Claude Code, Codex) who wants to run
    a repeated prompt is faster than its first send: send a different prompt for each timed request, or `--cache-ram 0`,
    when you time prefill.
 6. **Read the speed from the response's `timings`**, not from wall time that includes the download or the load:
-   `predicted_per_second` (decode), `prompt_per_second` (prefill), `draft_n` and `draft_n_accepted` (the MTP draft).
+   `predicted_per_second` (decode), `prompt_per_second` (prefill), `draft_n` and `draft_n_accepted` (the draft). A
+   request the server ran in plain steps although it drafts (`ignore_eos`, a `logit_bias`, sampling on a draft that
+   does not take sampled requests) carries `draft_off` naming why, and no draft counts.
 7. **Compare with llama-server on equal terms**: the same GGUF file, the same `--ctx-size`, the same `--parallel`
    (`-np`), and the same request body (messages, `max_tokens`, `temperature`, `top_p`, `top_k`, `seed`,
    `chat_template_kwargs`). Time one request alone for single-stream speed, and two at once for the total.
