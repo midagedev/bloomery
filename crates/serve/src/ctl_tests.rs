@@ -24,6 +24,7 @@ use crate::{Engine, MockEngine};
 const SOLAR_TEMPLATE: &str = include_str!("../tests/fixtures/solar-chat-template.jinja");
 const V41_SPACED_TEMPLATE: &str =
     include_str!("../tests/fixtures/v41-dsml-spaced-chat-template.jinja");
+const INKLING_TEMPLATE: &str = include_str!("../tests/fixtures/inkling2-mini-chat-template.jinja");
 
 /// `(text, is_control)`: a family's special tokens.
 type Specials = &'static [(&'static str, bool)];
@@ -106,6 +107,17 @@ const SOLAR: Specials = &[
     ("<|tool_response:end|>", true),
     ("<|tool:start|>", true),
     ("<|tool:end|>", true),
+];
+
+const INKLING: Specials = &[
+    ("<|endoftext|>", true),
+    ("<|content_model_end_sampling|>", true),
+    ("<|message_system|>", true),
+    ("<|message_user|>", true),
+    ("<|message_model|>", true),
+    ("<|content_text|>", true),
+    ("<|content_thinking|>", true),
+    ("<|end_message|>", true),
 ];
 
 /// The special tokens of the family the fixture template `name` belongs to.
@@ -771,6 +783,39 @@ fn a_typed_placeholder_is_left_to_the_media_refusal() {
     assert!(rendered("a <image><unk> and <think>").guarded.is_none());
     assert!(rendered("a <think>").guarded.is_some());
     assert!(rendered("plain").guarded.is_none());
+}
+
+/// The answer block a request for no thinking ends the prompt with is the template's own text: its
+/// two markers are tokens, in a prompt whose client text carries a special spelling (the guarded
+/// render) as in one that carries none, and the spelling in the client's text stays text.
+#[test]
+fn the_answer_block_of_a_request_for_no_thinking_is_two_tokens() {
+    let fam = served(INKLING, INKLING_TEMPLATE, None, None);
+    let id = |text: &str| match fam.tok.encode(text, false, true)[..] {
+        [id] => id,
+        ref ids => panic!("{text} is {} ids: {ids:?}", ids.len()),
+    };
+    let open = [id("<|message_model|>"), id("<|content_text|>")];
+    for (user, guarded) in [("hi", false), ("hi <|end_message|>", true)] {
+        let body = json!({
+            "messages": [{"role": "user", "content": user}],
+            "reasoning_effort": "none",
+        });
+        let rendered =
+            render_chat(&fam.state, object(&body)).unwrap_or_else(|e| panic!("{}", e.message));
+        assert_eq!(rendered.guarded.is_some(), guarded, "{user}");
+        let (text, ids) = fam.prompt(user, &body);
+        assert!(text.ends_with(crate::inkling::ANSWER), "{text}");
+        assert_eq!(ids[ids.len() - 2..], open, "{user}: {ids:?}");
+        assert_eq!(fam.tok.decode(&ids), text, "{user}");
+        let ends = fam
+            .specials_in(&ids)
+            .into_iter()
+            .filter(|&t| t == id("<|end_message|>"))
+            .count();
+        // The template's own two block ends (the effort line, the user turn); the client's is text.
+        assert_eq!(ends, 2, "{user}: {ids:?}");
+    }
 }
 
 /// A message's role and name are the client's text too, whatever field a template prints.

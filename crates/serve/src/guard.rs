@@ -390,6 +390,12 @@ pub(crate) struct Guarded {
 }
 
 impl Guarded {
+    /// Appends text the server writes after the template's render (a generation prompt): it holds
+    /// no mark and tokenizes as the template's own text does.
+    pub(crate) fn push_template_text(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
     /// The ids of the prompt: the text the client sent, with no special token across a mark.
     pub(crate) fn encode(&self, tok: &dyn Tokenizer) -> Vec<u32> {
         tok.encode_marked(&self.text, &self.mark)

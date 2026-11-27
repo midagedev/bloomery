@@ -798,6 +798,12 @@ maximum absolute difference; the tool applies no acceptance band. The gates are 
   it serves under its bare name, and its calls carry the namespace in the `function_call` item's `namespace` field.
   `conversation`, an `item_reference` item and `background: true` with `store: false` or `stream: true` are refused.
 - **Anthropic Messages**: `POST /v1/messages` and `/v1/messages/count_tokens`, as llama-server serves them.
+  `thinking: {"type": "disabled"}` is `enable_thinking: false` (each template answers it as it answers that switch,
+  and one with `chat_template_kwargs.enable_thinking: true` beside it is a 400), and `thinking: {"type": "enabled",
+  "budget_tokens": N}` is `reasoning_budget: N`, except where no tracker can close the model's reasoning (Inkling 2,
+  Muse Spark): there a cap above 0 is not kept, the request runs with the template's own thinking and no cap, and the
+  server's stderr prints one line a request naming it (`thinking.budget_tokens N is not kept`). The answer carries no
+  field for it.
 - **Chat token counts**: `POST /chat/completions/input_tokens` (and `/v1/`) answers `{"input_tokens": N}` for the
   same chat request, an image as its span; `max_tokens` is not needed.
 - **Prompt ids**: `POST /apply-template` takes a chat request's `messages`, tools and template options and answers
@@ -886,7 +892,10 @@ template uses is read from the call it renders, and a `tool_choice` that forces 
 
 - **`reasoning_budget`** (on `/v1/chat/completions` and `/completion`): llama-server's think span budget in generated
   ids, `0` closing it at once, `-1` or absent unrestricted, ignored when the template already closed the span. A
-  Qwen3-Coder `<tool_call>` ends the span too. A finite budget beside a forced `tool_choice` is a 400.
+  Qwen3-Coder `<tool_call>` ends the span too. A finite budget beside a forced `tool_choice` is a 400. Inkling 2's
+  thinking is a block, not a `<think>` span: there `0` is the request for no thinking (below), `-1` or absent leaves the
+  model unrestricted, and any other budget is a 400 naming the field, as on Muse Spark, whose reasoning is a message to
+  `self`. A budget no tracker can spend is refused, never accepted and ignored.
 - **`reasoning_loop`** (on every generating route): `true` ends a generation whose open think span repeats a cycle of
   up to 1,024 ids over at least 256 ids and one whole cycle. It ends with the reasoning so far and `finish_reason`
   `reasoning_loop` (`stop_reason` on `/v1/messages`, `stop_type` on `/completion`; on `/v1/responses` `status`
@@ -903,8 +912,22 @@ template uses is read from the call it renders, and a `tool_choice` that forces 
   both. Every other word asks for
   reasoning: a template whose thinking is off until `enable_thinking` is set (V4.1's) gets `enable_thinking: true`, and
   `max` also adds its maximum-effort header. A `chat_template_kwargs` `enable_thinking` in the same request wins.
-  `/props`' `thinking_off` names the template's case: `"switch"`, `"low_effort"`, `"off_word"` or `"neither"`. Unlike llama-server,
-  a request that names neither field keeps the template's own default (thinking is off for V4.1).
+  A top-level `enable_thinking` (a boolean, as Qwen's clients send it) is the same request as the one in
+  `chat_template_kwargs`, and two that disagree are a 400. A template that has no switch, no effort knob and a think
+  span of its own (the model always thinks) refuses `"none"` and `enable_thinking: false` with a 400 naming the field,
+  and one line at start says so; a template that writes no think span either (Qwen3-Coder's) has nothing to turn off
+  and renders as it does.
+  Inkling 2's template writes no generation prompt (the model opens its own block, thinking among them) and its effort
+  `none` is level 0, which does not stop the reasoning. There `"none"`, `enable_thinking: false` (top level or in the
+  kwargs), a kwargs `reasoning_effort` of `"none"` and `reasoning_budget: 0` each render the effort-0 prompt and end
+  it with `<|message_model|><|content_text|>`, the template's own start of an assistant turn that is only text, so the
+  model begins inside its answer block; the reply is `content` from its first byte. A request whose program starts at
+  the first generated id (a forced `tool_choice`, a JSON `response_format`) writes its own header or text and keeps
+  the effort-0 prompt alone, and `add_generation_prompt: false` keeps the template's render. A template whose assistant
+  turn is not that block refuses the request by name.
+  `/props`' `thinking_off` names the template's case: `"switch"`, `"low_effort"`, `"off_word"`, `"neither"` or
+  `"fixed"`. Unlike llama-server, a request that names neither field keeps the template's own default (thinking is off
+  for V4.1).
 - **`developer` messages** reach the template as `system`, as llama-server maps them, except on GPT-OSS's template.
 
 ### 11.4 Structured output

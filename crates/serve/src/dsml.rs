@@ -581,6 +581,12 @@ pub enum ToolFormat {
 }
 
 impl ToolFormat {
+    /// Whether the family's reasoning is a span only its own scan reads (a thinking block, a
+    /// message to `self`), not a `<think>` span a budget tracker can close.
+    pub(crate) fn scans_own_reasoning(self) -> bool {
+        matches!(self, ToolFormat::Inkling | ToolFormat::MuseSpark)
+    }
+
     /// The markup the template `source` spells for a call: the key/value
     /// markup's when it spells a [`KvSpelling`]'s call, name and value
     /// openers (GLM's `<tool_call>`, `<arg_key>` and `<arg_value>`), Qwen3-Coder's
@@ -879,6 +885,9 @@ impl ChatParser {
         // Qwen3-Coder's call ends an open span without `</think>`, as
         // llama.cpp's parser for the markup reads it.
         let call_ends_span = matches!(tools, Some(Tools::QwenXml(..)));
+        // A prompt that ends in Inkling 2's answer block leaves the model inside it.
+        let in_answer = prompt.ends_with(crate::inkling::ANSWER);
+        let inkling = |scan: InklingScan| if in_answer { scan.in_answer() } else { scan };
         ChatParser {
             format,
             tags,
@@ -900,8 +909,10 @@ impl ChatParser {
                 Tools::QwenXml(framing, kinds) => Scan::Qwen(QwenScan::new(kinds, framing)),
                 Tools::MuseSpark => Scan::Recipient(crate::museatem::MuseScan::default()),
                 Tools::Mistral => Scan::Mistral(MistralScan::default()),
-                Tools::Inkling => Scan::Inkling(InklingScan::new(extract)),
-                Tools::InklingText => Scan::Inkling(InklingScan::new(extract).without_calls()),
+                Tools::Inkling => Scan::Inkling(inkling(InklingScan::new(extract))),
+                Tools::InklingText => {
+                    Scan::Inkling(inkling(InklingScan::new(extract).without_calls()))
+                }
                 Tools::ErnieXml(types) => Scan::Ernie(ErnieScan::new(types)),
             }),
             streamer: None,

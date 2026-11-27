@@ -85,6 +85,7 @@ use crate::genloop::{self, Depth, Event, GenError, GenParams, Outcome, Slot, Tim
 use crate::glmxml::ArgTypes;
 use crate::guard::{Guard, GuardError, Guarded};
 use crate::http::{self, EventStream, Request};
+use crate::inkling;
 use crate::media::{self, ExpandError, MediaError, Medium, Prompt, SharedMediaModel, VideoCtx};
 use crate::models::Listed;
 use crate::qwenxml::ParamKinds;
@@ -414,6 +415,8 @@ impl Server {
     ) -> Result<Self, ServeError> {
         let template = ChatTemplate::parse(&config.chat_template)?;
         let thinking_off = probe_thinking_off(&template)?;
+        let tool_format = ToolFormat::of_chat_template(&template);
+        let answer_open = probe_answer_open(&template, tool_format);
         if let Some(dir) = config.slot_save_path.as_ref().filter(|d| !d.is_dir()) {
             return Err(ServeError::SlotSavePath(dir.clone()));
         }
@@ -445,6 +448,13 @@ impl Server {
         if let Some(note) = thinking_off.note() {
             eprintln!("bloomery-serve: {note}");
         }
+        if let Some(open) = answer_open {
+            eprintln!(
+                "bloomery-serve: chat template: no generation prompt; reasoning_effort \"none\", \
+                 enable_thinking false and reasoning_budget 0 end the prompt with {open}, the \
+                 answer block"
+            );
+        }
         let vocab = Arc::new(constrain::Vocab::read(&*tok));
         let state = State {
             shared: Arc::new(shared),
@@ -453,10 +463,11 @@ impl Server {
             tok,
             vocab,
             fatal_linger: config.fatal_linger,
-            tool_format: ToolFormat::of_chat_template(&template),
+            tool_format,
             object_arguments: needs_object_arguments(&template),
             typed_content: keeps_typed_content(template.source()),
             thinking_off,
+            answer_open,
             preparation: config.chat_preparation,
             think: ThinkTags::THINK,
             template,
@@ -751,6 +762,10 @@ struct State {
     /// How the template answers `reasoning_effort: "none"`
     /// ([`probe_thinking_off`]), decided once.
     thinking_off: ThinkingOff,
+    /// What a request for no thinking appends to the prompt on a template that writes no
+    /// generation prompt and leaves the model to open its own block ([`probe_answer_open`]),
+    /// decided once; `None` on every other template.
+    answer_open: Option<&'static str>,
     /// The family's request preparation, which shapes a request before the
     /// template renders it; `None` renders the request as the template reads
     /// it.
@@ -3213,7 +3228,9 @@ impl Rendered {
 /// special-token spelling in the client's text (a message, a tool call, a tool,
 /// a `chat_template_kwargs` value; not an assistant message's content or
 /// reasoning, which the model wrote) reaches the template marked
-/// ([`crate::guard`]) and is text in the prompt.
+/// ([`crate::guard`]) and is text in the prompt. A request for no thinking on a template that
+/// writes no generation prompt ends the prompt in the template's answer block
+/// ([`thinking_off_prompt`]), after the guarded render.
 fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiError> {
     let Some(Value::Array(msgs)) = b.get("messages") else {
         return Err(invalid("'messages' is required and must be an array").at("messages"));
@@ -3346,7 +3363,18 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         }
         Some(other) => return Err(wrong_type("tools", "an array", other)),
     }
-    thinking_vars(b, &mut vars, state.thinking_off)?;
+    let mut off = thinking_vars(b, &mut vars, state.thinking_off)?;
+    if state.tool_format == ToolFormat::Inkling && reasoning_budget(b)? == Some(0) {
+        // A budget of 0 is the request for no thinking: the effort the client did not name is
+        // the template's word for it, so the prompt is the one `"none"` makes.
+        if let (ThinkingOff::OffWord(word), false) =
+            (state.thinking_off, vars.contains_key("reasoning_effort"))
+        {
+            vars.insert("reasoning_effort".into(), Value::String(word.to_owned()));
+        }
+        off = true;
+    }
+    let answer = thinking_off_prompt(state, b, off)?;
     if let Some(preparation) = state.preparation {
         // The family's preparation shapes the request before the template
         // renders it: it rewrites the messages and adds the variables its
@@ -3372,9 +3400,16 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         }
     }
     let marked = state.template.render(&vars).map_err(template_error)?;
-    let (text, guarded) = guard
+    let (mut text, mut guarded) = guard
         .finish(marked, &state.template, &vars)
         .map_err(guard_error)?;
+    // The server's own text after the template's, which holds no client string.
+    if let Some(open) = answer {
+        text.push_str(open);
+        if let Some(g) = &mut guarded {
+            g.push_template_text(open);
+        }
+    }
     Ok(Rendered {
         text,
         guarded,
@@ -3513,8 +3548,13 @@ enum ThinkingOff {
     /// the word itself.
     OffWord(&'static str),
     /// Neither knob changes the prompt: `"none"` sets `enable_thinking`
-    /// `false`, as llama-server does, and there is nothing to map it to.
+    /// `false`, as llama-server does, and there is nothing to map it to. The template
+    /// writes no think span either, so there is no thinking to turn off.
     Neither,
+    /// Neither knob changes the prompt and the template writes a think span (its source
+    /// names the span's tags): the model always thinks, and a request for no thinking is
+    /// a 400, not a request the template would drop.
+    Fixed,
 }
 
 impl ThinkingOff {
@@ -3525,6 +3565,7 @@ impl ThinkingOff {
             ThinkingOff::LowEffort => "low_effort",
             ThinkingOff::OffWord(_) => "off_word",
             ThinkingOff::Neither => "neither",
+            ThinkingOff::Fixed => "fixed",
         }
     }
 
@@ -3547,22 +3588,15 @@ impl ThinkingOff {
                 "chat template: no thinking switch; reasoning_effort \"none\" and \
                  enable_thinking false are sent as the template's own word for no thinking",
             ),
+            ThinkingOff::Fixed => Some(
+                "chat template: no thinking switch and the model always thinks; \
+                 reasoning_effort \"none\" and enable_thinking false are refused",
+            ),
             ThinkingOff::Switch { .. } | ThinkingOff::Neither => None,
         }
     }
 }
 
-/// Reads the template's [`ThinkingOff`] from the generation prompt of one
-/// user message `"hi"`: a template where `enable_thinking: false` and `true`
-/// render differently has a [`Switch`](ThinkingOff::Switch), opt-in when
-/// the prompt with no `enable_thinking` is not the `true` one; otherwise one
-/// that refuses an effort word it does not know ([`PROBE_EFFORT`]) and renders
-/// one of [`OFF_WORDS`] apart from no effort is
-/// [`OffWord`](ThinkingOff::OffWord) of that word; otherwise one
-/// where `reasoning_effort: "low"` renders differently from no effort is
-/// [`LowEffort`](ThinkingOff::LowEffort); otherwise
-/// [`Neither`](ThinkingOff::Neither). A render that fails is the bind's
-/// error, naming the probe: the answer is never guessed.
 /// The effort words a template may take as its own for no thinking
 /// ([`ThinkingOff::OffWord`]): OpenAI's `"none"` where the template reads it as itself
 /// (Inkling 2's maps it to effort 0), and Hy4-flash's `"no_think"`.
@@ -3572,6 +3606,18 @@ const OFF_WORDS: [&str; 2] = ["none", "no_think"];
 /// words it takes ([`probe_thinking_off`]).
 const PROBE_EFFORT: &str = "bloomery-probe-effort";
 
+/// Reads the template's [`ThinkingOff`] from the generation prompt of one
+/// user message `"hi"`: a template where `enable_thinking: false` and `true`
+/// render differently has a [`Switch`](ThinkingOff::Switch), opt-in when
+/// the prompt with no `enable_thinking` is not the `true` one; otherwise one
+/// that refuses an effort word it does not know ([`PROBE_EFFORT`]) and renders
+/// one of [`OFF_WORDS`] apart from no effort is
+/// [`OffWord`](ThinkingOff::OffWord) of that word; otherwise one
+/// where `reasoning_effort: "low"` renders differently from no effort is
+/// [`LowEffort`](ThinkingOff::LowEffort); otherwise one whose source names a
+/// think span's tags is [`Fixed`](ThinkingOff::Fixed) and one that names none
+/// [`Neither`](ThinkingOff::Neither). A render that fails is the bind's
+/// error, naming the probe: the answer is never guessed.
 fn probe_thinking_off(t: &ChatTemplate) -> Result<ThinkingOff, TemplateError> {
     let render = |extra: Option<(&str, Value)>| {
         let mut vars = Map::new();
@@ -3605,9 +3651,104 @@ fn probe_thinking_off(t: &ChatTemplate) -> Result<ThinkingOff, TemplateError> {
     let low = render(Some(("reasoning_effort", json!("low"))))?;
     Ok(if low != unset {
         ThinkingOff::LowEffort
+    } else if ::models::ReasoningFormat::of_template(t.source()).is_some() {
+        ThinkingOff::Fixed
     } else {
         ThinkingOff::Neither
     })
+}
+
+/// An assistant turn's text no template writes: [`probe_answer_open`] finds where the turn's
+/// text starts by it.
+const PROBE_ANSWER: &str = "bloomery-probe-answer";
+
+/// The generation prompt of a request for no thinking, for a template that writes none: Inkling
+/// 2's ends the prompt at the last message and the model writes its own block header, thinking
+/// being the block it opens. The text that puts the model in its answer is what the template
+/// itself writes before the text of an assistant turn that is only text, read here from its
+/// render of `[user, assistant]` after that of `[user]`; it is taken only where it is
+/// [`inkling::ANSWER`], the text the parser starts inside ([`ChatParser`]). `None` on every other
+/// template, and on an Inkling one whose assistant turn is not that: a request for no thinking is
+/// then a 400, never a prompt the parser would misread.
+fn probe_answer_open(t: &ChatTemplate, format: ToolFormat) -> Option<&'static str> {
+    if format != ToolFormat::Inkling {
+        return None;
+    }
+    let render = |messages: Value| {
+        let mut vars = Map::new();
+        vars.insert("messages".into(), messages);
+        vars.insert("add_generation_prompt".into(), json!(true));
+        vars.insert("bos_token".into(), json!(""));
+        vars.insert("eos_token".into(), json!(""));
+        t.render(&vars).ok()
+    };
+    let user = json!({"role": "user", "content": "hi"});
+    let asked = render(json!([user]))?;
+    let turn = render(json!([user, {"role": "assistant", "content": PROBE_ANSWER}]))?;
+    let head = turn.strip_prefix(&asked)?.split_once(PROBE_ANSWER)?.0;
+    (head == inkling::ANSWER).then_some(inkling::ANSWER)
+}
+
+/// What a request for no thinking appends to the rendered prompt: [`State::answer_open`] on a
+/// template whose model opens its own block, so that it starts inside its answer. Asked by
+/// `off` (the thinking vars, [`thinking_vars`], and a `reasoning_budget` of 0), and not where
+/// the client asked for no generation prompt or a program starts at the first id (a forced call
+/// writes its own header, a JSON document its own text: none of them thinks). A request for no
+/// thinking on a template of that kind with no such prompt is a 400.
+fn thinking_off_prompt(
+    state: &State,
+    b: &Map<String, Value>,
+    off: bool,
+) -> Result<Option<&'static str>, ApiError> {
+    if state.tool_format != ToolFormat::Inkling {
+        return Ok(None);
+    }
+    let generating = get_b(b, "add_generation_prompt")?.unwrap_or(true);
+    if !off || !generating || constrain::starts_at_once(b) {
+        return Ok(None);
+    }
+    state.answer_open.map(Some).ok_or_else(|| {
+        invalid(format!(
+            "this chat template's assistant turn is not a block that opens with {}: a request \
+             for no thinking has no prompt to end in",
+            inkling::ANSWER
+        ))
+    })
+}
+
+/// `reasoning_budget` on a template whose reasoning only the family's own scan reads (Inkling
+/// 2's thinking block, Muse Spark's message to `self`): the budget's tracker reads a think span
+/// whose tags such a model never writes, so a budget would be accepted and never spent. A prompt
+/// that ends in Inkling 2's answer block has no reasoning to cap, and the budget is moot as a
+/// closed `<think>` span makes it ([`gate_think_span`]); any other budget is a 400.
+fn scanned_reasoning_budget(
+    state: &State,
+    p: &mut GenParams,
+    prompt: &str,
+) -> Result<(), ApiError> {
+    let Some(budget) = p.reasoning_budget else {
+        return Ok(());
+    };
+    let why = match state.tool_format {
+        ToolFormat::Inkling if prompt.ends_with(inkling::ANSWER) => {
+            p.reasoning_budget = None;
+            return Ok(());
+        }
+        ToolFormat::Inkling => format!(
+            "its thinking is a block no budget closes: a chat request that asks for a generation \
+             prompt ends it with {} for reasoning_budget 0, reasoning_effort \"none\" or \
+             enable_thinking false, which turns it off; send -1 to leave it",
+            inkling::ANSWER
+        ),
+        ToolFormat::MuseSpark => {
+            "its reasoning is a message to self that no budget closes".to_owned()
+        }
+        _ => return Ok(()),
+    };
+    Err(invalid(format!(
+        "reasoning_budget {budget} is not supported by this chat template: {why}"
+    ))
+    .at("reasoning_budget"))
 }
 
 /// The tool calls of message `at` with each string `arguments` parsed as JSON,
@@ -3685,17 +3826,29 @@ fn check_effort(field: &str, effort: &str, how: ThinkingOff) -> Result<(), ApiEr
 /// `reasoning_effort` ask for opposite thinking (`false` with an effort that is
 /// not `"none"` or the template's own word, `true` with one) is a 400 naming
 /// both: neither is picked. `true` leaves the template's default.
+///
+/// A top-level `enable_thinking` (a bool; `null` is absent; another type is a 400) is the kwargs
+/// one, and a request whose two disagree is a 400. A template that always thinks
+/// ([`ThinkingOff::Fixed`]) has nothing a request for no thinking could turn off: `"none"` and
+/// `enable_thinking: false` are a 400 naming the field there, never a request the template drops.
+/// The result is whether the template now reads a request for no thinking, which
+/// [`thinking_off_prompt`] turns into the prompt's end.
 fn thinking_vars(
     b: &Map<String, Value>,
     vars: &mut Map<String, Value>,
     how: ThinkingOff,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     let kwargs = match b.get("chat_template_kwargs") {
         None | Some(Value::Null) => None,
         Some(Value::Object(kw)) => Some(kw),
         Some(other) => return Err(wrong_type("chat_template_kwargs", "an object", other)),
     };
     let mut thinking: Option<bool> = None;
+    // Where the switch was sent: its name for the refusals, and the field they point at.
+    let mut sent = (
+        "chat_template_kwargs.enable_thinking",
+        "chat_template_kwargs",
+    );
     if let Some(kw) = kwargs {
         match kw.get("enable_thinking") {
             Some(Value::Bool(on)) => thinking = Some(*on),
@@ -3707,6 +3860,25 @@ fn thinking_vars(
             }
             _ => {}
         }
+    }
+    // The same switch as a top-level field, as Qwen's and Alibaba's clients send it: read as the
+    // kwargs one, and a request whose two disagree is a 400.
+    match b.get("enable_thinking") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(on)) => {
+            if let Some(kw) = thinking.filter(|kw| kw != on) {
+                return Err(invalid(format!(
+                    "\"enable_thinking\" is {on} but \"chat_template_kwargs.enable_thinking\" is \
+                     {kw}: they ask for opposite thinking, send one of them"
+                ))
+                .at("enable_thinking"));
+            }
+            if thinking.is_none() {
+                sent = ("enable_thinking", "enable_thinking");
+            }
+            thinking = Some(*on);
+        }
+        Some(other) => return Err(wrong_type("enable_thinking", "a boolean", other)),
     }
     let effort = match b.get("reasoning_effort") {
         None | Some(Value::Null) => None,
@@ -3721,18 +3893,32 @@ fn thinking_vars(
         let effort_off = e == "none" || matches!(how, ThinkingOff::OffWord(w) if w == e);
         if effort_off == on {
             return Err(invalid(format!(
-                "\"chat_template_kwargs.enable_thinking\" is {on} but \"reasoning_effort\" \
+                "\"{}\" is {on} but \"reasoning_effort\" \
                  (\"reasoning.effort\" on /v1/responses) is {e:?}: they ask for opposite \
-                 thinking, send one of them"
+                 thinking, send one of them",
+                sent.0
             ))
-            .at("chat_template_kwargs"));
+            .at(sent.1));
         }
+    }
+    let effort_none = effort.and_then(Value::as_str) == Some("none");
+    // A model that always thinks has nothing a request for no thinking could turn off.
+    if how == ThinkingOff::Fixed && (effort_none || thinking == Some(false)) {
+        let (what, field) = if effort_none {
+            ("reasoning_effort \"none\"".to_owned(), "reasoning_effort")
+        } else {
+            (format!("{} false", sent.0), sent.1)
+        };
+        return Err(invalid(format!(
+            "{what} cannot be honoured: this chat template has no thinking switch and its \
+             model always thinks, send neither"
+        ))
+        .at(field));
     }
     // A template with no thinking switch has nothing `enable_thinking: false`
     // could turn off, so the request for no thinking is the effort that stands
     // for it: the same as `"none"`.
-    let none =
-        effort.and_then(Value::as_str) == Some("none") || (by_effort && thinking == Some(false));
+    let none = effort_none || (by_effort && thinking == Some(false));
     match (none, how) {
         (true, ThinkingOff::LowEffort) => {
             vars.insert("reasoning_effort".into(), Value::String("low".to_owned()));
@@ -3740,7 +3926,9 @@ fn thinking_vars(
         (true, ThinkingOff::OffWord(word)) => {
             vars.insert("reasoning_effort".into(), Value::String(word.to_owned()));
         }
-        (true, ThinkingOff::Switch { .. } | ThinkingOff::Neither) => thinking = Some(false),
+        (true, ThinkingOff::Switch { .. } | ThinkingOff::Neither | ThinkingOff::Fixed) => {
+            thinking = Some(false);
+        }
         (false, how) => {
             if let Some(v) = effort {
                 vars.insert("reasoning_effort".into(), v.clone());
@@ -3766,7 +3954,14 @@ fn thinking_vars(
                 .map(|(k, v)| (k.clone(), v.clone())),
         );
     }
-    Ok(())
+    // Whether the template now reads a request for no thinking: its own word for it, a kwargs
+    // `reasoning_effort` that is that word included.
+    Ok(match how {
+        ThinkingOff::OffWord(word) => {
+            vars.get("reasoning_effort").and_then(Value::as_str) == Some(word)
+        }
+        _ => none || thinking == Some(false),
+    })
 }
 
 /// The text of an array `content` on an engine that takes no images: its text
@@ -4674,6 +4869,7 @@ fn completion_plan(state: &State, b: &Map<String, Value>) -> Result<CompletionPl
             Some(Value::String(s)) => s.clone(),
             _ => state.tok.decode(&ids),
         };
+        scanned_reasoning_budget(state, &mut p, &text)?;
         gate_think_span(&mut p, &text);
         // A forced call's span ends at its close alone ([`ChatParser::following_reasoning`]).
         if let (ToolFormat::QwenXml(framing), false) = (state.tool_format, call) {
@@ -5052,6 +5248,7 @@ fn chat_plan(
         ReasoningFormat::from_request(format).map_err(|e| invalid(e).at("reasoning_format"))?;
     let (text, input) = chat_input(state, b)?;
     let tools = tool_scan(state, b)?;
+    scanned_reasoning_budget(state, &mut p, &text)?;
     gate_think_span(&mut p, &text);
     let mut parser =
         ChatParser::with_tags(&text, format, tools, state.think).for_template(state.tool_format);
@@ -10403,6 +10600,284 @@ mod tests {
             "another effort reaches the template: {p}"
         );
         assert!(p.ends_with("<think>\n"), "its span stays open: {p}");
+    }
+
+    /// `enable_thinking` as a top-level field is the same switch as the one in
+    /// `chat_template_kwargs`, not an unknown field the server drops: on Qwen3.8's
+    /// template it renders the prompt the kwargs one does; the two together
+    /// must agree, and a field that is not a boolean is a 400 naming it.
+    #[test]
+    fn a_top_level_enable_thinking_is_the_kwargs_one() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            templated(include_str!("../tests/fixtures/qwen38-chat-template.jinja")),
+        );
+        let messages = || json!([{ "role": "user", "content": "Hi" }]);
+        for on in [false, true] {
+            let (status, kwargs) = applied(
+                addr,
+                &json!({ "messages": messages(), "chat_template_kwargs": { "enable_thinking": on } }),
+            );
+            assert_eq!(status, 200, "{kwargs}");
+            let (status, top) = applied(
+                addr,
+                &json!({ "messages": messages(), "enable_thinking": on }),
+            );
+            assert_eq!(status, 200, "{top}");
+            assert_eq!(top, kwargs, "top-level {on}");
+            let (status, both) = applied(
+                addr,
+                &json!({
+                    "messages": messages(),
+                    "enable_thinking": on,
+                    "chat_template_kwargs": { "enable_thinking": on },
+                }),
+            );
+            assert_eq!(status, 200, "{both}");
+            assert_eq!(both, kwargs, "both {on}");
+        }
+        let (_, off) = applied(
+            addr,
+            &json!({ "messages": messages(), "enable_thinking": false }),
+        );
+        assert!(
+            applied_prompt(&off).ends_with("<think>\n\n</think>\n\n"),
+            "the span is closed: {off}"
+        );
+        let (status, body) = applied(
+            addr,
+            &json!({
+                "messages": messages(),
+                "enable_thinking": false,
+                "chat_template_kwargs": { "enable_thinking": true },
+            }),
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(
+            body.contains("opposite thinking") && body.contains("\"param\":\"enable_thinking\""),
+            "{body}"
+        );
+        let (status, body) = applied(
+            addr,
+            &json!({ "messages": messages(), "enable_thinking": "no" }),
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(body.contains("enable_thinking"), "{body}");
+    }
+
+    /// A template that writes a think span and has neither switch
+    /// ([`ThinkingOff::Fixed`]) belongs to a model that always thinks: a
+    /// request for no thinking, in any of its spellings, is a 400 naming it, and
+    /// a request that asks for thinking or for nothing renders. A template that
+    /// writes no span ([`ThinkingOff::Neither`]) has no thinking to turn off, and
+    /// the same requests render.
+    #[test]
+    fn a_model_that_always_thinks_refuses_a_request_to_stop() {
+        const ALWAYS: &str = "{% for m in messages %}{{ m.content }}\n{% endfor %}\
+                              {% if add_generation_prompt %}<think>\n{% endif %}";
+        const NEVER: &str = "{% for m in messages %}{{ m.content }}\n{% endfor %}";
+        let parsed = |source: &str| ChatTemplate::parse(source).expect("a template");
+        assert_eq!(
+            probe_thinking_off(&parsed(ALWAYS)).expect("renders"),
+            ThinkingOff::Fixed
+        );
+        assert_eq!(
+            probe_thinking_off(&parsed(NEVER)).expect("renders"),
+            ThinkingOff::Neither
+        );
+        let messages = || json!([{ "role": "user", "content": "Hi" }]);
+        let stops = [
+            ("reasoning_effort", json!({ "reasoning_effort": "none" })),
+            (
+                "chat_template_kwargs",
+                json!({ "chat_template_kwargs": { "enable_thinking": false } }),
+            ),
+            ("enable_thinking", json!({ "enable_thinking": false })),
+        ];
+        let (always, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(ALWAYS));
+        let (never, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(NEVER));
+        for (param, extra) in stops {
+            let mut body = json!({ "messages": messages() });
+            body.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            let (status, answer) = applied(always, &body);
+            assert_eq!(status, 400, "{param}: {answer}");
+            assert!(
+                answer.contains("always thinks")
+                    && answer.contains(&format!("\"param\":\"{param}\"")),
+                "{param}: {answer}"
+            );
+            let (status, answer) = applied(never, &body);
+            assert_eq!(status, 200, "{param}: {answer}");
+        }
+        for body in [
+            json!({ "messages": messages() }),
+            json!({ "messages": messages(), "enable_thinking": true }),
+        ] {
+            let (status, answer) = applied(always, &body);
+            assert_eq!(status, 200, "{answer}");
+            assert!(applied_prompt(&answer).ends_with("<think>\n"), "{answer}");
+        }
+    }
+
+    /// A template that teaches Inkling 2's blocks but whose assistant turn is not a block that opens
+    /// with `<|message_model|><|content_text|>` has no prompt a request for no thinking could end
+    /// in: the request is a 400 naming that, never a prompt the parser would misread, and a request
+    /// that asks for no such thing renders.
+    #[test]
+    fn an_inkling_template_with_no_answer_block_refuses_a_request_for_no_thinking() {
+        const ODD: &str = "{% for m in messages %}<|message_model|>{{ m.content }}\
+                           <|content_invoke_tool_json|>{% endfor %}";
+        let (addr, state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(ODD));
+        assert_eq!(state.tool_format, super::ToolFormat::Inkling);
+        assert_eq!(state.answer_open, None);
+        let messages = || json!([{ "role": "user", "content": "Hi" }]);
+        for extra in [
+            json!({ "reasoning_effort": "none" }),
+            json!({ "enable_thinking": false }),
+            json!({ "reasoning_budget": 0 }),
+        ] {
+            let mut body = json!({ "messages": messages() });
+            body.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            let (status, answer) = applied(addr, &body);
+            assert_eq!(status, 400, "{extra}: {answer}");
+            assert!(answer.contains("no prompt to end in"), "{extra}: {answer}");
+        }
+        let (status, answer) = applied(addr, &json!({ "messages": messages() }));
+        assert_eq!(status, 200, "{answer}");
+    }
+
+    /// `reasoning_budget` on a template whose reasoning only its family's scan reads
+    /// (Muse Spark's message to `self`) is a 400 naming the field: its budget tracker reads
+    /// `<think>` spans the model never writes, so the budget would be accepted and never
+    /// spent. `-1` and no budget are the requests the model runs unrestricted.
+    #[test]
+    fn a_budget_no_tracker_can_spend_is_refused() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(4096)),
+            templated(include_str!(
+                "../tests/fixtures/musespark-chat-template.jinja"
+            )),
+        );
+        let chat = |extra: &str| {
+            roundtrip(
+                addr,
+                "POST",
+                "/v1/chat/completions",
+                &format!(
+                    r#"{{"messages":[{{"role":"user","content":"Hi"}}],"max_tokens":2{extra}}}"#
+                ),
+            )
+        };
+        for budget in ["0", "5"] {
+            let (status, body) = chat(&format!(r#","reasoning_budget":{budget}"#));
+            assert_eq!(status, 400, "{budget}: {body}");
+            assert!(
+                body.contains(&format!("reasoning_budget {budget} is not supported"))
+                    && body.contains("\"param\":\"reasoning_budget\""),
+                "{budget}: {body}"
+            );
+        }
+        for extra in [
+            "",
+            r#","reasoning_budget":-1"#,
+            r#","reasoning_budget":null"#,
+        ] {
+            let (status, body) = chat(extra);
+            assert_eq!(status, 200, "{extra}: {body}");
+        }
+    }
+
+    /// `/v1/messages` with `thinking: {"type": "enabled", "budget_tokens": N}` on a template whose
+    /// reasoning only its family's scan reads (Inkling 2, Muse Spark) is not refused as the chat
+    /// path's `reasoning_budget` is: Anthropic clients send the field on every request. The cap
+    /// is dropped and the server names it in one stderr line a request, after the id the answer
+    /// carries; a budget of 0 is not dropped (no thinking where the model can, a named 400
+    /// where it cannot), and a template whose budget a tracker keeps prints no such line.
+    #[test]
+    fn a_messages_budget_a_scanned_template_cannot_keep_is_dropped_and_named() {
+        let inkling = include_str!("../tests/fixtures/inkling2-mini-chat-template.jinja");
+        let muse = include_str!("../tests/fixtures/musespark-chat-template.jinja");
+        for (name, template, zero) in [("inkling", inkling, 200), ("muse", muse, 400)] {
+            let (addr, state, _ended) = super::testserve::spawn(
+                Box::new(crate::MockEngine::new(4096)),
+                templated(template),
+            );
+            let ask = |budget: u32| {
+                roundtrip(
+                    addr,
+                    "POST",
+                    "/v1/messages",
+                    &format!(
+                        r#"{{"max_tokens":2,"messages":[{{"role":"user","content":"Hi"}}],
+                            "thinking":{{"type":"enabled","budget_tokens":{budget}}}}}"#
+                    ),
+                )
+            };
+            let (status, body) = ask(2048);
+            assert_eq!(status, 200, "{name}: {body}");
+            let id = serde_json::from_str::<Value>(&body).expect("JSON")["id"]
+                .as_str()
+                .expect("an id")
+                .to_owned();
+            let lines: Vec<String> = state
+                .shared
+                .notes()
+                .into_iter()
+                .filter(|l| l.contains("budget_tokens"))
+                .collect();
+            assert_eq!(lines.len(), 1, "{name}: one line a request: {lines:#?}");
+            assert!(
+                lines[0].contains(&format!("request {id} /v1/messages: "))
+                    && lines[0].contains("thinking.budget_tokens 2048 is not kept"),
+                "{name}: {}",
+                lines[0]
+            );
+            let (status, body) = ask(0);
+            assert_eq!(status, zero, "{name}: {body}");
+            if zero == 400 {
+                assert!(
+                    body.contains("reasoning_budget 0 is not supported"),
+                    "{name}: {body}"
+                );
+            }
+            assert_eq!(
+                state
+                    .shared
+                    .notes()
+                    .iter()
+                    .filter(|l| l.contains("budget_tokens"))
+                    .count(),
+                1,
+                "{name}: a budget of 0 is not dropped"
+            );
+        }
+        let (addr, state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            super::testserve::mock_config(),
+        );
+        let (status, body) = roundtrip(
+            addr,
+            "POST",
+            "/v1/messages",
+            r#"{"max_tokens":2,"messages":[{"role":"user","content":"Hi"}],
+                "thinking":{"type":"enabled","budget_tokens":2048}}"#,
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            !state
+                .shared
+                .notes()
+                .iter()
+                .any(|l| l.contains("budget_tokens")),
+            "a template whose budget a tracker keeps drops nothing"
+        );
     }
 
     /// The official V4.1 encoding's prompts: DeepSeek's own encoder renders
