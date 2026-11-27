@@ -78,7 +78,7 @@ const V_TILE_WORDS: usize = KEY_TILE * ROW_QWORDS * 2;
 const STAGES: usize = 2;
 const _: () =
     assert!(ROW_WORDS.is_multiple_of(4) && ROW_CHUNKS == 16 && ROW_QWORDS * 2 == ROW_WORDS);
-const _: () = assert!(K_ROW % 4 == 0 && (K_ROW / 4) % 2 == 1);
+const _: () = assert!(K_ROW.is_multiple_of(4) && (K_ROW / 4) % 2 == 1);
 
 /// Rows of a tile one pass of a block's copy threads covers (`32·G` threads,
 /// [`ROW_CHUNKS`] a row), and the passes a tile takes.
@@ -157,6 +157,10 @@ fn stage_tile<const RING: bool, const G: usize>(
 /// Contract (the caller keeps it; rust-quality R28): `bias` holds `REL · extent` values and `hi <= limit`, so a held
 /// key's distance is below `limit` (the launch contract).
 #[inline(always)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes"
+)]
 fn bias_lane(
     bias: &[f32],
     (t0, hi, limit, extent): (usize, usize, usize, usize),
