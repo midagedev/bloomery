@@ -16,7 +16,9 @@ use crate::library::{Library, Pipeline};
 
 use super::nvfp4::NvfpLayout;
 use super::routed::{ROUTE_TILE, ROUTED_ROWS, TABLE_THREADS, route_table_words, route_tiles};
-use super::{Kernels, args_bytes, check_window_len, pack, range, word};
+use super::{
+    Kernels, WeightAlign, args_bytes, check_weights_align, check_window_len, pack, range, word,
+};
 
 /// The pipelines of the pass's kernels.
 pub(crate) struct Pipelines {
@@ -25,9 +27,11 @@ pub(crate) struct Pipelines {
     router_rows: Pipeline,
     table: Pipeline,
     combine_store: Pipeline,
-    /// The scaled grouped tiles: NVFP4 planes' pair and plain, MXFP8 rows'.
+    /// The scaled grouped tiles: NVFP4 planes' pair and plain, MXFP8 rows' and
+    /// MXFP8 quads'.
     nv4p: [Pipeline; 2],
     mx8r: [Pipeline; 2],
+    mx8q: [Pipeline; 2],
 }
 
 impl Pipelines {
@@ -45,6 +49,10 @@ impl Pipelines {
             mx8r: [
                 library.pipeline("gemm_routed_ink2_mx8r_pair_f16")?,
                 library.pipeline("gemm_routed_ink2_mx8r_plain_f16")?,
+            ],
+            mx8q: [
+                library.pipeline("gemm_routed_ink2_mx8q_pair_f16")?,
+                library.pipeline("gemm_routed_ink2_mx8q_plain_f16")?,
             ],
         })
     }
@@ -514,6 +522,7 @@ impl Kernels {
         let (family, vpb, block) = match p.layout {
             NvfpLayout::Planes => (&self.ink2_pass.nv4p, 16, 9),
             NvfpLayout::Mxfp8Rows => (&self.ink2_pass.mx8r, 32, 33),
+            NvfpLayout::Mxfp8Quads => (&self.ink2_pass.mx8q, 128, 132),
             other => return Err(refuse(format!("a stack of {other:?}: no grouped tile"))),
         };
         if p.cols == 0 || !p.cols.is_multiple_of(32) || !p.cols.is_multiple_of(vpb) {
@@ -556,6 +565,16 @@ impl Kernels {
                     stack_rows * nb * block
                 )));
             }
+        }
+        if p.layout == NvfpLayout::Mxfp8Quads {
+            // A tile reads a block's codes as 32-bit words; an expert and a
+            // row are whole 132-byte blocks.
+            check_weights_align(
+                ROUTED_WHAT,
+                "stack",
+                p.stack.byte_range()?.start.get(),
+                WeightAlign::Word,
+            )?;
         }
         let x_rows = if p.gather { p.x_rows } else { p.slots };
         check_window_len(

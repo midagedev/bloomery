@@ -401,6 +401,14 @@ fn nvfp4_weights(layout: NvfpLayout, rows: usize, cols: usize, seed: u64) -> Vec
                 }
             }
         }
+        NvfpLayout::Mxfp8Quads => {
+            for block in bytes.as_chunks_mut::<132>().0 {
+                for code in &mut block[..128] {
+                    *code &= 0xF7;
+                }
+                block[128..].fill(0x7F);
+            }
+        }
     }
     bytes
 }

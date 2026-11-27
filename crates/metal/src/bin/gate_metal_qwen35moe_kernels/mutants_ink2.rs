@@ -366,7 +366,7 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         edits: &[(
             "const float dot = simd_sum(acc) * w_scale;",
             "const float dot = simd_sum(acc);",
-            3,
+            4,
         )],
     },
     Mutant {
@@ -480,6 +480,88 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "mxfp8_quads_scale_group_swapped",
+        clause: "nvfp4_rows",
+        why: "the quads' scale bytes are read in reverse order: groups 0 and 3, 1 and 2 swap scales",
+        edits: &[(
+            "const uint sb = (sw >> (8u * gg)) & 0xffu;",
+            "const uint sb = (sw >> (8u * (3u - gg))) & 0xffu;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mxfp8_quads_code_byte_rotated",
+        clause: "nvfp4_rows",
+        why: "a group takes its neighbour's code byte of the lane's word",
+        edits: &[(
+            "const uint c = (cw >> (8u * gg)) & 0xffu;",
+            "const uint c = (cw >> (8u * ((gg + 1u) & 3u))) & 0xffu;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mxfp8_quads_lane_pair_swapped",
+        clause: "nvfp4_rows",
+        why: "lane l reads lane l^1's code word but its own input value",
+        edits: &[(
+            "*(device const uint *)(blk + 4u * lane);",
+            "*(device const uint *)(blk + 4u * (lane ^ 1u));",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mxfp8_quads_sign_in_exponent",
+        clause: "nvfp4_rows",
+        why: "a negative code's sign lands in the f32 exponent field, not the sign bit",
+        edits: &[("((c & 0x80u) << 24)", "((c & 0x80u) << 23)", 1)],
+    },
+    Mutant {
+        name: "mxfp8_quads_nan_scale_usable",
+        clause: "nvfp4_nan",
+        why: "the NaN scale byte 0xff is the number 2.0: its row stays finite",
+        edits: &[(
+            "sb == 0xffu ? 0x7fc00000u :",
+            "sb == 0xffu ? 0x40000000u :",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mxfp8_quads_nan_code_passes",
+        clause: "nvfp4_nan",
+        why: "an E4M3 NaN code decodes as the largest normal value: the row stays finite",
+        edits: &[(
+            "const float m = mag == 0x7fu ? NAN : e;",
+            "const float m = mag == 0x7fu ? 448.0f : e;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mxfp8_quads_fault_untracked",
+        clause: "nvfp4_nan",
+        why: "the quads' finite tracking is dropped: the NaN row raises the product site, not the quant-column one",
+        edits: &[(
+            "bad |= (as_type<uint>(v) << 1) >= 0xff000000u;",
+            "bad = bad;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mxfp8_quads_scale_octave_high",
+        clause: "mxfp8_quads_identity",
+        why: "every quads scale reads one octave high: the quads differ from the rows on every pair",
+        edits: &[("(sb << 23)", "((sb + 1u) << 23)", 1)],
+    },
+    Mutant {
+        name: "mxfp8_quads_subnormal_code_flushed",
+        clause: "mxfp8_quads_identity",
+        why: "the quads' subnormal E4M3 codes (1 to 7, exponent field 0) read 0, as the rows' man x 2^-9 does not",
+        edits: &[(
+            "const float e = float(as_type<half>(ushort(mag << 7))) * 256.0f;",
+            "const float e = mag < 8u ? 0.0f : float(as_type<half>(ushort(mag << 7))) * 256.0f;",
+            1,
+        )],
+    },
+    Mutant {
         name: "nvfp4_slot_reads_slot_zero",
         clause: "nvfp4_route",
         why: "every slot reads the first slot's id: the route runs one expert eight times",
@@ -513,7 +595,7 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         name: "nvfp4_slot_input_shared",
         clause: "nvfp4_route",
         why: "every slot of a down reads the first slot's activation",
-        edits: &[("    x += slot * args.x_stride;\n", "", 4)],
+        edits: &[("    x += slot * args.x_stride;\n", "", 5)],
     },
     Mutant {
         name: "nvfp4_bad_id_reads_expert_zero",

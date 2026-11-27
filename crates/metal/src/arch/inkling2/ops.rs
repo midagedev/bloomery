@@ -40,10 +40,12 @@ use bloomery_device::{Buffer, DeviceError, Elems, Stream, Window};
 
 use super::arena::{Arena, LayerBufs, Scratch};
 use super::check::{CONV_CHANNELS, Checked, EPS, VisitPlan};
+use super::clock::Trace;
+use super::count::Kind;
 use super::session::{Inputs, Routes, SessionError, Tap, TapSink, refuse};
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
-use crate::encode::ComputeEncoder;
+use crate::encode::{ComputeEncoder, EncodeCount};
 use crate::fault::MetalFaultWord;
 use crate::kernels::{
     BiasRowsParams, CombineParams, ConvResParams, HEAD_SIMD_GROUPS, HeadParams, Kernels, LoadNorm,
@@ -93,6 +95,8 @@ pub struct Walk<'a> {
     pub a: &'a mut Arena,
     pub k: &'a Kernels,
     pub stream: &'a MetalStream,
+    /// The step clock's record of the token, when the clock runs.
+    pub trace: Option<&'a mut Trace>,
 }
 
 /// `len` elements of `b` from `at`.
@@ -182,11 +186,14 @@ impl Walk<'_> {
         mut taps: Option<TapSink<'_>>,
         mut routes: Option<Routes<'_>>,
         mut inputs: Option<Inputs<'_>>,
-    ) -> Result<u32, SessionError> {
+    ) -> Result<(u32, EncodeCount), SessionError> {
         if inputs.is_some() && taps.is_none() {
             return Err(refuse(
                 "a step whose visits start from given rows reads every visit back",
             ));
+        }
+        if let Some(t) = self.trace.as_deref_mut() {
+            t.begin();
         }
         let h0 = self.embed(id)?;
         if let Some(t) = taps.as_mut() {
@@ -201,6 +208,8 @@ impl Walk<'_> {
         let split = taps.is_some() || routes.is_some();
         let mut banks = 0usize;
         let mut passes = 0usize;
+        // What every command buffer of the token encoded, summed.
+        let mut count = EncodeCount::default();
         let mut tr = stream.begin()?.open_token_encoder()?;
         for (vi, v) in self.c.visits.iter().enumerate() {
             // The tapped walk settled every buffer before this visit.
@@ -212,7 +221,8 @@ impl Walk<'_> {
                 banks += 1;
             }
             if split {
-                let (rec, _) = tr.finish();
+                let (rec, encoded) = tr.finish();
+                count += encoded;
                 self.flush(rec)?;
                 if let Some(t) = taps.as_mut() {
                     self.front_taps(vi, v, banks, t)?;
@@ -230,7 +240,8 @@ impl Walk<'_> {
                 tr.encoder(|enc| self.message_end(enc, banks, passes))?;
             }
             if let Some(t) = taps.as_mut() {
-                let (rec, _) = tr.finish();
+                let (rec, encoded) = tr.finish();
+                count += encoded;
                 self.flush(rec)?;
                 self.back_taps(vi, banks, t)?;
                 tr = stream.begin()?.open_token_encoder()?;
@@ -238,9 +249,14 @@ impl Walk<'_> {
                 // The card runs the token's first visits while the host
                 // encodes the rest: the chunk signals the token boundary at
                 // its end, and the next chunk's encoder waits for it.
-                let (rec, _) = tr.finish();
+                let (rec, encoded) = tr.finish();
+                count += encoded;
+                let stamps = self.trace.as_ref().map(|_| rec.stamps());
                 // The token's closing sync reads every chunk's failure.
                 drop(stream.submit_signalled(rec)?);
+                if let (Some(t), Some(stamps)) = (self.trace.as_deref_mut(), stamps) {
+                    t.committed(stamps);
+                }
                 tr = stream.begin()?.open_token_encoder()?;
             }
             if v.pass_end {
@@ -252,15 +268,50 @@ impl Walk<'_> {
             self.start_from(f, self.c.visits.len(), banks)?;
         }
         tr.encoder(|enc| self.head(enc, banks))?;
-        let (rec, _) = tr.finish();
-        self.flush(rec)?;
+        let (rec, encoded) = tr.finish();
+        count += encoded;
+        let stamps = self.trace.as_ref().map(|_| rec.stamps());
+        stream.submit(rec)?;
+        if let (Some(t), Some(stamps)) = (self.trace.as_deref_mut(), stamps) {
+            t.committed(stamps);
+        }
+        stream.sync()?;
+        if let Some(t) = self.trace.as_deref_mut() {
+            t.woke();
+        }
         let mut pick = [0u32];
         self.a
             .scratch
             .step_id
             .pages()
             .read_at(Elems(0), &mut pick)?;
-        Ok(pick[0])
+        Ok((pick[0], count))
+    }
+
+    /// Every visit's groups and the head's on one encoder, in the order
+    /// [`Walk::token`] encodes them (a plain step's, whose command buffers
+    /// end between visits): the profile's walk, which holds all but one
+    /// group back from Metal and runs the host side whole.
+    pub(super) fn encode_visits(
+        &mut self,
+        enc: &mut ComputeEncoder<'_>,
+        pos: u32,
+    ) -> Result<(), SessionError> {
+        let mut banks = 0usize;
+        let mut passes = 0usize;
+        for (vi, v) in self.c.visits.iter().enumerate() {
+            self.front(enc, vi, v, banks, pos, passes)?;
+            if v.boundary {
+                banks += 1;
+            }
+            self.experts(enc, vi, v, banks, pos)?;
+            if v.pass_end {
+                self.message_end(enc, banks, passes)?;
+                banks = self.c.prelude_blocks;
+                passes += 1;
+            }
+        }
+        self.head(enc, banks)
     }
 
     /// The bank's rows and the stream visit `vi` (the head at the visit
@@ -355,6 +406,7 @@ impl Walk<'_> {
         let stream_at = banks * n;
         // 1. The attention's inputs: its mix and the loop's messages, which
         // read nothing the other writes, then the controllers.
+        enc.tag(Kind::Mix);
         let mut inputs = [Src::Rows(stream_at); 3];
         let mut mixed = false;
         if let (Some((_, nq)), Some(query)) = (&p.attn_query, &lb.attn_query) {
@@ -424,11 +476,13 @@ impl Walk<'_> {
         if v.message {
             // The three attention modules' down rows together, then their
             // merges together.
+            enc.tag(Kind::LoopDown);
             for (i, input) in inputs.iter().enumerate() {
                 k.loop_control_down(enc, &controller(c, lb, sc, *input, i, faults, layer)?)?;
             }
             // Hazard: the down rows, the merges' input.
             enc.memory_barrier();
+            enc.tag(Kind::LoopMerge);
             for (i, input) in inputs.iter_mut().enumerate() {
                 k.loop_control_merge(enc, &controller(c, lb, sc, *input, i, faults, layer)?)?;
                 *input = Src::Xin(i * n);
@@ -464,6 +518,7 @@ impl Walk<'_> {
                 out_offset: Q_ROWS + REL_ROWS,
             },
         ];
+        enc.tag(Kind::Proj);
         k.matvec_seg(
             enc,
             SegParams {
@@ -543,6 +598,7 @@ impl Walk<'_> {
         enc.memory_barrier();
         // 3. The k and v convs, then the clips and the append.
         let rows = c.plane_rows(v.windowed);
+        enc.tag(Kind::ConvKv);
         for (base, w, x, taps_buf, y) in [
             (BASE_K, &lb.convs[0], &sc.k_raw, &sc.k_taps, &mut sc.k),
             (BASE_V, &lb.convs[1], &sc.v_raw, &sc.v_taps, &mut sc.v),
@@ -570,6 +626,7 @@ impl Walk<'_> {
         }
         // Hazard: the convs' k and v rows, which the clips norm and append.
         enc.memory_barrier();
+        enc.tag(Kind::QkClip);
         let (q, r) = sc
             .qrg
             .window_mut(Elems(0), Elems(Q_ROWS + REL_ROWS))?
@@ -602,6 +659,7 @@ impl Walk<'_> {
         let segments = segments_for_window(pos + 1, window) as usize;
         let parts = crate::kernels::rel_partials_len(segments)
             .ok_or_else(|| refuse("the attention's partials overflow"))?;
+        enc.tag(Kind::Flash);
         k.rel_flash(
             enc,
             RelFlashParams {
@@ -625,6 +683,7 @@ impl Walk<'_> {
         )?;
         // Hazard: the attention's output, the gate's input.
         enc.memory_barrier();
+        enc.tag(Kind::Gate);
         k.out_gate(
             enc,
             OutGateParams {
@@ -638,6 +697,7 @@ impl Walk<'_> {
         )?;
         // Hazard: the gated rows, wo's input.
         enc.memory_barrier();
+        enc.tag(Kind::Wo);
         k.matvec(
             enc,
             MatvecParams {
@@ -654,6 +714,7 @@ impl Walk<'_> {
         enc.memory_barrier();
         // At a boundary the stream row closes as a block and the post-conv's
         // output is the residual, the next row's stream.
+        enc.tag(Kind::ConvAttn);
         let y = if v.boundary {
             sc.rows.window_mut(Elems(stream_at + n), Elems(n))?
         } else {
@@ -683,6 +744,7 @@ impl Walk<'_> {
         // the new stream row the FFN's mix reads).
         enc.memory_barrier();
         if !v.boundary {
+            enc.tag(Kind::BiasAttn);
             k.bias_rows(
                 enc,
                 BiasRowsParams {
@@ -699,6 +761,7 @@ impl Walk<'_> {
         // 5. The FFN's mix, its message, its norm and the router.
         let banks = banks + usize::from(v.boundary);
         let stream_at = banks * n;
+        enc.tag(Kind::FfnMix);
         k.res_mix(
             enc,
             ResMixParams {
@@ -720,6 +783,7 @@ impl Walk<'_> {
         // Hazard: the FFN's mix, its controller's (or its norm's) input.
         enc.memory_barrier();
         let ffn_in = if v.message {
+            enc.tag(Kind::LoopFfn);
             let [down, gain, forget] = &lb.controllers[3];
             k.loop_control(
                 enc,
@@ -745,6 +809,7 @@ impl Walk<'_> {
         } else {
             &sc.fmix
         };
+        enc.tag(Kind::Norm);
         k.norm_rows(
             enc,
             NormRowsParams {
@@ -762,6 +827,7 @@ impl Walk<'_> {
         )?;
         // Hazard: the normed row, the router's input.
         enc.memory_barrier();
+        enc.tag(Kind::Router);
         k.router_sigmoid(
             enc,
             RouterSigmoidParams {
@@ -810,6 +876,7 @@ impl Walk<'_> {
         // slots' inputs.
         enc.memory_barrier();
         // Every slot's gate rows first, then every slot's up rows.
+        enc.tag(Kind::GateUp);
         k.nvfp4_matvec(
             enc,
             Nvfp4Params {
@@ -830,6 +897,7 @@ impl Walk<'_> {
         )?;
         // Hazard: the slots' gate and up rows, the activation's input.
         enc.memory_barrier();
+        enc.tag(Kind::Pair);
         k.pair_situ(
             enc,
             SituParams {
@@ -845,6 +913,7 @@ impl Walk<'_> {
         )?;
         // Hazard: the slots' activations, the downs' inputs.
         enc.memory_barrier();
+        enc.tag(Kind::Down);
         k.nvfp4_matvec(
             enc,
             Nvfp4Params {
@@ -865,6 +934,7 @@ impl Walk<'_> {
         )?;
         // Hazard: the slots' weighted rows, the combine's input.
         enc.memory_barrier();
+        enc.tag(Kind::Combine);
         k.combine_rows(
             enc,
             CombineParams {
@@ -881,6 +951,7 @@ impl Walk<'_> {
         )?;
         // Hazard: the visit's expert sum, the post-conv's input.
         enc.memory_barrier();
+        enc.tag(Kind::ConvFfn);
         k.conv_res(
             enc,
             ConvResParams {
@@ -903,6 +974,7 @@ impl Walk<'_> {
         )?;
         // Hazard: the post-conv's row, the stream's add.
         enc.memory_barrier();
+        enc.tag(Kind::BiasFfn);
         k.bias_rows(
             enc,
             BiasRowsParams {
@@ -935,6 +1007,7 @@ impl Walk<'_> {
             )));
         }
         let sc = &mut self.a.scratch;
+        enc.tag(Kind::MsgEnd);
         k.bias_rows(
             enc,
             BiasRowsParams {
@@ -965,6 +1038,7 @@ impl Walk<'_> {
         } = &mut *self.a;
         let faults: &MetalFaultWord = faults;
         let layer = c.visits.len() as u32;
+        enc.tag(Kind::HeadMix);
         k.res_mix(
             enc,
             ResMixParams {
@@ -986,6 +1060,7 @@ impl Walk<'_> {
             },
         )?;
         enc.memory_barrier();
+        enc.tag(Kind::Head);
         k.head(
             enc,
             HeadParams {

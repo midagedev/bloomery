@@ -11,7 +11,6 @@ use runtime::prompt::PrefillMode;
 use runtime::{Out, Target, Want};
 
 use super::session::{Session, SessionError, refuse};
-use crate::encode::EncodeCount;
 use crate::session::clock::{StepMode, Stepped};
 use crate::session::pass::{PassOut, Passed, StateOut};
 use crate::session::prompt::{Family, prompt_call};
@@ -79,13 +78,10 @@ impl Family for Session {
     }
 
     /// Every step is host-fed: the family runs no token ahead, so an ahead
-    /// mode's next id is fed by the call after. The walk does not tally its
-    /// encoders, so the count is empty.
+    /// mode's next id is fed by the call after. The count is what the
+    /// token's command buffers encoded, summed.
     fn step(&mut self, id: u32, _mode: StepMode) -> Result<Stepped, SessionError> {
-        Ok(Stepped {
-            id: Session::step(self, id)?,
-            count: EncodeCount::default(),
-        })
+        Session::step_counted(self, id)
     }
 
     fn pass(

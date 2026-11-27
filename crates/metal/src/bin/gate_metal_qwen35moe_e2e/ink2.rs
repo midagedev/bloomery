@@ -33,6 +33,10 @@
 //!   ([`VISIT_LAYERS`]).
 //! - `k_room`: the open's device bytes are the plan's, to within a page a
 //!   buffer, and the room line the plan prints.
+//! - `k_count`: a plain step encodes the paper's token (`count::token_count`
+//!   over the file's own description: its groups, dispatches and barriers),
+//!   and the profiled step ([`Session::step_profile`]) ran the same groups to
+//!   the same pick and logits and left the state a plain step does.
 //! - `k_pass`: the pin's ids as prompt passes (`Session::pass_routed`), each
 //!   ending at a held step and run on the walk's routing rule, against the
 //!   step walk's logits at the held steps, within twice the row's band (each
@@ -59,7 +63,8 @@ use std::time::Instant;
 
 use bloomery_device::DeviceError;
 use bloomery_device::conformance::{Clause, Report, Verdict, why};
-use bloomery_metal::arch::inkling2::{Session, Tap};
+use bloomery_metal::arch::inkling2::count::{self, Group, TokenCount};
+use bloomery_metal::arch::inkling2::{ProfileGroup, Session, Tap};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::library::Library;
 use bloomery_metal::session::room::PAGE;
@@ -69,12 +74,13 @@ use super::mlx::{Pin, distance, parse_pin, pin_of};
 use super::{GATE, flag, mlx_split, mutants, row, serve};
 
 /// The row's clauses, in the order they run.
-pub const NAMES: [&str; 9] = [
+pub const NAMES: [&str; 10] = [
     "k_routes",
     "k_logits",
     "k_greedy",
     "k_visits",
     "k_room",
+    "k_count",
     "k_pass",
     "k_pass_pin",
     "k_carry",
@@ -767,6 +773,124 @@ fn k_room(session: &Session, opened: u64) -> Clause {
     )))
 }
 
+/// What a token encodes by the paper, from the file's own description: its groups in the walk's
+/// order and their sums.
+struct Paper {
+    groups: Vec<Group>,
+    count: TokenCount,
+}
+
+/// `k_count`: two plain steps encode the paper's token, and a profiled step of the same first id
+/// ends on the same pick, logits and groups, so a second plain step after it picks and scores
+/// what the plain run's second step did.
+fn k_count(session: &mut Session, paper: &Result<Paper, String>) -> Clause {
+    let paper = paper
+        .as_ref()
+        .map_err(|e| format!("the file's description: {e}"))?;
+    let ids = pin(session)?.ids;
+    let (first, second) = match ids.as_slice() {
+        [a, b, ..] => (*a, *b),
+        _ => return Err("the pin holds fewer than two ids".to_string()),
+    };
+    let want = (
+        paper.count.groups,
+        paper.count.dispatches,
+        paper.count.barriers,
+    );
+    let shape = |c: bloomery_metal::encode::EncodeCount| (c.groups, c.dispatches, c.barriers);
+    let err = |e: bloomery_metal::arch::inkling2::SessionError| e.to_string();
+    session.reset().map_err(err)?;
+    let a = session.step_counted(first).map_err(err)?;
+    let logits_a = session.logits_row().map_err(err)?.to_vec();
+    let b = session.step_counted(second).map_err(err)?;
+    let logits_b = session.logits_row().map_err(err)?.to_vec();
+    for (at, got) in [(0, a), (1, b)] {
+        if shape(got.count) != want {
+            return Err(format!(
+                "the plain step at position {at} encoded (groups, dispatches, barriers) {:?}; \
+                 the paper's token over the file's {} visits is {want:?}",
+                shape(got.count),
+                session.checked().visits.len()
+            ));
+        }
+    }
+    session.reset().map_err(err)?;
+    let mut samples: Vec<ProfileGroup> = Vec::new();
+    let p = session.step_profile(first, &mut samples).map_err(err)?;
+    let logits_p = session.logits_row().map_err(err)?.to_vec();
+    let q = session.step_counted(second).map_err(err)?;
+    let logits_q = session.logits_row().map_err(err)?.to_vec();
+    if (p.id, p.count) != (a.id, a.count) {
+        return Err(format!(
+            "the profiled step ended on {} with {:?}; the plain step on {} with {:?}",
+            p.id, p.count, a.id, a.count
+        ));
+    }
+    if q.id != b.id {
+        return Err(format!(
+            "the step after a profiled one picked {}; after a plain one {}",
+            q.id, b.id
+        ));
+    }
+    for (what, ours, theirs) in [
+        ("the profiled step's", &logits_p, &logits_a),
+        ("the step after a profiled one's", &logits_q, &logits_b),
+    ] {
+        let parted = ours
+            .iter()
+            .zip(theirs)
+            .filter(|(x, y)| x.to_bits() != y.to_bits())
+            .count();
+        if ours.len() != theirs.len() || parted > 0 {
+            return Err(format!(
+                "{what} logits part from the plain step's in {parted} of {} values",
+                theirs.len()
+            ));
+        }
+    }
+    if samples.len() != paper.groups.len() {
+        return Err(format!(
+            "the profile sampled {} groups; the paper's token has {}",
+            samples.len(),
+            paper.groups.len()
+        ));
+    }
+    for (i, (s, g)) in samples.iter().zip(&paper.groups).enumerate() {
+        if (s.kind, s.dispatches) != (g.kind, g.dispatches) {
+            return Err(format!(
+                "group {i} (visit {:?}): the profile's {} of {} dispatches; the paper's {} of {}",
+                s.visit,
+                s.kind.name(),
+                s.dispatches,
+                g.kind.name(),
+                g.dispatches
+            ));
+        }
+        if !(s.gpu_s.is_finite() && s.gpu_s >= 0.0) {
+            return Err(format!(
+                "group {i} ({}): its GPU interval is {} s",
+                s.kind.name(),
+                s.gpu_s
+            ));
+        }
+    }
+    let total: f64 = samples.iter().map(|s| s.gpu_s).sum();
+    if total <= 0.0 {
+        return Err("the profile's groups read no GPU time".to_string());
+    }
+    Ok(Verdict::Noted(format!(
+        "a token encodes {} groups, {} dispatches and {} barriers over {} visits, plain at \
+         positions 0 and 1 and profiled alike; the profile's {} groups end on the plain pick \
+         {} and leave the state the plain step's",
+        want.0,
+        want.1,
+        want.2,
+        session.checked().visits.len(),
+        samples.len(),
+        p.id
+    )))
+}
+
 /// The row's run: the open, then the clauses `only` leaves.
 pub fn run(
     args: &[String],
@@ -858,6 +982,12 @@ pub fn run(
             return ExitCode::FAILURE;
         }
     };
+    let paper = model::arch::inkling2::spec::read(file.header())
+        .map_err(|e| e.to_string())
+        .map(|r| Paper {
+            groups: count::token_groups(&r.spec),
+            count: count::token_count(&r.spec),
+        });
     drop(file);
     println!(
         "session: {} ({} stored layers, {} visits, ctx {CTX}) open in {:.1} s; row inkling2, \
@@ -889,6 +1019,7 @@ pub fn run(
             "k_greedy" => k_greedy(&mut session),
             "k_visits" => k_visits(&session),
             "k_room" => k_room(&session, opened),
+            "k_count" => k_count(&mut session, &paper),
             "k_pass" => k_pass(&mut session),
             "k_pass_pin" => k_pass_pin(&mut session),
             "k_carry" => k_carry(&mut session),

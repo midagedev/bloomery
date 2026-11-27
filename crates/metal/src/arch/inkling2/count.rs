@@ -1,22 +1,42 @@
-//! The dispatches and the weight bytes one decoded Inkling 2 token walks,
-//! visit by visit ([`token_count`], [`token_bytes`]): the paper arithmetic
-//! the family's session is checked against, every dispatch named by its
-//! kernel.
+//! The groups, dispatches and weight bytes one decoded Inkling 2 token walks,
+//! visit by visit ([`token_groups`], [`token_count`], [`token_bytes`]): the
+//! paper arithmetic the family's session is checked against (the e2e gate's
+//! `k_count` holds the encoder's own tally to it), every group named by what
+//! it runs ([`Kind`]).
 //!
 //! A visit is the walk's unit — a stored layer's one run, its own cache slot
-//! — and its dispatches divide by its kind. Every visit runs: one mix of the
-//! banked blocks (a windowed visit one query row, a windowless one three,
-//! one launch either way), its attention projections (a windowed visit's
-//! sites in two segmented dispatches, a windowless one's in three — a
-//! segment norms one input — and its two dynamic-taps projections beside
-//! them), four short convolutions (k, v, the attention output's, the
-//! feed-forward block's), one qk clip epilogue, one rel-bias flash, one
-//! output gate, one output projection, one feed-forward mix, one router,
-//! one expert pair and one down. Every sixth visit — the block residual's
-//! boundary, the stored layer a multiple of the block — pushes its input
-//! onto the bank. A core visit of a pass past the first adds two message
-//! mixes and four controllers, one a module. The ends are five: the
-//! embedding row, the final mix, the final norm, the logits and the pick.
+//! — and the walk (`ops.rs`) encodes it as groups, a group being the
+//! dispatches between two barriers. A visit's groups, in order:
+//!
+//! - [`Kind::Mix`]: the attention's mix of the blocks and the stream (one
+//!   query on a windowed visit, three on a windowless one; the stored layer 0
+//!   reads the stream as it is, so it runs none) and, on a core visit of a
+//!   pass past the first, the loop's message mix beside it. One dispatch each.
+//! - [`Kind::LoopDown`] and [`Kind::LoopMerge`], a message visit's: the three
+//!   attention modules' controllers, each a launch in two groups.
+//! - [`Kind::Proj`]: the q, relative and gate rows in one launch, the sink
+//!   rows, the k and the v, and on a windowless visit the two dynamic-taps
+//!   projections: four dispatches, six on a windowless visit.
+//! - [`Kind::ConvKv`]: the k and v short convolutions, two dispatches.
+//! - [`Kind::QkClip`]: the clip epilogue and the cache append.
+//! - [`Kind::Flash`]: the rel-bias attention, two groups (the segment walk,
+//!   then the fold of its partials, a barrier the launch itself holds).
+//! - [`Kind::Gate`], [`Kind::Wo`], [`Kind::ConvAttn`]: the output gate, the
+//!   output projection and the attention's post-convolution; and
+//!   [`Kind::BiasAttn`], the stream's add of it, which a block boundary
+//!   skips (its post-convolution writes the next row itself).
+//! - [`Kind::FfnMix`], the feed-forward's mix, then on a message visit
+//!   [`Kind::LoopFfn`] (its controller: two groups), then [`Kind::Norm`] and
+//!   [`Kind::Router`].
+//! - [`Kind::GateUp`], [`Kind::Pair`], [`Kind::Down`], [`Kind::Combine`],
+//!   [`Kind::ConvFfn`], [`Kind::BiasFfn`]: the kept experts' rows, their
+//!   activation, their down rows, the sum, the post-convolution and its add.
+//! - [`Kind::MsgEnd`], on the last core visit of a pass the loop runs again:
+//!   the pass's blocks added into its message bank.
+//!
+//! The head is three groups ([`head_groups`]): the mix, the logits and the
+//! pick (the logits and the pick are one launch's two groups). The embedding
+//! row is the host's, so the token runs no embed dispatch.
 //!
 //! The weights a token reads ([`token_bytes`]): the attention's Q8_0
 //! projection sites and the output projection once a visit, the kept eight
@@ -58,54 +78,218 @@ pub const fn q8_0_bytes(values: u64) -> u64 {
 /// over the heads' values.
 pub const ATTN_SITE_VALUES: u64 = (3072 + 1024 + 1024 + 2304 + 384 + 24) * 2304 + 2304 * 3072;
 
-/// The dispatches of the four short convolutions a visit runs.
-pub const CONV_DISPATCHES: u32 = 4;
-
-/// The dispatches of one visit's feed-forward half: the mix, the router,
-/// the pair and the down.
-pub const FFN_DISPATCHES: u32 = 4;
-
-/// The dispatches a block boundary adds: the bank push.
-pub const JOIN_DISPATCHES: u32 = 1;
-
-/// The dispatches a core visit of a pass past the first adds: two message
-/// mixes (the attention's and the feed-forward's tables) and four
-/// controllers (the attention's, the k's, the v's and the feed-forward's,
-/// one launch a module).
-pub const MESSAGE_DISPATCHES: u32 = 6;
-
-/// The dispatches of the walk's ends: the embedding row, the final mix, the
-/// final norm, the logits and the pick.
-pub const ENDS_DISPATCHES: u32 = 5;
-
-/// The projections a visit's attention reads: a windowed visit's sites in
-/// two segmented dispatches, a windowless one's in three (a segment norms
-/// one input) and its two dynamic-taps projections beside them.
-#[must_use]
-pub const fn projection_dispatches(windowed: bool) -> u32 {
-    if windowed { 2 } else { 3 + 2 }
+/// What a group of the walk runs: the name a profile's line carries and the
+/// tag the walk puts on its encoder (`ComputeEncoder::tag`). The variants
+/// are in walk order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Kind {
+    Mix = 1,
+    LoopDown,
+    LoopMerge,
+    Proj,
+    ConvKv,
+    QkClip,
+    Flash,
+    Gate,
+    Wo,
+    ConvAttn,
+    BiasAttn,
+    FfnMix,
+    LoopFfn,
+    Norm,
+    Router,
+    GateUp,
+    Pair,
+    Down,
+    Combine,
+    ConvFfn,
+    BiasFfn,
+    MsgEnd,
+    HeadMix,
+    Head,
 }
 
-/// The dispatches of one visit of `windowed` kind, a core visit of a pass
-/// past the first when `message`, at a block boundary when `boundary`.
-#[must_use]
-pub const fn visit_dispatches(windowed: bool, message: bool, boundary: bool) -> u32 {
-    let attn = 5 + projection_dispatches(windowed) + CONV_DISPATCHES;
-    let join = if boundary { JOIN_DISPATCHES } else { 0 };
-    let message = if message { MESSAGE_DISPATCHES } else { 0 };
-    attn + FFN_DISPATCHES + join + message
+/// Every kind, in the token's walk order: the order a profile's lines print.
+pub const KINDS: [Kind; 24] = [
+    Kind::Mix,
+    Kind::LoopDown,
+    Kind::LoopMerge,
+    Kind::Proj,
+    Kind::ConvKv,
+    Kind::QkClip,
+    Kind::Flash,
+    Kind::Gate,
+    Kind::Wo,
+    Kind::ConvAttn,
+    Kind::BiasAttn,
+    Kind::FfnMix,
+    Kind::LoopFfn,
+    Kind::Norm,
+    Kind::Router,
+    Kind::GateUp,
+    Kind::Pair,
+    Kind::Down,
+    Kind::Combine,
+    Kind::ConvFfn,
+    Kind::BiasFfn,
+    Kind::MsgEnd,
+    Kind::HeadMix,
+    Kind::Head,
+];
+
+impl Kind {
+    /// The kind's name in a profile's line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Kind::Mix => "mix",
+            Kind::LoopDown => "loop_down",
+            Kind::LoopMerge => "loop_merge",
+            Kind::Proj => "proj",
+            Kind::ConvKv => "conv_kv",
+            Kind::QkClip => "qk_clip",
+            Kind::Flash => "flash",
+            Kind::Gate => "gate",
+            Kind::Wo => "wo",
+            Kind::ConvAttn => "conv_attn",
+            Kind::BiasAttn => "bias_attn",
+            Kind::FfnMix => "ffn_mix",
+            Kind::LoopFfn => "loop_ffn",
+            Kind::Norm => "norm",
+            Kind::Router => "router",
+            Kind::GateUp => "gate_up",
+            Kind::Pair => "pair",
+            Kind::Down => "down",
+            Kind::Combine => "combine",
+            Kind::ConvFfn => "conv_ffn",
+            Kind::BiasFfn => "bias_ffn",
+            Kind::MsgEnd => "msg_end",
+            Kind::HeadMix => "head_mix",
+            Kind::Head => "head",
+        }
+    }
+
+    /// The kind a tag names, `None` for a tag no kind has (0 is no tag).
+    #[must_use]
+    pub fn from_tag(tag: u8) -> Option<Kind> {
+        KINDS.iter().copied().find(|k| u8::from(*k) == tag)
+    }
+
+    /// Whether the group streams a weight matrix the token reads once: the
+    /// projections, the output projection, the kept experts' rows and the
+    /// head. The other kinds read activations, the cache and small f32
+    /// matrices.
+    #[must_use]
+    pub const fn streams_weights(self) -> bool {
+        matches!(
+            self,
+            Kind::Proj | Kind::Wo | Kind::GateUp | Kind::Down | Kind::Head
+        )
+    }
+}
+
+impl From<Kind> for u8 {
+    fn from(k: Kind) -> u8 {
+        k as u8
+    }
+}
+
+/// One group of the walk: what it runs and how many dispatches it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub kind: Kind,
+    pub dispatches: u32,
+}
+
+/// What a token encodes, summed over its command buffers: the shape of
+/// `EncodeCount` on every OS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenCount {
+    pub groups: usize,
+    pub dispatches: usize,
+    pub barriers: usize,
 }
 
 /// One visit's kind in the walk: whether it attends a window, whether it is
-/// a core visit of a pass past the first, and whether its stored layer
-/// closes a block onto the bank.
+/// a core visit of a pass past the first, whether its stored layer closes a
+/// block onto the bank, whether it ends a pass the loop runs again, and
+/// whether it is the stored layer 0 (which has no attention mix).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Visit {
     pub windowed: bool,
     pub message: bool,
     pub boundary: bool,
+    pub pass_end: bool,
+    pub first: bool,
     /// The stored layer the visit runs.
     pub layer: usize,
+}
+
+/// The groups of one visit, in the order the walk encodes them.
+#[must_use]
+pub fn visit_groups(v: &Visit) -> Vec<Group> {
+    let g = |kind, dispatches| Group { kind, dispatches };
+    let mut out = Vec::new();
+    let mixes = u32::from(!v.first) + u32::from(v.message);
+    if mixes > 0 {
+        out.push(g(Kind::Mix, mixes));
+    }
+    if v.message {
+        out.push(g(Kind::LoopDown, 3));
+        out.push(g(Kind::LoopMerge, 3));
+    }
+    out.push(g(Kind::Proj, if v.windowed { 4 } else { 6 }));
+    out.push(g(Kind::ConvKv, 2));
+    out.push(g(Kind::QkClip, 1));
+    out.push(g(Kind::Flash, 1));
+    out.push(g(Kind::Flash, 1));
+    out.push(g(Kind::Gate, 1));
+    out.push(g(Kind::Wo, 1));
+    out.push(g(Kind::ConvAttn, 1));
+    if !v.boundary {
+        out.push(g(Kind::BiasAttn, 1));
+    }
+    out.push(g(Kind::FfnMix, 1));
+    if v.message {
+        out.push(g(Kind::LoopFfn, 1));
+        out.push(g(Kind::LoopFfn, 1));
+    }
+    out.push(g(Kind::Norm, 1));
+    out.push(g(Kind::Router, 1));
+    for kind in [
+        Kind::GateUp,
+        Kind::Pair,
+        Kind::Down,
+        Kind::Combine,
+        Kind::ConvFfn,
+        Kind::BiasFfn,
+    ] {
+        out.push(g(kind, 1));
+    }
+    if v.pass_end {
+        out.push(g(Kind::MsgEnd, 1));
+    }
+    out
+}
+
+/// The groups of the head: the mix, then the logits and the pick.
+#[must_use]
+pub const fn head_groups() -> [Group; 3] {
+    [
+        Group {
+            kind: Kind::HeadMix,
+            dispatches: 1,
+        },
+        Group {
+            kind: Kind::Head,
+            dispatches: 1,
+        },
+        Group {
+            kind: Kind::Head,
+            dispatches: 1,
+        },
+    ]
 }
 
 /// The visits of one decoded token, in walk order ([`ModelSpec::visits`],
@@ -117,6 +301,9 @@ pub struct Visit {
 /// holds one.
 #[must_use]
 pub fn token_visits(spec: &ModelSpec) -> Vec<Visit> {
+    let core = spec
+        .loop_
+        .map(|l| (l.core_start as usize, l.core_end as usize, l.passes));
     spec.visits()
         .iter()
         .map(|v| {
@@ -124,34 +311,50 @@ pub fn token_visits(spec: &ModelSpec) -> Vec<Visit> {
             let Mixer::RelBias(a) = &spec.layers[layer].mixer else {
                 panic!("layer {layer}: a mixer other than the relative-position bias one");
             };
+            let in_core = core.is_some_and(|(start, end, _)| (start..end).contains(&layer));
             Visit {
                 windowed: a.window.is_some(),
-                message: v.pass > 0,
+                message: in_core && v.pass > 0,
                 boundary: layer.is_multiple_of(BLOCK),
+                pass_end: core.is_some_and(|(_, end, passes)| {
+                    in_core && layer + 1 == end && v.pass + 1 < passes
+                }),
+                first: layer == 0,
                 layer,
             }
         })
         .collect()
 }
 
-/// The dispatches one decoded token encodes over `spec`'s visits, the ends
-/// included.
+/// The groups one decoded token encodes over `spec`'s visits, the head's
+/// included, in walk order.
 ///
 /// # Panics
 ///
-/// On a layer of another mixer (as [`token_visits`] does) or a count that
-/// does not fit `u32`.
+/// On a layer of another mixer (as [`token_visits`] does).
 #[must_use]
-pub fn token_count(spec: &ModelSpec) -> u32 {
-    let mut n = ENDS_DISPATCHES;
-    for v in &token_visits(spec) {
-        n = n
-            .checked_add(visit_dispatches(v.windowed, v.message, v.boundary))
-            .unwrap_or_else(|| {
-                panic!("token count: the dispatch count of a token does not fit u32")
-            });
+pub fn token_groups(spec: &ModelSpec) -> Vec<Group> {
+    let mut out: Vec<Group> = token_visits(spec).iter().flat_map(visit_groups).collect();
+    out.extend(head_groups());
+    out
+}
+
+/// What one decoded token encodes over `spec`'s visits, the head's included:
+/// every group, every dispatch, and a barrier after every group but the
+/// head's last (the walk closes each group with one, and ends the token on
+/// the head's pick).
+///
+/// # Panics
+///
+/// On a layer of another mixer (as [`token_visits`] does).
+#[must_use]
+pub fn token_count(spec: &ModelSpec) -> TokenCount {
+    let groups = token_groups(spec);
+    TokenCount {
+        groups: groups.len(),
+        dispatches: groups.iter().map(|g| g.dispatches as usize).sum(),
+        barriers: groups.len() - 1,
     }
-    n
 }
 
 /// The kept experts' stacks of one visit, in bytes: the gate-up and down
@@ -246,33 +449,83 @@ mod tests {
         );
     }
 
-    /// One visit's dispatches by its kind: a windowed visit's attention is
-    /// the mix, two projections, four convolutions, the epilogue, the
-    /// flash, the gate and the output projection; a windowless one's trades
-    /// the second projection for the third and the two dynamic-taps
-    /// projections; the feed-forward is four more; a block boundary pushes
-    /// the bank; a message visit adds two mixes and four controllers.
-    /// Mutant: the output projection counted in the gate.
+    /// The groups and dispatches of one visit by its kind: a plain windowed
+    /// visit runs nineteen groups of twenty-three dispatches (the flash and
+    /// the projections' launch the odd ones: the flash is two groups, the
+    /// projections four dispatches); a block boundary skips the attention's
+    /// stream add; a windowless visit's projections are six dispatches; a
+    /// message visit adds the controllers' four groups and the message mix;
+    /// the stored layer 0 has no attention mix; a pass end adds its bank's
+    /// add. Mutant: the flash counted one group.
     #[test]
-    fn one_visits_dispatches_by_kind() {
-        assert_eq!(visit_dispatches(true, false, false), 15);
-        assert_eq!(visit_dispatches(true, false, true), 16);
-        assert_eq!(visit_dispatches(false, false, false), 18);
-        assert_eq!(visit_dispatches(true, true, false), 21);
-        assert_eq!(visit_dispatches(true, true, true), 22);
-        assert_eq!(visit_dispatches(false, true, false), 24);
+    fn one_visits_groups_by_kind() {
+        let plain = Visit {
+            windowed: true,
+            message: false,
+            boundary: false,
+            pass_end: false,
+            first: false,
+            layer: 1,
+        };
+        let shape = |v: &Visit| {
+            let g = visit_groups(v);
+            (g.len(), g.iter().map(|g| g.dispatches).sum::<u32>())
+        };
+        assert_eq!(shape(&plain), (19, 23));
+        assert_eq!(
+            shape(&Visit {
+                boundary: true,
+                ..plain
+            }),
+            (18, 22)
+        );
+        assert_eq!(
+            shape(&Visit {
+                windowed: false,
+                ..plain
+            }),
+            (19, 25)
+        );
+        assert_eq!(
+            shape(&Visit {
+                message: true,
+                ..plain
+            }),
+            (23, 32)
+        );
+        assert_eq!(
+            shape(&Visit {
+                first: true,
+                ..plain
+            }),
+            (18, 22)
+        );
+        assert_eq!(
+            shape(&Visit {
+                pass_end: true,
+                ..plain
+            }),
+            (20, 24)
+        );
+        let kinds: Vec<Kind> = visit_groups(&plain).iter().map(|g| g.kind).collect();
+        assert_eq!(
+            kinds.iter().filter(|k| **k == Kind::Flash).count(),
+            2,
+            "the walk and the fold"
+        );
+        assert!(
+            kinds.windows(2).all(|w| u8::from(w[0]) <= u8::from(w[1])),
+            "a visit's groups run in the kinds' own order"
+        );
     }
 
-    /// One decoded token's dispatches: the ends' five beside the visits' —
-    /// twenty windowed visits of the stem, the coda and the core's first
-    /// pass, twenty message visits of the core's later passes, four plain
-    /// windowless ones (the stem's 5, the coda's 23 and the core's first
-    /// pass's 11 and 17) and four message ones, eight visits boundaries —
-    /// the same order of magnitude as the CUDA side's walk of the same
-    /// model, and the dispatch cost the resource timeline charges it for.
-    /// Mutant: a core pass counted once.
+    /// One decoded token's groups: the Mini's forty-eight visits and the
+    /// head's three. Derived on paper from the walk's call sites (the e2e
+    /// gate's `k_count` holds the encoder to it): 1,004 groups, 1,332
+    /// dispatches, a barrier after every group but the last. Mutant: a core
+    /// pass counted once.
     #[test]
-    fn one_tokens_dispatches() {
+    fn one_tokens_groups() {
         let spec = mini();
         let visits = token_visits(&spec);
         let by_kind = |windowed: bool, message: bool| {
@@ -290,7 +543,43 @@ mod tests {
             ),
             (20, 4, 20, 4)
         );
-        assert_eq!(token_count(&spec), 901);
+        assert_eq!(visits.iter().filter(|v| v.pass_end).count(), 2);
+        assert_eq!(
+            token_count(&spec),
+            TokenCount {
+                groups: 1004,
+                dispatches: 1332,
+                barriers: 1003
+            }
+        );
+        let groups = token_groups(&spec);
+        assert_eq!(groups.last().map(|g| g.kind), Some(Kind::Head));
+        assert_eq!(
+            groups.iter().filter(|g| g.kind == Kind::Head).count(),
+            2,
+            "the logits and the pick"
+        );
+    }
+
+    /// Every kind has one name, one tag and a place in [`KINDS`]; a tag no
+    /// kind has names none. Mutant: two kinds sharing a name.
+    #[test]
+    fn the_kinds_name_themselves_once() {
+        for (i, k) in KINDS.iter().enumerate() {
+            assert_eq!(Kind::from_tag(u8::from(*k)), Some(*k));
+            assert_eq!(
+                usize::from(u8::from(*k)),
+                i + 1,
+                "the tags run in walk order"
+            );
+            assert!(
+                KINDS[..i].iter().all(|o| o.name() != k.name()),
+                "{} named twice",
+                k.name()
+            );
+        }
+        assert_eq!(Kind::from_tag(0), None);
+        assert_eq!(Kind::from_tag(KINDS.len() as u8 + 1), None);
     }
 
     /// The kept experts' stacks: an NVFP4 layer's eight experts read their

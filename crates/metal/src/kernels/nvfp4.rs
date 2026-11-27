@@ -4,13 +4,14 @@
 //! out of the router's ids and its rows' finished dots scaled by its expert's
 //! global scale, times its route weight on a routed down.
 //!
-//! Four layouts, one kernel source: the NVFP4 blocks of the GGUF file
+//! Five layouts, one kernel source: the NVFP4 blocks of the GGUF file
 //! (mainline's `block_nvfp4`: 64 values in 36 bytes, [`NvfpLayout::Blocks`]),
 //! the MLX folder's NVFP4 as two planes an expert ([`NvfpLayout::Planes`]:
 //! the codes, then the UE4M3 scale bytes, one a 16-value group; sixteen rows
 //! a SIMD group), and the two codas' forms: the GGUF's Q8_0 blocks
 //! ([`NvfpLayout::Q8_0`]) and the MLX folder's MXFP8 rows
-//! ([`NvfpLayout::Mxfp8Rows`]).
+//! ([`NvfpLayout::Mxfp8Rows`]) or, the same bytes with four groups' codes
+//! interleaved a lane, its quads ([`NvfpLayout::Mxfp8Quads`]).
 //!
 //! Every layout but the planes takes a SIMD group a row, eight rows a
 //! threadgroup; the planes take sixteen rows a SIMD group, two SIMD groups a
@@ -50,6 +51,11 @@ const WIDE_GROUP_VALUES: usize = 32;
 const Q8_0_BYTES: usize = 34;
 /// Bytes an MXFP8 group holds: the E8M0 scale byte and 32 codes.
 const MXFP8_BYTES: usize = 33;
+/// Values a block of the MXFP8 quads layout holds: four groups.
+const QUADS_VALUES: usize = 4 * WIDE_GROUP_VALUES;
+/// Bytes an MXFP8 quads block holds: the four groups' 128 code bytes and
+/// their four scale bytes.
+const QUADS_BYTES: usize = 4 * MXFP8_BYTES;
 
 /// How the weights are laid out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,9 +75,29 @@ pub enum NvfpLayout {
     /// first, value `i` E4M3 code byte `i`. The MLX folder coda's stacks; `k`
     /// is a multiple of 32.
     Mxfp8Rows,
+    /// Bloomery's MXFP8 quads: the rows' bytes in 132-byte blocks of four
+    /// groups (128 values), a block's 128 code bytes first (lane `l`'s four
+    /// codes, groups 0 to 3, the word at byte `4 l`) then the four scale
+    /// bytes. The MLX folder coda's stacks as the session loads them; `k` is a
+    /// multiple of 128. Declared after [`NvfpLayout::Mxfp8Rows`]: the clauses
+    /// seed from the discriminant, so the earlier ones must not move.
+    Mxfp8Quads,
 }
 
 impl NvfpLayout {
+    /// The layout of the folder's MXFP8 coda stacks a run asks for: the word
+    /// of its lever (`quads`, or unset, the quads; `rows`).
+    ///
+    /// # Errors
+    /// A word that names neither layout.
+    pub fn mx8_of(word: Option<&str>) -> Result<Self, String> {
+        match word {
+            None | Some("quads") => Ok(Self::Mxfp8Quads),
+            Some("rows") => Ok(Self::Mxfp8Rows),
+            Some(other) => Err(format!("{other}: the MXFP8 coda is quads or rows")),
+        }
+    }
+
     /// The values one scale group covers: the block's or the row group's.
     #[must_use]
     pub const fn step(self) -> usize {
@@ -79,6 +105,7 @@ impl NvfpLayout {
             Self::Blocks => NVFP4_VALUES,
             Self::Planes => PLANES_GROUP_VALUES,
             Self::Q8_0 | Self::Mxfp8Rows => WIDE_GROUP_VALUES,
+            Self::Mxfp8Quads => QUADS_VALUES,
         }
     }
 
@@ -105,6 +132,12 @@ impl NvfpLayout {
                     MXFP8_BYTES
                 };
                 rows.checked_mul(k / WIDE_GROUP_VALUES)?.checked_mul(per)
+            }
+            Self::Mxfp8Quads => {
+                if !k.is_multiple_of(QUADS_VALUES) {
+                    return None;
+                }
+                rows.checked_mul(k / QUADS_VALUES)?.checked_mul(QUADS_BYTES)
             }
         }
     }
@@ -195,6 +228,16 @@ impl Kernels {
         if let Some(w) = &p.route_weights {
             check_window_len(WHAT, "route weights", w.len(), slots)?;
         }
+        if p.layout == NvfpLayout::Mxfp8Quads {
+            // The kernel reads a block's code and scale words as 32-bit words;
+            // a block is 132 bytes, so an expert's rows keep the alignment.
+            check_weights_align(
+                WHAT,
+                "weights",
+                p.weights.byte_range()?.start.get(),
+                WeightAlign::Word,
+            )?;
+        }
         if p.layout == NvfpLayout::Blocks {
             // The kernel reads each block's scale word as a 32-bit word.
             check_weights_align(
@@ -244,6 +287,7 @@ impl Kernels {
             NvfpLayout::Planes => &self.ink2.nvfp4_planes,
             NvfpLayout::Q8_0 => &self.ink2.q8_0_scaled,
             NvfpLayout::Mxfp8Rows => &self.ink2.mxfp8_rows,
+            NvfpLayout::Mxfp8Quads => &self.ink2.mxfp8_quads,
         };
         encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);
@@ -275,6 +319,35 @@ mod tests {
     use crate::experts_geom::routed_ids;
     use crate::inkling2_geom::TOP_K;
     use crate::instance::INKLING2_MINI;
+
+    use super::NvfpLayout;
+
+    /// The quads hold the rows' bytes (an MXFP8 stack's size does not move with
+    /// its layout) and take only whole blocks of four groups; the lever's word
+    /// names a layout, and no other word does.
+    #[test]
+    fn the_quads_hold_the_rows_bytes_in_blocks_of_four_groups() {
+        for (rows, k) in [(1, 128), (37, 2304), (2304, 1152), (4608, 2304)] {
+            assert_eq!(
+                NvfpLayout::Mxfp8Quads.bytes(rows, k),
+                NvfpLayout::Mxfp8Rows.bytes(rows, k),
+                "{rows} rows of {k}"
+            );
+        }
+        assert_eq!(
+            NvfpLayout::Mxfp8Quads.step(),
+            4 * NvfpLayout::Mxfp8Rows.step()
+        );
+        assert!(NvfpLayout::Mxfp8Rows.bytes(1, 96).is_some());
+        assert_eq!(NvfpLayout::Mxfp8Quads.bytes(1, 96), None);
+        assert_eq!(NvfpLayout::mx8_of(None), Ok(NvfpLayout::Mxfp8Quads));
+        assert_eq!(
+            NvfpLayout::mx8_of(Some("quads")),
+            Ok(NvfpLayout::Mxfp8Quads)
+        );
+        assert_eq!(NvfpLayout::mx8_of(Some("rows")), Ok(NvfpLayout::Mxfp8Rows));
+        assert!(NvfpLayout::mx8_of(Some("planes")).is_err());
+    }
 
     /// The family's row compiles at least the route's slots as routed ids,
     /// so no slot of a launch is the shared slot the id read leaves unread.

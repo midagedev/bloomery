@@ -1,10 +1,12 @@
 //! The NVFP4 mat-vec's clauses (`kernels/nvfp4.metal`): every layout the
 //! routed experts' bytes come in — mainline's 36-byte block of 64 values (the
 //! GGUF file's), bloomery's two planes an expert (the MLX folder's), the
-//! codas' Q8_0 and MXFP8 — against an f64
+//! codas' Q8_0 and MXFP8 (the folder's rows, and its quads: the same bytes with four
+//! groups' codes interleaved a lane) — against an f64
 //! dot of an independent decode, the decode itself held to the `gguf` crate's
 //! decoders, a scale byte that is no UE4M3, the launch's refusals and the
-//! planes at the Mini's two launch shapes.
+//! planes at the Mini's two launch shapes; the quads mat-vec against the rows
+//! mat-vec on the same bytes, bit for bit.
 //!
 //! The decode: a code `c` is `KVALUES[c] · ue4m3(scale) / 2`, the doubled E2M1
 //! table and the halved scale both exact in f32; the dot's products and sums
@@ -100,17 +102,58 @@ fn stack(layout: NvfpLayout, rows: usize, k: usize, seed: u64) -> Vec<u8> {
                 }
             }
         }
+        // The rows' draw, its bytes permuted.
+        NvfpLayout::Mxfp8Quads => return quads_of(&stack(NvfpLayout::Mxfp8Rows, rows, k, seed)),
     }
     bytes
 }
 
+/// The quads layout of an MXFP8-rows stack: every four 33-byte groups (`[scale,
+/// 32 codes]` each) become `[128 code bytes, 4 scale bytes]`, lane `l`'s four
+/// codes (groups 0 to 3) the four bytes at `4 l`.
+fn quads_of(rows: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; rows.len()];
+    let (blocks, dst_blocks) = (rows.as_chunks::<132>().0, out.as_chunks_mut::<132>().0);
+    for (src, dst) in blocks.iter().zip(dst_blocks) {
+        for gg in 0..4 {
+            let group = &src[gg * 33..(gg + 1) * 33];
+            dst[128 + gg] = group[0];
+            for l in 0..32 {
+                dst[4 * l + gg] = group[1 + l];
+            }
+        }
+    }
+    out
+}
+
+/// The rows layout of a quads span: [`quads_of`]'s inverse.
+fn rows_of_quads(quads: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; quads.len()];
+    let (blocks, dst_blocks) = (quads.as_chunks::<132>().0, out.as_chunks_mut::<132>().0);
+    for (src, dst) in blocks.iter().zip(dst_blocks) {
+        for gg in 0..4 {
+            dst[gg * 33] = src[128 + gg];
+            for l in 0..32 {
+                dst[gg * 33 + 1 + l] = src[4 * l + gg];
+            }
+        }
+    }
+    out
+}
+
 /// Row `r` of one expert's stack of `rows` rows as [`decode`] reads it: the
-/// row's own span, or, of the planes, its groups gathered (each group's scale
-/// byte, then its 8 code bytes: the MLX folder's NVFP4 rows type).
+/// row's own span, of the quads its span in the rows layout, or, of the planes,
+/// its groups gathered (each group's scale byte, then its 8 code bytes: the MLX
+/// folder's NVFP4 rows type).
 fn row_of(layout: NvfpLayout, bytes: &[u8], rows: usize, r: usize, k: usize) -> Vec<u8> {
     if layout != NvfpLayout::Planes {
         let per = row_bytes(layout, k);
-        return bytes[r * per..(r + 1) * per].to_vec();
+        let span = &bytes[r * per..(r + 1) * per];
+        return if layout == NvfpLayout::Mxfp8Quads {
+            rows_of_quads(span)
+        } else {
+            span.to_vec()
+        };
     }
     let (codes, scales) = (&bytes[r * k / 2..], &bytes[rows * k / 2 + r * (k / 16)..]);
     (0..k / 16)
@@ -158,7 +201,8 @@ fn decode(layout: NvfpLayout, row: &[u8], k: usize) -> Vec<f64> {
                 }
             }
         }
-        NvfpLayout::Mxfp8Rows => {
+        // A quads row arrives in the rows layout (`row_of`).
+        NvfpLayout::Mxfp8Rows | NvfpLayout::Mxfp8Quads => {
             for (g, grp) in row.chunks(33).enumerate() {
                 let s = 2f64.powi(i32::from(grp[0]) - 127);
                 for i in 0..32 {
@@ -256,6 +300,7 @@ pub fn nvfp4_rows(h: &Harness<'_>) -> Clause {
         (NvfpLayout::Planes, "planes"),
         (NvfpLayout::Q8_0, "q8_0"),
         (NvfpLayout::Mxfp8Rows, "mxfp8 rows"),
+        (NvfpLayout::Mxfp8Quads, "mxfp8 quads"),
     ] {
         for (case, (rows, k)) in [(37usize, 2304usize), (9, layout.step())]
             .into_iter()
@@ -275,8 +320,10 @@ pub fn nvfp4_rows(h: &Harness<'_>) -> Clause {
                     .map_err(|e| format!("gguf's NVFP4 rows decode: {e}"))?,
                 NvfpLayout::Q8_0 => dequant_row(GgmlType::Q8_0, &row0, &mut gg)
                     .map_err(|e| format!("gguf's Q8_0 decode: {e}"))?,
-                NvfpLayout::Mxfp8Rows => dequant_row(GgmlType::MXFP8, &row0, &mut gg)
-                    .map_err(|e| format!("gguf's MXFP8 decode: {e}"))?,
+                NvfpLayout::Mxfp8Rows | NvfpLayout::Mxfp8Quads => {
+                    dequant_row(GgmlType::MXFP8, &row0, &mut gg)
+                        .map_err(|e| format!("gguf's MXFP8 decode: {e}"))?
+                }
             }
             let mine = values(layout, &bytes, rows, 0, k);
             if let Some(i) = gg.iter().zip(&mine).position(|(a, b)| f64::from(*a) != *b) {
@@ -306,7 +353,7 @@ pub fn nvfp4_rows(h: &Harness<'_>) -> Clause {
         }
     }
     Ok(Verdict::Noted(format!(
-        "the four layouts decode as the gguf crate does and dot in the f64 oracle's band, worst error over its band: {}",
+        "the five layouts decode as the gguf crate does and dot in the f64 oracle's band, worst error over its band: {}",
         parts.join(", ")
     )))
 }
@@ -322,6 +369,7 @@ pub fn nvfp4_nan(h: &Harness<'_>) -> Clause {
         (NvfpLayout::Planes, "planes"),
         (NvfpLayout::Q8_0, "q8_0"),
         (NvfpLayout::Mxfp8Rows, "mxfp8 rows"),
+        (NvfpLayout::Mxfp8Quads, "mxfp8 quads"),
     ] {
         let bytes = stack(layout, rows, k, 0x4A80);
         let x = ink2::draw(k, 0x4A81, 1.0);
@@ -346,6 +394,13 @@ pub fn nvfp4_nan(h: &Harness<'_>) -> Clause {
             ],
             // The scale byte 0xff, then a NaN code.
             NvfpLayout::Mxfp8Rows => [(3 * per + per - 33, 0xff), (8 * per + 33 * 17 + 5, 0x7f)],
+            // The same two bytes in quads: row 3's last group is block 17's
+            // fourth (scale byte 131 of 132), row 8's group 17 is block 4's
+            // second, lane 4.
+            NvfpLayout::Mxfp8Quads => [
+                (3 * per + per - 1, 0xff),
+                (8 * per + 132 * 4 + 4 * 4 + 1, 0x7f),
+            ],
         };
         bad[last] = last_byte;
         bad[mid] = mid_byte;
@@ -365,7 +420,7 @@ pub fn nvfp4_nan(h: &Harness<'_>) -> Clause {
         }
     }
     Ok(Verdict::Noted(
-        "a byte with no defined value is NaN in its row alone and raises the quant-column site, in the four layouts"
+        "a byte with no defined value is NaN in its row alone and raises the quant-column site, in the five layouts"
             .to_string(),
     ))
 }
@@ -519,6 +574,7 @@ pub fn nvfp4_route(h: &Harness<'_>) -> Clause {
         (NvfpLayout::Planes, "planes"),
         (NvfpLayout::Q8_0, "q8_0"),
         (NvfpLayout::Mxfp8Rows, "mxfp8 rows"),
+        (NvfpLayout::Mxfp8Quads, "mxfp8 quads"),
     ] {
         let per = layout.bytes(rows, k).expect("whole groups");
         let seed = 0x4B00 + 16 * layout as u64;
@@ -615,7 +671,7 @@ pub fn nvfp4_route(h: &Harness<'_>) -> Clause {
         }
     }
     Ok(Verdict::Noted(
-        "every slot of a route is its expert's one-slot launch to the bit, at its plane's place, with its own input and route weight on a down; an id past the stack is NaN in its slot alone and raises the expert-id site, in the four layouts"
+        "every slot of a route is its expert's one-slot launch to the bit, at its plane's place, with its own input and route weight on a down; an id past the stack is NaN in its slot alone and raises the expert-id site, in the five layouts"
             .to_string(),
     ))
 }
@@ -689,6 +745,167 @@ pub fn nvfp4_planes(h: &Harness<'_>) -> Clause {
     )))
 }
 
+/// A rows-layout stack of `experts` experts of `rows` rows over `k` drawn as the
+/// MLX folder's coda holds one: scale bytes in the census's 113..=118, codes
+/// uniform but the two NaN codes, with bit 3 of every code cleared when
+/// `bit3_cleared` (the real file's codes hold subnormals one in 12,000).
+fn coda_stack(experts: usize, rows: usize, k: usize, seed: u64, bit3_cleared: bool) -> Vec<u8> {
+    let mut rng = Rng::new(seed);
+    let mut bytes = Vec::with_capacity(experts * rows * (k / 32) * 33);
+    for _ in 0..experts * rows * (k / 32) {
+        bytes.push(113 + (rng.next() % 6) as u8);
+        for _ in 0..32 {
+            let mut c = rng.next() as u8;
+            if bit3_cleared {
+                c &= 0xf7;
+            }
+            bytes.push(if c & 0x7f == 0x7f { c ^ 1 } else { c });
+        }
+    }
+    bytes
+}
+
+/// Every (code, scale byte) pair of the rows layout, at `k` = 128 (one quads
+/// block a row): expert `e` has scale byte `e`, row `r` has code `r` in lane 0
+/// of group 0 and zero codes elsewhere, so row `r` of expert `e` dots to that
+/// pair's value times the input 1.
+fn exhaustive_stack() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(256 * 256 * 4 * 33);
+    for e in 0..=255u8 {
+        for r in 0..=255u8 {
+            for gg in 0..4 {
+                let mut group = [0u8; 33];
+                group[0] = e;
+                if gg == 0 {
+                    group[1] = r;
+                }
+                bytes.extend_from_slice(&group);
+            }
+        }
+    }
+    bytes
+}
+
+/// One route over the rows stack `rows_bytes` and over its quads, each in its
+/// layout's mat-vec: the outputs' bits and the fault word each left, which
+/// must be the same. The count of outputs compared.
+#[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
+fn quads_vs_rows(
+    h: &Harness<'_>,
+    what: &str,
+    (rows, k, plane): (usize, usize, usize),
+    rows_bytes: &[u8],
+    ids: &[u32],
+    scales: &[f32],
+    route_weights: Option<&[f32]>,
+    x: &[f32],
+) -> Result<usize, String> {
+    let quads = quads_of(rows_bytes);
+    let run = |layout: NvfpLayout, bytes: &[u8]| -> Result<(Vec<f32>, String), String> {
+        let out = launch_route(
+            h,
+            layout,
+            rows,
+            k,
+            bytes,
+            ids,
+            scales,
+            route_weights,
+            x,
+            plane,
+        )?;
+        let fault = h
+            .fault()?
+            .map_or_else(|| "clean".to_string(), |f| f.to_string());
+        Ok((out, fault))
+    };
+    let (want, want_fault) = run(NvfpLayout::Mxfp8Rows, rows_bytes)?;
+    let (got, got_fault) = run(NvfpLayout::Mxfp8Quads, &quads)?;
+    if let Some((i, g, w)) = common::first_diff(
+        &got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        &want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+    ) {
+        return Err(format!(
+            "{what}: output {i} is {:#010x} in the quads and {w:#010x} in the rows",
+            g
+        ));
+    }
+    if got_fault != want_fault {
+        return Err(format!(
+            "{what}: the quads left the fault word `{got_fault}`, the rows `{want_fault}`"
+        ));
+    }
+    Ok(got.len())
+}
+
+/// The MXFP8 quads mat-vec is the rows mat-vec on the same bytes, to the bit
+/// and to the fault word: (a) the coda's own draw (scale bytes 113..=118, codes
+/// uniform but the NaN codes, and the same with bit 3 cleared) at the Mini's
+/// gate·up and down launches, six experts, a route of eight slots; (b) every
+/// (code, scale byte) pair, the subnormal codes under the extreme scales, the
+/// NaN scale and the NaN codes included. The rows mat-vec stays the reference:
+/// a device that flushes a subnormal result differs from the f64 oracle on both
+/// kernels alike.
+pub fn mxfp8_quads_identity(h: &Harness<'_>) -> Clause {
+    const EXPERTS: usize = 6;
+    const ROUTE: [f32; 8] = [0.3, 0.9, 0.11, 0.5, 0.7, 0.2, 0.6, 0.4];
+    let ids = [0u32, 1, 2, 3, 4, 5, 2, 0];
+    let mut compared = 0usize;
+    for (name, rows, k, plane, down) in [
+        ("gate·up", 2304usize, 2304usize, 1152usize, false),
+        ("down", 2304, 1152, 2304, true),
+    ] {
+        for (case, bit3_cleared) in [(0u64, false), (1, true)] {
+            let bytes = coda_stack(
+                EXPERTS,
+                rows,
+                k,
+                0x4D00 + 16 * k as u64 + case,
+                bit3_cleared,
+            );
+            let x = ink2::draw(if down { ids.len() * k } else { k }, 0x4D01 + case, 1.0);
+            let scales = [1.0f32; EXPERTS];
+            let label = format!(
+                "{name} {rows}x{k}{}",
+                if bit3_cleared {
+                    ", codes with bit 3 cleared"
+                } else {
+                    ""
+                }
+            );
+            compared += quads_vs_rows(
+                h,
+                &label,
+                (rows, k, plane),
+                &bytes,
+                &ids,
+                &scales,
+                down.then_some(&ROUTE[..]),
+                &x,
+            )?;
+        }
+    }
+    let exhaustive = exhaustive_stack();
+    let scales = [1.0f32; 256];
+    let x = vec![1.0f32; 128];
+    for launch in 0..32usize {
+        let ids: Vec<u32> = (0..8).map(|s| (8 * launch + s) as u32).collect();
+        compared += quads_vs_rows(
+            h,
+            &format!("every pair, experts {}..{}", 8 * launch, 8 * launch + 8),
+            (256, 128, 256),
+            &exhaustive,
+            &ids,
+            &scales,
+            None,
+            &x,
+        )?;
+    }
+    Ok(Verdict::Noted(format!(
+        "{compared} outputs of the quads mat-vec are the rows mat-vec's bits with its fault words: the coda's draw at the Mini's two launches (eight slots over six experts, with and without bit 3 of the codes) and all 65,536 (code, scale byte) pairs"
+    )))
+}
+
 /// The mat-vec's clauses, in gate order.
 pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
     let h = ctx.harness;
@@ -698,5 +915,6 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<
         ("nvfp4_bounds", Box::new(|| nvfp4_bounds(h))),
         ("nvfp4_route", Box::new(|| nvfp4_route(h))),
         ("nvfp4_planes", Box::new(|| nvfp4_planes(h))),
+        ("mxfp8_quads_identity", Box::new(|| mxfp8_quads_identity(h))),
     ]
 }

@@ -21,13 +21,16 @@ use runtime::prompt::PrefillMode;
 
 use super::arena::Arena;
 use super::check::{self, Checked, Refusal};
+use super::clock::{StepClock, Trace};
 use super::ops::Walk;
 use super::pass::{self as rows, Pass, PassBufs, PassRoutes};
+use super::profile::ProfileGroup;
 use crate::device::MetalDevice;
 use crate::instance::{INKLING2_MINI, Instance};
-use crate::kernels::Kernels;
+use crate::kernels::{Kernels, NvfpLayout};
 use crate::library::Library;
 use crate::residency::Alloc;
+use crate::session::clock::Stepped;
 use crate::session::pass::{PassOut, Passed};
 use crate::session::room::Bytes;
 use crate::stream::MetalStream;
@@ -184,6 +187,8 @@ pub struct Session {
     logits_fresh: bool,
     /// The epilogue's scale before the cap.
     logit_scale: f32,
+    /// The step clock, when a run asked for it.
+    clock: Option<StepClock>,
 }
 
 impl Session {
@@ -203,7 +208,8 @@ impl Session {
     }
 
     /// A session of `file` at a cache of `ctx` rows on `device`, its kernels
-    /// built from `library`. Every buffer is made and the residency set
+    /// built from `library`, the folder's MXFP8 coda in the quads layout
+    /// ([`Session::open_with`]). Every buffer is made and the residency set
     /// committed here.
     ///
     /// # Errors
@@ -214,8 +220,26 @@ impl Session {
         file: &ModelFile,
         ctx: usize,
     ) -> Result<Session, SessionError> {
+        Self::open_with(device, library, file, ctx, NvfpLayout::Mxfp8Quads)
+    }
+
+    /// [`Session::open`] with the folder's MXFP8 coda stacks loaded in the
+    /// layout `mx8`, [`NvfpLayout::Mxfp8Quads`] or [`NvfpLayout::Mxfp8Rows`]:
+    /// the decode and the prompt pass read the layout the load wrote, and a
+    /// file with no MXFP8 stack loads the same bytes under both.
+    ///
+    /// # Errors
+    /// The check's refusal (a layout the coda does not take, a width it
+    /// cannot hold), the room's, or the device's, by name.
+    pub fn open_with(
+        device: &MetalDevice,
+        library: &Library,
+        file: &ModelFile,
+        ctx: usize,
+        mx8: NvfpLayout,
+    ) -> Result<Session, SessionError> {
         let split = file.header();
-        let checked = check::check(split, ctx)
+        let checked = check::check_with(split, ctx, mx8)
             .checked_or_first()
             .map_err(SessionError::Refused)?;
         let free = crate::plan::device_room().map(|d| d.free);
@@ -263,6 +287,7 @@ impl Session {
             headless: false,
             logits_fresh: false,
             logit_scale,
+            clock: None,
         })
     }
 
@@ -302,6 +327,15 @@ impl Session {
     /// A poisoned session, a position past the cache, an id past the
     /// vocabulary, the device's error, or the fault word raised by the step.
     pub fn step(&mut self, id: u32) -> Result<u32, SessionError> {
+        self.step_counted(id).map(|s| s.id)
+    }
+
+    /// [`Session::step`] with what the token encoded: its groups, dispatches
+    /// and barriers over every command buffer it ran in.
+    ///
+    /// # Errors
+    /// As [`Session::step`].
+    pub fn step_counted(&mut self, id: u32) -> Result<Stepped, SessionError> {
         self.step_with(id, None, None)
     }
 
@@ -311,7 +345,7 @@ impl Session {
     /// # Errors
     /// As [`Session::step`].
     pub fn step_tapped(&mut self, id: u32, taps: TapSink<'_>) -> Result<u32, SessionError> {
-        self.step_with(id, Some(taps), None)
+        self.step_with(id, Some(taps), None).map(|s| s.id)
     }
 
     /// [`Session::step_tapped`] whose experts run the route `routes` gives at
@@ -327,15 +361,12 @@ impl Session {
         taps: TapSink<'_>,
         routes: Routes<'_>,
     ) -> Result<u32, SessionError> {
-        self.step_with(id, Some(taps), Some(routes))
+        self.step_with(id, Some(taps), Some(routes)).map(|s| s.id)
     }
 
-    fn step_with(
-        &mut self,
-        id: u32,
-        taps: Option<TapSink<'_>>,
-        routes: Option<Routes<'_>>,
-    ) -> Result<u32, SessionError> {
+    /// The refusals every step shares: a poisoned session, a position past
+    /// the cache, an id past the vocabulary.
+    fn ready(&self, id: u32) -> Result<(), SessionError> {
         if let Some(f) = self.poisoned {
             return Err(SessionError::Poisoned(f));
         }
@@ -351,13 +382,25 @@ impl Session {
                 self.checked.vocab
             )));
         }
+        Ok(())
+    }
+
+    fn step_with(
+        &mut self,
+        id: u32,
+        taps: Option<TapSink<'_>>,
+        routes: Option<Routes<'_>>,
+    ) -> Result<Stepped, SessionError> {
+        self.ready(id)?;
         self.logits_fresh = false;
         self.headless = false;
+        let mut trace = self.clock.is_some().then(Trace::new);
         let mut walk = Walk {
             c: &self.checked,
             a: &mut self.arena,
             k: &self.kernels,
             stream: &self.stream,
+            trace: trace.as_mut(),
         };
         let picked = walk.token(id, self.pos, taps, routes, None);
         // A raise outranks the walk's own error: the fault names the visit.
@@ -366,9 +409,62 @@ impl Session {
             self.poisoned = Some(f);
             return Err(SessionError::Fault(f));
         }
-        let picked = picked?;
+        let (id, count) = picked?;
+        if let (Some(clock), Some(trace)) = (self.clock.as_mut(), &trace) {
+            clock.settled(trace)?;
+        }
         self.pos += 1;
-        Ok(picked)
+        Ok(Stepped { id, count })
+    }
+
+    /// [`Session::step`] with every group of the token on a command buffer of
+    /// its own, waited, its GPU seconds read and one sample a group appended
+    /// to `out`, in the token's order ([`super::profile`]). `out` is cleared
+    /// and keeps its capacity. The count is what one encoder of the whole
+    /// token encodes.
+    ///
+    /// # Errors
+    /// As [`Session::step`], and a walk whose groups are not the paper's.
+    pub fn step_profile(
+        &mut self,
+        id: u32,
+        out: &mut Vec<ProfileGroup>,
+    ) -> Result<Stepped, SessionError> {
+        self.ready(id)?;
+        self.logits_fresh = false;
+        self.headless = false;
+        if let Some(clock) = self.clock.as_mut() {
+            clock.broken();
+        }
+        let mut walk = Walk {
+            c: &self.checked,
+            a: &mut self.arena,
+            k: &self.kernels,
+            stream: &self.stream,
+            trace: None,
+        };
+        let picked = walk.token_profile(id, self.pos, out);
+        let fault = self.arena.faults.read(&self.stream)?;
+        if let Some(f) = fault {
+            self.poisoned = Some(f);
+            return Err(SessionError::Fault(f));
+        }
+        let (id, count) = picked?;
+        self.pos += 1;
+        Ok(Stepped { id, count })
+    }
+
+    /// Start the step clock: every plain step from here on is timed, read
+    /// back through [`Session::step_clock`]. A clock already running starts
+    /// over.
+    pub fn start_step_clock(&mut self) {
+        self.clock = Some(StepClock::new());
+    }
+
+    /// The step clock, when one runs.
+    #[must_use]
+    pub fn step_clock(&self) -> Option<&StepClock> {
+        self.clock.as_ref()
     }
 
     /// How a prompt call feeds its ids: in passes, or a step each. A file the

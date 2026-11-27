@@ -10,6 +10,8 @@
 mod arena;
 #[cfg(target_os = "macos")]
 pub mod check;
+#[cfg(target_os = "macos")]
+mod clock;
 pub mod count;
 #[cfg(target_os = "macos")]
 pub mod generate;
@@ -21,11 +23,17 @@ mod pass;
 #[cfg(target_os = "macos")]
 pub mod plan;
 #[cfg(target_os = "macos")]
+mod profile;
+#[cfg(target_os = "macos")]
 pub mod session;
 #[cfg(target_os = "macos")]
 mod target;
 
 #[cfg(target_os = "macos")]
+pub use clock::{StepClock, StepTerms};
+#[cfg(target_os = "macos")]
 pub use pass::PassRoutes;
+#[cfg(target_os = "macos")]
+pub use profile::{GroupBytes, ProfileGroup};
 #[cfg(target_os = "macos")]
 pub use session::{Inputs, Routes, Session, SessionError, Tap};

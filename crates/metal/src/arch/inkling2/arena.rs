@@ -231,7 +231,9 @@ fn gate_up_row(j: usize, rows: usize) -> usize {
 /// Expert `e` of the folder's stack `st` in its launch layout, the rows in
 /// the launch's order (`fused`: the gate·up permutation): an NVFP4 stack's
 /// two planes, every row's codes then every row's scale bytes; an MXFP8
-/// stack's rows, a group's scale byte then its codes.
+/// stack's rows, a group's scale byte then its codes, or its quads, a block
+/// of four groups' 128 code bytes (lane `l`'s four codes at byte `4 l`) then
+/// the four scale bytes.
 fn expert_layout(
     st: &Stack,
     codes: &[u8],
@@ -241,7 +243,7 @@ fn expert_layout(
 ) -> Result<(), SessionError> {
     let (group, code_bytes) = match st.layout {
         NvfpLayout::Planes => (16, 8),
-        NvfpLayout::Mxfp8Rows => (32, 32),
+        NvfpLayout::Mxfp8Rows | NvfpLayout::Mxfp8Quads => (32, 32),
         other => {
             return Err(refuse(format!(
                 "{}: a folder's planes in the {other:?} layout",
@@ -270,6 +272,27 @@ fn expert_layout(
         for j in 0..st.rows {
             let r = row(j);
             out.extend_from_slice(&scales[r * sb..(r + 1) * sb]);
+        }
+        return Ok(());
+    }
+    if st.layout == NvfpLayout::Mxfp8Quads {
+        if !groups.is_multiple_of(4) {
+            return Err(refuse(format!(
+                "{}: {groups} groups a row are not whole blocks of four",
+                st.name
+            )));
+        }
+        for j in 0..st.rows {
+            let r = row(j) * groups;
+            for b in 0..groups / 4 {
+                let first = r + 4 * b;
+                for lane in 0..code_bytes {
+                    for gg in 0..4 {
+                        out.push(codes[(first + gg) * code_bytes + lane]);
+                    }
+                }
+                out.extend_from_slice(&scales[first..first + 4]);
+            }
         }
         return Ok(());
     }
@@ -569,5 +592,64 @@ mod tests {
     fn the_fused_rows_land_gate_first() {
         let rows: Vec<usize> = (0..8).map(|j| gate_up_row(j, 8)).collect();
         assert_eq!(rows, [0, 2, 4, 6, 1, 3, 5, 7]);
+    }
+
+    /// A quads expert is the rows expert's bytes permuted a block at a time:
+    /// each 132-byte block of four groups holds the 128 code bytes, lane `l`'s
+    /// four (groups 0 to 3) at byte `4 l`, then the four scale bytes.
+    ///
+    /// Mutant: the loader writes the rows order under the quads layout, or a
+    /// group's codes ahead of the next group's.
+    #[test]
+    fn the_quads_are_the_rows_permuted_per_block() {
+        let (rows, k) = (3usize, 256usize);
+        let groups = k / 32;
+        let codes: Vec<u8> = (0..rows * groups * 32).map(|i| (i * 7 + 3) as u8).collect();
+        let scales: Vec<u8> = (0..rows * groups).map(|i| (100 + i) as u8).collect();
+        let stack = |layout| Stack {
+            name: "test".to_string(),
+            layout,
+            planes: true,
+            experts: 1,
+            rows,
+            k,
+            scale: None,
+        };
+        let (mut by_rows, mut by_quads) = (Vec::new(), Vec::new());
+        expert_layout(
+            &stack(NvfpLayout::Mxfp8Rows),
+            &codes,
+            &scales,
+            false,
+            &mut by_rows,
+        )
+        .expect("the rows layout");
+        expert_layout(
+            &stack(NvfpLayout::Mxfp8Quads),
+            &codes,
+            &scales,
+            false,
+            &mut by_quads,
+        )
+        .expect("the quads layout");
+        assert_eq!(by_rows.len(), by_quads.len());
+        assert_eq!(by_quads.len(), rows * (k / 128) * 132);
+        for (r, q) in by_rows
+            .as_chunks::<132>()
+            .0
+            .iter()
+            .zip(by_quads.as_chunks::<132>().0)
+        {
+            for gg in 0..4 {
+                assert_eq!(q[128 + gg], r[33 * gg], "group {gg}'s scale byte");
+                for lane in 0..32 {
+                    assert_eq!(
+                        q[4 * lane + gg],
+                        r[33 * gg + 1 + lane],
+                        "lane {lane}, group {gg}"
+                    );
+                }
+            }
+        }
     }
 }

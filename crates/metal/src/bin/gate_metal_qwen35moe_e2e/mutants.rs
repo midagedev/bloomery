@@ -40,7 +40,7 @@
 //! residual convs' taps and the MXFP8 coda's scale (`k_logits`) and of the head's pick
 //! (`k_greedy`), and of the prompt pass's own kernels: the grouped NVFP4 rows' decode, the SITU
 //! epilogue, the router over rows, the attention's sink (`k_pass`) and its window (`k_carry`);
-//! `k_visits`' and `k_room`'s defects are
+//! `k_visits`', `k_room`'s and `k_count`'s defects are
 //! the host's (a walk of other visits, a buffer the plan does not count), as are the pass's own
 //! (a conv ring reset at a pass boundary, a route reused across visits, a ring of the window
 //! only), one-off edits like the others above. The edits compile into
@@ -512,7 +512,7 @@ pub const INKLING2: &[Mutant] = &[
         clause: "k_logits",
         why: "an MXFP8 group's E8M0 scale reads its exponent one too high, so the MXFP8 coda's \
               every expert weight is doubled, which only an MLX folder's coda layer holds",
-        edits: &[("exp2(float(sb) - 127.0f)", "exp2(float(sb) - 126.0f)", 1)],
+        edits: &[("(sb << 23)", "((sb + 1u) << 23)", 1)],
     },
     Mutant {
         name: "ink2_pass_mxfp8_scale_exp",
@@ -522,7 +522,7 @@ pub const INKLING2: &[Mutant] = &[
         edits: &[(
             "exp2(float(sb) + (-127.0f))",
             "exp2(float(sb) + (-126.0f))",
-            1,
+            2,
         )],
     },
     Mutant {

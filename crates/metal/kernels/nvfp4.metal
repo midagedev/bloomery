@@ -501,3 +501,84 @@ kernel void mxfp8_rows_gemv(device const uint8_t *W [[buffer(0)]],
         y[out] = isfinite(dot) ? dot : NAN;
     }
 }
+
+// MXFP8 quads (132 bytes a 128-value block of four groups): the block's 128
+// code bytes first, lane l's four codes (groups 4b to 4b + 3) the word at byte
+// 4l, then the four groups' E8M0 scale bytes. Same bytes as the rows layout,
+// the same value rule, the same per-lane order (group 0, 1, 2, ...): a SIMD
+// group loads 128 bytes contiguous for four groups, and the decode is integer.
+
+// E4M3 code byte `gg` of word `cw` times the E8M0 scale byte `gg` of word `sw`.
+// `mag << 7` is the code's f16 pattern times 2^-8 (a subnormal code a subnormal
+// half), and the scale is the f32 whose exponent field is the byte (byte 0 is
+// 2^-127, the f32 pattern 0x00400000; 0xff is NaN). Equal in bits to the rows
+// kernel's product of the two decodes for every (code, scale) pair.
+inline float mxfp8_quad_value(uint cw, uint sw, uint gg) {
+    const uint c = (cw >> (8u * gg)) & 0xffu;
+    const uint sb = (sw >> (8u * gg)) & 0xffu;
+    const uint mag = c & 0x7fu;
+    const float e = float(as_type<half>(ushort(mag << 7))) * 256.0f;
+    const float m = mag == 0x7fu ? NAN : e;
+    const float signed_m = as_type<float>(as_type<uint>(m) ^ ((c & 0x80u) << 24));
+    const uint sbits = sb == 0xffu ? 0x7fc00000u : (sb == 0u ? 0x00400000u : (sb << 23));
+    return signed_m * as_type<float>(sbits);
+}
+
+kernel void mxfp8_quads_gemv(device const uint8_t *W [[buffer(0)]],
+                             device const float *x [[buffer(1)]],
+                             device float *y [[buffer(2)]],
+                             constant Nvfp4Args &args [[buffer(3)]],
+                             device atomic_uint *faults [[buffer(4)]],
+                             device const int *ids [[buffer(5)]],
+                             device const float *scales [[buffer(6)]],
+                             device const float *route_w [[buffer(7)]],
+                             uint2 tg [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]])
+{
+    const uint r = tg.x * 8u + sg;
+    const uint slot = tg.y;
+    if (r >= args.rows || slot >= args.slots) {
+        return;
+    }
+    const uint out = nv_out(args, slot, r);
+    ulong expert = 0;
+    float w_scale = 0.f;
+    if (!nv_route(ids, scales, route_w, args, slot, expert, w_scale)) {
+        if (lane == 0u) {
+            nv_bad_slot(y, args, faults, out);
+        }
+        return;
+    }
+    x += slot * args.x_stride;
+    const uint blocks = args.k / 128u;
+    device const uint8_t *wr = W + (expert * (ulong)args.rows + (ulong)r) * (ulong)blocks * 132ul;
+    bool bad = false;
+    float acc = 0.f;
+    for (uint b = 0u; b < blocks; ++b) {
+        device const uint8_t *blk = wr + (ulong)b * 132ul;
+        const uint cw = *(device const uint *)(blk + 4u * lane);
+        const uint sw = *(device const uint *)(blk + 128u);
+        for (uint gg = 0u; gg < 4u; ++gg) {
+            const float v = mxfp8_quad_value(cw, sw, gg);
+            // v is inf or NaN: its exponent field is all ones.
+            bad |= (as_type<uint>(v) << 1) >= 0xff000000u;
+            acc += v * x[(4u * b + gg) * 32u + lane];
+        }
+    }
+    const float dot = simd_sum(acc) * w_scale;
+    const bool usable = simd_all(!bad);
+    if (!usable) {
+        if (lane == 0u) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
+            y[out] = NAN;
+        }
+        return;
+    }
+    if (!isfinite(dot) && lane == 0u) {
+        raise(faults, args.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
+    }
+    if (lane == 0u) {
+        y[out] = isfinite(dot) ? dot : NAN;
+    }
+}

@@ -144,6 +144,9 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         mtp: Option<std::path::PathBuf>,
         /// `BLOOMERY_MTP_WIDTH`: how many of a proposal's ids a pass verifies.
         width: WidthMode,
+        /// `BLOOMERY_METAL_MX8`: the layout an Inkling 2 file's MXFP8 coda
+        /// stacks load in; `None` unset (the quads).
+        mx8: Option<&'static str>,
     }
 
     /// The drafts the server runs.
@@ -169,6 +172,7 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             draft: None,
             mtp: None,
             width: WidthMode::Cost,
+            mx8: None,
         };
         let mut it = args.into_iter();
         while let Some(f) = it.next() {
@@ -229,6 +233,7 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         let levers = match bloomery_levers::at_main(&[
             bloomery_levers::SCREEN,
             bloomery_levers::MTP_WIDTH,
+            bloomery_levers::METAL_MX8,
         ]) {
             Ok(l) => l,
             Err(e) => {
@@ -238,7 +243,10 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         };
         serve::live::enable(levers.screen());
         let a = match parse(levers.mtp_width(), std::env::args().skip(1)) {
-            Ok(a) => a,
+            Ok(a) => Args {
+                mx8: levers.metal_mx8(),
+                ..a
+            },
             Err(e) => {
                 eprintln!("bloomery-serve-metal: {e}");
                 return ExitCode::from(64);
@@ -356,6 +364,13 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         let split = file.header();
         if split.architecture() == Some(ink2::ARCH) {
             return ink2::open(a, &model, file);
+        }
+        if let Some(w) = a.mx8 {
+            return Err(format!(
+                "{}={w}: it picks the layout of an {} file's MXFP8 coda; this file is another family's",
+                bloomery_levers::METAL_MX8,
+                ink2::ARCH
+            ));
         }
         let ctx = match a.ctx {
             Some(c) => c,
@@ -488,6 +503,7 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
 
         use bloomery_metal::MetalDevice;
         use bloomery_metal::arch::inkling2::{Session, plan};
+        use bloomery_metal::kernels::NvfpLayout;
         use bloomery_metal::model_arg::{self, Model};
         use model_hf::ModelFile;
         use serve::sampling::sampler_factory;
@@ -523,9 +539,11 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             let vocab = Arc::new(Vocab::new(tok)?.with_chat_template(&template)?);
             let instance = Session::instance_of(&file, ctx).map_err(|e| e.to_string())?;
             let device = MetalDevice::open(instance).map_err(|e| e.to_string())?;
+            let mx8 = NvfpLayout::mx8_of(a.mx8)
+                .map_err(|e| format!("{}={e}", bloomery_levers::METAL_MX8))?;
             let t0 = Instant::now();
-            let session =
-                Session::open(&device, device.library(), &file, ctx).map_err(|e| e.to_string())?;
+            let session = Session::open_with(&device, device.library(), &file, ctx, mx8)
+                .map_err(|e| e.to_string())?;
             drop(file);
             eprintln!(
                 "bloomery-serve-metal: opened {} in {:.1} s, ctx {ctx}, prompt passes of up to \

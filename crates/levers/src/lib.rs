@@ -34,9 +34,9 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     AUTOTUNE, ELASTIC, INK2_DENSE, INK2_LOOPCD, INK2_LOOPCD_MAX, INK2_LOOPCD_PLACES,
-    INK2_LOOPCD_REF, INK2_PASSES, INK2_PASSES_MAX, PREPARE_Q8, REPLAY_POISON, ROUTE_CENSUS,
-    ROUTE_MASK, ROUTE_RESIDENT_BONUS, ROUTE_RESIDENT_BONUS_MAX, ROUTE_RESIDENT_BONUS_PLACES,
-    ROUTE_TOPK, ROUTE_TOPK_MAX, SCHEMAJUMP, SPLIT_WALK, XSTREAM,
+    INK2_LOOPCD_REF, INK2_PASSES, INK2_PASSES_MAX, METAL_MX8, PREPARE_Q8, REPLAY_POISON,
+    ROUTE_CENSUS, ROUTE_MASK, ROUTE_RESIDENT_BONUS, ROUTE_RESIDENT_BONUS_MAX,
+    ROUTE_RESIDENT_BONUS_PLACES, ROUTE_TOPK, ROUTE_TOPK_MAX, SCHEMAJUMP, SPLIT_WALK, XSTREAM,
 };
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CARD_EXPERTS_CAP, CARD_MARGIN, CED, CHECK_FINITE, DRAFT,
@@ -1488,6 +1488,13 @@ impl Levers {
     #[must_use]
     pub fn mtp_width(&self) -> Option<&'static str> {
         self.word(MTP_WIDTH)
+    }
+
+    /// `BLOOMERY_METAL_MX8` as set, `quads` or `rows`; `None` unset, which an
+    /// Inkling 2 run on the Metal backend reads as `quads`.
+    #[must_use]
+    pub fn metal_mx8(&self) -> Option<&'static str> {
+        self.word(METAL_MX8)
     }
 
     /// `BLOOMERY_ROUTE_TRACE`: the route trace's new directory; `None` unset

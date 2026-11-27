@@ -164,6 +164,17 @@
 //! step's wall does: a host-fed step pays all four serially, a chain or
 //! ahead step encodes the next token under the current one's GPU time.
 //!
+//! An Inkling 2 folder runs both flags too, with its own lines: `step
+//! encoded` (the groups, dispatches and barriers one plain step encoded, held
+//! to the paper's by the e2e gate's `k_count`), `prof op=` a group kind over
+//! the token's visits, `prof class=` the weight kinds against the rest,
+//! `prof med` the same by each group's median over the tokens (a stretch of
+//! slow tokens moves the mean, and a run is read only where its profile sum
+//! is near the real step's GPU time), and, under `--step-times`, the one
+//! host-fed mode (`step_times mode=host`, then `step_times_host`: the buffers
+//! a token runs in, the host before the first commit, the card's idle between
+//! a token's buffers and between two tokens, the wall and the period).
+//!
 //! `--logits-hash [N]` (default N 32) runs the prompt once more from a reset
 //! session and N − 1 more tokens host-fed, each token's logits read back,
 //! and prints one `logits_hash` line a token on stderr: its index, its pick
@@ -402,6 +413,9 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         /// `BLOOMERY_MTP_WIDTH`: the width chooser's mode behind the draft;
         /// `Cost` unset, as the CUDA family's.
         width: WidthMode,
+        /// `BLOOMERY_METAL_MX8`: the layout an Inkling 2 file's MXFP8 coda
+        /// stacks load in; `None` unset (the quads).
+        mx8: Option<&'static str>,
         /// `--mtp SIDECAR`: the MTP draft layer's folder, opened beside the model.
         mtp: Option<std::path::PathBuf>,
         /// `--mtp-hidden pre|post`: the hidden row the draft joins.
@@ -663,6 +677,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             prefill,
             draft,
             width,
+            mx8: None,
             mtp,
             mtp_hidden,
             mtp_check,
@@ -717,6 +732,9 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
     #[derive(Clone, Copy, Default)]
     struct Acc {
         groups: u64,
+        /// The dispatches the groups held, for a family whose samples count
+        /// them (zero otherwise, and the line then prints none).
+        dispatches: u64,
         gpu_s: f64,
         bytes: u64,
     }
@@ -781,7 +799,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             s.pos() - steps as u32,
             s.pos() - 1
         );
-        let total = print_acc("prof", &acc, layers, steps, p.layers);
+        let total = print_acc("prof", &qwen_kind_names(), &acc, layers, steps, p.layers);
         eprintln!(
             "prof total groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1} decode_ms={}",
             total.groups as f64 / steps as f64,
@@ -797,16 +815,30 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         Ok(())
     }
 
+    /// The Qwen family's kinds' names, in the token's walk order.
+    fn qwen_kind_names() -> Vec<&'static str> {
+        KINDS.iter().map(|k| k.name()).collect()
+    }
+
     /// The lines of an accumulated profile, `per` tokens (or verifies) deep:
     /// one `{tag} op=` line a kind and, under `with_layers`, a line a layer of
-    /// the kind, the kinds in the token's walk order. The total of the kinds,
-    /// as the caller prints it.
-    fn print_acc(tag: &str, acc: &[Acc], layers: usize, per: usize, with_layers: bool) -> Acc {
-        let kind_total = |kind: GroupKind| -> Acc {
+    /// the kind, the kinds (`kinds`, a family's names in the token's walk
+    /// order; `acc` holds one row of `layers + 1` accumulators a kind). The
+    /// total of the kinds, as the caller prints it.
+    fn print_acc(
+        tag: &str,
+        kinds: &[&str],
+        acc: &[Acc],
+        layers: usize,
+        per: usize,
+        with_layers: bool,
+    ) -> Acc {
+        let kind_total = |ki: usize| -> Acc {
             let mut t = Acc::default();
             for l in 0..=layers {
-                let a = &acc[kind_index(kind) * (layers + 1) + l];
+                let a = &acc[ki * (layers + 1) + l];
                 t.groups += a.groups;
+                t.dispatches += a.dispatches;
                 t.gpu_s += a.gpu_s;
                 t.bytes += a.bytes;
             }
@@ -815,8 +847,13 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         let line = |op: &str, layer: Option<usize>, a: &Acc| {
             let n = per as f64;
             let at = layer.map_or_else(String::new, |l| format!(" layer={l}"));
+            let dispatches = if a.dispatches > 0 {
+                format!(" dispatches={:.2}", a.dispatches as f64 / n)
+            } else {
+                String::new()
+            };
             eprintln!(
-                "{tag} op={op}{at} groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1}",
+                "{tag} op={op}{at} groups={:.2}{dispatches} gpu_ms={:.3} bytes={:.0} gbps={:.1}",
                 a.groups as f64 / n,
                 a.gpu_s / n * 1e3,
                 a.bytes as f64 / n,
@@ -828,20 +865,21 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             );
         };
         let mut total = Acc::default();
-        for &kind in &KINDS {
-            let t = kind_total(kind);
+        for (ki, name) in kinds.iter().enumerate() {
+            let t = kind_total(ki);
             if t.groups == 0 {
                 continue;
             }
-            line(kind.name(), None, &t);
+            line(name, None, &t);
             total.groups += t.groups;
+            total.dispatches += t.dispatches;
             total.gpu_s += t.gpu_s;
             total.bytes += t.bytes;
             if with_layers {
                 for l in 0..layers {
-                    let a = &acc[kind_index(kind) * (layers + 1) + l];
+                    let a = &acc[ki * (layers + 1) + l];
                     if a.groups != 0 {
-                        line(kind.name(), Some(l), a);
+                        line(name, Some(l), a);
                     }
                 }
             }
@@ -950,7 +988,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
              group's at the verify's first position, the weights once a launch)",
             mid - 1
         );
-        let total = print_acc("vprof", &acc, layers, n, p.layers);
+        let total = print_acc("vprof", &qwen_kind_names(), &acc, layers, n, p.layers);
         let ops_s = total.gpu_s / nf;
         eprintln!(
             "vprof total groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1}",
@@ -1295,22 +1333,27 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
     }
 
     pub(super) fn run() -> ExitCode {
-        // `BLOOMERY_MTP_WIDTH` is the one lever row this CLI acts on; startup
-        // refuses a retired name that is set, and a bare `--levers` prints the
-        // table.
-        let levers =
-            match bloomery_levers::at_main_with_flags(&[bloomery_levers::MTP_WIDTH], has_flag) {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("generate_metal: {e}");
-                    return ExitCode::from(1);
-                }
-            };
+        // `BLOOMERY_MTP_WIDTH` and `BLOOMERY_METAL_MX8` are the lever rows this
+        // CLI acts on; startup refuses a retired name that is set, and a bare
+        // `--levers` prints the table.
+        let levers = match bloomery_levers::at_main_with_flags(
+            &[bloomery_levers::MTP_WIDTH, bloomery_levers::METAL_MX8],
+            has_flag,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("generate_metal: {e}");
+                return ExitCode::from(1);
+            }
+        };
         if has_flag("--plan") {
             return plan_run();
         }
         let a = match parse(levers.mtp_width()) {
-            Ok(a) => a,
+            Ok(a) => Args {
+                mx8: levers.metal_mx8(),
+                ..a
+            },
             Err(e) => {
                 eprintln!("generate_metal: {e}");
                 return ExitCode::from(2);
@@ -1566,11 +1609,13 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
     mod ink2 {
         use std::time::Instant;
 
-        use bloomery_metal::arch::inkling2::{Session, generate::greedy, plan};
+        use bloomery_metal::arch::inkling2::count::{KINDS, Kind};
+        use bloomery_metal::arch::inkling2::{ProfileGroup, Session, generate::greedy, plan};
         use bloomery_metal::device::MetalDevice;
+        use bloomery_metal::kernels::NvfpLayout;
         use model_hf::ModelFile;
 
-        use super::{Args, CTX_DEFAULT, Draft, Prompt, Stream};
+        use super::{Acc, Args, CTX_DEFAULT, Draft, Profile, Prompt, Stream, print_acc};
 
         /// The architecture the family's files name.
         pub const ARCH: &str = "inkling2";
@@ -1580,9 +1625,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 (a.draft != Draft::None, "--draft"),
                 (a.mtp.is_some(), "--mtp"),
                 (a.mtp_check.is_some(), "--mtp-check"),
-                (a.profile.is_some(), "--profile"),
                 (a.pass_times.is_some(), "--pass-times"),
-                (a.step_times.is_some(), "--step-times"),
                 (a.logits_hash.is_some(), "--logits-hash"),
                 (a.draft_step_times.is_some(), "--draft-step-times"),
                 (a.repeat > 1, "--repeat"),
@@ -1615,9 +1658,11 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             };
             let instance = Session::instance_of(&file, ctx).map_err(|e| e.to_string())?;
             let device = MetalDevice::open(instance).map_err(|e| e.to_string())?;
+            let mx8 = NvfpLayout::mx8_of(a.mx8)
+                .map_err(|e| format!("{}={e}", bloomery_levers::METAL_MX8))?;
             let t0 = Instant::now();
-            let mut session =
-                Session::open(&device, device.library(), &file, ctx).map_err(|e| e.to_string())?;
+            let mut session = Session::open_with(&device, device.library(), &file, ctx, mx8)
+                .map_err(|e| e.to_string())?;
             drop(file);
             let open_s = t0.elapsed().as_secs_f64();
             let allocated = device.allocated_bytes().map_err(|e| e.to_string())?;
@@ -1645,6 +1690,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             eprintln!("# development-loop numbers: no lease, no witness");
             eprintln!("model={}", path.display());
             eprintln!("ctx={ctx}");
+            eprintln!("mx8={}", a.mx8.unwrap_or("quads"));
             eprintln!("open_s={open_s:.3}");
             eprintln!("device_allocated_bytes={allocated}");
             eprintln!("planned_bytes={}", session.bytes().held().requested);
@@ -1661,6 +1707,210 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             } else {
                 eprintln!("decode_tok_s=none");
             }
+            let id = *out
+                .ids
+                .last()
+                .ok_or("a profile or step clock of no token: the run picked none")?;
+            if a.profile.is_some() || a.step_times.is_some() {
+                // The plain step's own tally, the paper's count held against it.
+                let c = session.step_counted(id).map_err(|e| e.to_string())?.count;
+                eprintln!(
+                    "step encoded groups={} dispatches={} barriers={}",
+                    c.groups, c.dispatches, c.barriers
+                );
+            }
+            if let Some(p) = &a.profile {
+                let decode_ms = (out.tokens() > 1 && decode_s > 0.0)
+                    .then(|| decode_s / out.tokens().saturating_sub(1) as f64 * 1e3);
+                profile_run(&mut session, p, id, decode_ms)?;
+            }
+            if let Some(n) = a.step_times {
+                step_times_run(&mut session, n, id)?;
+            }
+            Ok(())
+        }
+
+        /// The kinds' names, in the token's walk order.
+        fn kind_names() -> Vec<&'static str> {
+            KINDS.iter().map(|k| k.name()).collect()
+        }
+
+        /// A kind's place in [`KINDS`].
+        fn kind_index(kind: Kind) -> usize {
+            KINDS
+                .iter()
+                .position(|k| *k == kind)
+                .expect("every kind is in KINDS")
+        }
+
+        /// The `prof` lines after the run's summary: `p.n` more tokens, each
+        /// group of each on a command buffer of its own, waited; one line a
+        /// kind (and, under `p.layers`, a visit), the weight-streaming kinds
+        /// and the others summed as the two classes, then the total beside
+        /// the run's own decode ms a token. The visit is the line's `layer`;
+        /// the head's groups sit at the visit count.
+        fn profile_run(
+            s: &mut Session,
+            p: &Profile,
+            mut id: u32,
+            decode_ms: Option<f64>,
+        ) -> Result<(), String> {
+            let rows = s.ctx() - s.pos() as usize;
+            if rows == 0 {
+                return Err(format!(
+                    "prof: the cache holds no row past position {}; give --ctx more rows",
+                    s.pos()
+                ));
+            }
+            let steps = p.n.min(rows);
+            let visits = s.checked().visits.len();
+            let mut acc: Vec<Acc> = vec![Acc::default(); KINDS.len() * (visits + 1)];
+            let mut samples: Vec<ProfileGroup> = Vec::new();
+            let mut encoded = None;
+            // Every group's samples over the tokens, in the token's order: the
+            // median is printed beside the mean, which a stretch of slow tokens
+            // moves.
+            let mut each: Vec<Vec<f64>> = Vec::new();
+            for _ in 0..steps {
+                let stepped = s
+                    .step_profile(id, &mut samples)
+                    .map_err(|e| e.to_string())?;
+                id = stepped.id;
+                encoded = Some(stepped.count);
+                if each.is_empty() {
+                    each.resize_with(samples.len(), || Vec::with_capacity(steps));
+                }
+                for (e, g) in each.iter_mut().zip(&samples) {
+                    e.push(g.gpu_s);
+                }
+                for g in &samples {
+                    let a = &mut acc[kind_index(g.kind) * (visits + 1) + g.visit.unwrap_or(visits)];
+                    a.groups += 1;
+                    a.dispatches += u64::from(g.dispatches);
+                    a.gpu_s += g.gpu_s;
+                    a.bytes += g.bytes.total();
+                }
+            }
+            eprintln!(
+                "prof tokens={steps} at {}..={} (development-loop numbers: one command buffer a \
+                 group, waited; the real step's single buffer is not this)",
+                s.pos() - steps as u32,
+                s.pos() - 1
+            );
+            if let Some(c) = encoded {
+                eprintln!(
+                    "prof encoded groups={} dispatches={} barriers={}",
+                    c.groups, c.dispatches, c.barriers
+                );
+            }
+            let total = print_acc("prof", &kind_names(), &acc, visits, steps, p.layers);
+            let class = |name: &str, weights: bool| {
+                let mut t = Acc::default();
+                for k in KINDS.iter().filter(|k| k.streams_weights() == weights) {
+                    for v in 0..=visits {
+                        let a = &acc[kind_index(*k) * (visits + 1) + v];
+                        t.groups += a.groups;
+                        t.dispatches += a.dispatches;
+                        t.gpu_s += a.gpu_s;
+                        t.bytes += a.bytes;
+                    }
+                }
+                let n = steps as f64;
+                eprintln!(
+                    "prof class={name} groups={:.2} dispatches={:.2} gpu_ms={:.3} bytes={:.0} \
+                     gbps={:.1}",
+                    t.groups as f64 / n,
+                    t.dispatches as f64 / n,
+                    t.gpu_s / n * 1e3,
+                    t.bytes as f64 / n,
+                    if t.gpu_s > 0.0 {
+                        t.bytes as f64 / t.gpu_s / 1e9
+                    } else {
+                        0.0
+                    },
+                );
+            };
+            class("weights", true);
+            class("small", false);
+            // A group's median over the tokens, summed by kind (the kinds of
+            // the last token's groups name each group's kind).
+            let mut med = vec![0.0f64; KINDS.len()];
+            for (e, g) in each.iter_mut().zip(&samples) {
+                e.sort_by(f64::total_cmp);
+                med[kind_index(g.kind)] += e[e.len() / 2];
+            }
+            for (k, name) in kind_names().iter().enumerate() {
+                eprintln!("prof med op={name} gpu_ms={:.3}", med[k] * 1e3);
+            }
+            let weights_med: f64 = KINDS
+                .iter()
+                .filter(|k| k.streams_weights())
+                .map(|k| med[kind_index(*k)])
+                .sum();
+            let med_total: f64 = med.iter().sum();
+            eprintln!(
+                "prof med class=weights gpu_ms={:.3} class=small gpu_ms={:.3} total gpu_ms={:.3}",
+                weights_med * 1e3,
+                (med_total - weights_med) * 1e3,
+                med_total * 1e3,
+            );
+            eprintln!(
+                "prof total groups={:.2} dispatches={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1} \
+                 decode_ms={}",
+                total.groups as f64 / steps as f64,
+                total.dispatches as f64 / steps as f64,
+                total.gpu_s / steps as f64 * 1e3,
+                total.bytes as f64 / steps as f64,
+                if total.gpu_s > 0.0 {
+                    total.bytes as f64 / total.gpu_s / 1e9
+                } else {
+                    0.0
+                },
+                decode_ms.map_or_else(|| "none".to_owned(), |ms| format!("{ms:.3}")),
+            );
+            Ok(())
+        }
+
+        /// The `step_times` lines: `n` host-fed tokens past the run, the step
+        /// clock's phases averaged as the common line (`mode=host`: the host's
+        /// whole encode, the first buffer's GPU start after its commit, the
+        /// card's busy µs in the token's buffers, the host's µs from the last
+        /// end to the wait's return) and the terms the family adds: the
+        /// buffers a token runs in, the host before the first commit, the
+        /// card's idle between a token's buffers and between two tokens (the
+        /// host-fed gap), the step's wall and the run's period a token.
+        fn step_times_run(s: &mut Session, n: usize, id: u32) -> Result<(), String> {
+            let rows = s.ctx() - s.pos() as usize;
+            let per = n.min(rows);
+            if per == 0 {
+                return Err(format!(
+                    "step_times: the cache holds no row past position {}; give --ctx more rows",
+                    s.pos()
+                ));
+            }
+            s.start_step_clock();
+            let mut pick = id;
+            let t0 = Instant::now();
+            for _ in 0..per {
+                pick = s.step(pick).map_err(|e| e.to_string())?;
+            }
+            let period_us = t0.elapsed().as_secs_f64() / per as f64 * 1e6;
+            let clock = s.step_clock().ok_or("the step clock did not run")?;
+            let p = clock.phase();
+            let t = clock.terms();
+            eprintln!(
+                "step_times mode=host steps={} encode_us={:.1} start_us={:.1} gpu_us={:.1} \
+                 wake_us={:.1}",
+                p.steps, p.encode_us, p.start_us, p.gpu_us, p.wake_us,
+            );
+            eprintln!(
+                "step_times_host steps={} chunks={:.1} pre_us={:.1} gap_us={:.1} \
+                 between_us={:.1} wall_us={:.1} period_us={period_us:.1}",
+                t.steps, t.chunks, t.pre_us, t.gap_us, t.between_us, t.wall_us,
+            );
+            eprintln!(
+                "step_times {per} host-fed tokens (development-loop numbers: no lease, no witness)"
+            );
             Ok(())
         }
     }
@@ -1670,6 +1920,13 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         let file = ModelFile::open(&model.path).map_err(|e| e.to_string())?;
         if file.header().architecture() == Some(ink2::ARCH) {
             return ink2::generate(a, &model.path, file);
+        }
+        if let Some(w) = a.mx8 {
+            return Err(format!(
+                "{}={w}: it picks the layout of an {} file's MXFP8 coda; this file is another family's",
+                bloomery_levers::METAL_MX8,
+                ink2::ARCH
+            ));
         }
         // The tokenizer decodes what the run streams and owns the
         // end-of-generation set, so every run opens it, whatever named the

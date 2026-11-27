@@ -543,6 +543,40 @@ struct MX8R {
     }
 };
 
+// MX8Q is the same coda in nvfp4.metal's quads layout: a row is blocks of 132
+// bytes, 128 values of four groups — the four groups' E4M3 codes of lane `l`
+// the word at byte 4l, then the four scale bytes — so a row's bytes and an
+// expert's start are the rows layout's. The decode is MX8R's, unchanged.
+struct MX8Q {
+    typedef device const uint8_t * Row;
+
+    static inline int values_per_block() {
+        return 128;
+    }
+
+    // Row `r` of expert `e`: `blocks` the 128-value blocks of an expert's
+    // rows, `nb` a row's.
+    static inline Row row(device const uint8_t * W, ulong blocks, uint e, uint nb, uint r) {
+        return W + ((ulong)e * blocks + (ulong)r * nb) * 132ul;
+    }
+
+    // The 16 values at column `pos` (a multiple of 16) of `row`: half `il`
+    // of group `gg` of its block.
+    template <typename T>
+    static inline void dequant16(Row row, int pos, thread matrix<T, 4, 4> & reg) {
+        device const uint8_t * blk = row + (ulong)(pos / 128) * 132ul;
+        const uint gg = (uint)((pos / 32) % 4);
+        const uint il = (uint)((pos / 16) % 2);
+        const uint sb = uint(blk[128u + gg]);
+        // E8M0, as MX8R's.
+        const float s = sb == 0xffu ? NAN : exp2(float(sb) + (-127.0f));
+        device const uint * codes = (device const uint *)blk + 16u * il;
+        FOR_UNROLL(short i = 0; i < 16; ++i) {
+            reg[i / 4][i % 4] = (T)(rt_e4m3((codes[i] >> (8u * gg)) & 0xffu) * s);
+        }
+    }
+};
+
 // The scaled tiles' second argument block.
 struct Ink2RoutedArgs {
     float gate_beta;
@@ -767,3 +801,5 @@ INK2_ROUTED_ENTRY(nv4p_pair_f16, NV4P, true)
 INK2_ROUTED_ENTRY(nv4p_plain_f16, NV4P, false)
 INK2_ROUTED_ENTRY(mx8r_pair_f16, MX8R, true)
 INK2_ROUTED_ENTRY(mx8r_plain_f16, MX8R, false)
+INK2_ROUTED_ENTRY(mx8q_pair_f16, MX8Q, true)
+INK2_ROUTED_ENTRY(mx8q_plain_f16, MX8Q, false)

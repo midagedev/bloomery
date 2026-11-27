@@ -36,6 +36,7 @@ pub const MTP_WINDOWS: &str = "BLOOMERY_MTP_WINDOWS";
 pub const MTP_WIDTH: &str = "BLOOMERY_MTP_WIDTH";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const METAL_BREADCRUMB: &str = "BLOOMERY_METAL_BREADCRUMB";
+pub const METAL_MX8: &str = "BLOOMERY_METAL_MX8";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const XSTREAM: &str = "BLOOMERY_XSTREAM";
 pub const ELASTIC: &str = "BLOOMERY_ELASTIC";
@@ -1603,6 +1604,27 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               checkpoint's own `num_passes`, bit for bit. Read where the folder opens, in the \
               Inkling 2 folder reader, and over the GGUF header in the seat; the `load` line \
               prints `passes=`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: METAL_MX8,
+        class: Class::A,
+        kind: Kind::Words(&["quads", "rows"]),
+        default: Unset::Means("`quads` on an Inkling 2 run"),
+        doc: "`generate_metal` and `bloomery-serve-metal` on an Inkling 2 official checkpoint \
+              folder: the layout the MXFP8 coda's routed expert stacks (stored layers 20 to 23, \
+              the four coda visits of a step) are loaded in. `quads` (unset) holds four groups' \
+              codes interleaved a lane (a SIMD group loads 128 contiguous bytes for four \
+              groups) and reads them with an integer decode, in the decode mat-vec and the \
+              prompt pass's grouped tiles; `rows` is the 33-byte group of the folder's own \
+              order and the mat-vec that decodes with `exp2`, the same-binary arm. Same bytes, \
+              same launches, the same per-lane sum order: the output bits, the logits and the \
+              fault words are the same under both words (a difference is a defect). The stacks \
+              are written once at the load, one layout a session, so no setter changes it \
+              between calls. Refused by name on a file that is not an Inkling 2 one.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

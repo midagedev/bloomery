@@ -280,13 +280,15 @@ fn values(split: &Split, name: String, dims: &[u64]) -> Result<String, Refusal> 
     Ok(name)
 }
 
-/// `name` as a routed stack of `experts` experts of `rows` rows over `k`.
+/// `name` as a routed stack of `experts` experts of `rows` rows over `k`; an
+/// MXFP8 stack of the folder's coda is in the layout `mx8`.
 fn stack(
     split: &Split,
     name: String,
     experts: usize,
     rows: usize,
     k: usize,
+    mx8: NvfpLayout,
 ) -> Result<Stack, Refusal> {
     let t = find(split, &name)?;
     let planes = matches!(split.place(&name), Some(Place::Stack { .. }));
@@ -294,7 +296,7 @@ fn stack(
         (GgmlType::NVFP4, false) => NvfpLayout::Blocks,
         (GgmlType::NVFP4_ROWS, true) => NvfpLayout::Planes,
         (GgmlType::Q8_0, false) => NvfpLayout::Q8_0,
-        (GgmlType::MXFP8, true) => NvfpLayout::Mxfp8Rows,
+        (GgmlType::MXFP8, true) => mx8,
         (ty, _) => {
             return Err(Refusal(format!(
                 "{name} is {ty:?}{}; a routed stack launches NVFP4 (the GGUF's blocks or the \
@@ -336,10 +338,31 @@ fn stack(
 }
 
 /// Every refusal of the file `split` at a cache of `ctx` rows, in the order
-/// the open meets them, and the checked file when there is none.
+/// the open meets them, and the checked file when there is none: its MXFP8
+/// coda in the quads layout.
 #[must_use]
 pub fn check(split: &Split, ctx: usize) -> Outcome {
+    check_with(split, ctx, NvfpLayout::Mxfp8Quads)
+}
+
+/// [`check`] with the MXFP8 coda in the layout `mx8`: [`NvfpLayout::Mxfp8Quads`]
+/// or [`NvfpLayout::Mxfp8Rows`]. Another layout is a refusal.
+#[must_use]
+pub fn check_with(split: &Split, ctx: usize, mx8: NvfpLayout) -> Outcome {
     let mut items = Vec::new();
+    if !matches!(mx8, NvfpLayout::Mxfp8Quads | NvfpLayout::Mxfp8Rows) {
+        items.push(Item {
+            layer: None,
+            error: Refusal(format!(
+                "the MXFP8 coda's layout is {mx8:?}: the quads or the rows"
+            )),
+        });
+        return Outcome {
+            spec_line: None,
+            items,
+            checked: None,
+        };
+    }
     let spec = match model::arch::inkling2::spec::read(split) {
         Ok(read) => read.spec,
         Err(e) => {
@@ -354,7 +377,7 @@ pub fn check(split: &Split, ctx: usize) -> Outcome {
             };
         }
     };
-    let checked = read(split, &spec, ctx, &mut items);
+    let checked = read(split, &spec, ctx, mx8, &mut items);
     Outcome {
         spec_line: Some(arch_line(&spec)),
         checked: checked.filter(|_| items.is_empty()),
@@ -432,6 +455,7 @@ fn read(
     split: &Split,
     spec: &ModelSpec,
     ctx: usize,
+    mx8: NvfpLayout,
     items: &mut Vec<Item<Refusal>>,
 ) -> Option<Checked> {
     let refuse = |items: &mut Vec<Item<Refusal>>, detail: String| {
@@ -534,7 +558,14 @@ fn read(
             window = w as usize;
         }
         let core = (cs..ce).contains(&l);
-        match layer_plan(split, l, a.window.is_some(), core, hidden, ff, experts) {
+        match layer_plan(
+            split,
+            l,
+            a.window.is_some(),
+            core,
+            (hidden, ff, experts),
+            mx8,
+        ) {
             Ok(p) => layers.push(p),
             Err(e) => items.push(Item {
                 layer: Some(l),
@@ -629,16 +660,17 @@ fn read(
     })
 }
 
-/// Layer `l`'s tensors.
+/// Layer `l`'s tensors: `dims` the hidden, the experts' ff and the expert
+/// count, `mx8` the layout of an MXFP8 coda stack.
 fn layer_plan(
     split: &Split,
     l: usize,
     windowed: bool,
     core: bool,
-    hidden: usize,
-    ff: usize,
-    experts: usize,
+    dims: (usize, usize, usize),
+    mx8: NvfpLayout,
 ) -> Result<LayerPlan, Refusal> {
+    let (hidden, ff, experts) = dims;
     let n = |s: &str| format!("blk.{l}.{s}.weight");
     let h = hidden as u64;
     let norms = if windowed {
@@ -711,8 +743,8 @@ fn layer_plan(
             format!("blk.{l}.exp_probs_b.bias"),
             &[experts as u64],
         )?,
-        gate_up: stack(split, n("ffn_gate_up_exps"), experts, 2 * ff, hidden)?,
-        down: stack(split, n("ffn_down_exps"), experts, hidden, ff)?,
+        gate_up: stack(split, n("ffn_gate_up_exps"), experts, 2 * ff, hidden, mx8)?,
+        down: stack(split, n("ffn_down_exps"), experts, hidden, ff, mx8)?,
     })
 }
 

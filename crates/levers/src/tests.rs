@@ -755,6 +755,7 @@ fn accessors_read_their_rows() {
             AUTOTUNE,
             INK2_DENSE,
             INK2_PASSES,
+            METAL_MX8,
             INK2_LOOPCD,
             INK2_LOOPCD_REF,
             ROUTE_RESIDENT_BONUS,
@@ -962,6 +963,25 @@ fn schemajump_is_on_unless_off() {
         panic!("a word the row does not take is refused");
     };
     assert!(e.to_string().contains("BLOOMERY_SCHEMAJUMP"), "{e}");
+}
+
+/// `BLOOMERY_METAL_MX8` takes `quads` and `rows`, unset is no word (an Inkling 2
+/// run on the Metal backend reads it as `quads`), and any other word is refused
+/// by name.
+#[test]
+fn metal_mx8_takes_quads_and_rows() {
+    for w in ["quads", "rows"] {
+        let set = read(&env(&[(METAL_MX8, w)]), Scope::Every).expect("a word the row takes");
+        assert_eq!(set.metal_mx8(), Some(w));
+    }
+    let set = read(&env::<&str>(&[]), Scope::Every).expect("unset is no word");
+    assert_eq!(set.metal_mx8(), None);
+    for bad in ["planes", "Quads", "1", ""] {
+        let Err(other) = read(&env(&[(METAL_MX8, bad)]), Scope::Every) else {
+            panic!("{bad:?} is no word of the row");
+        };
+        assert!(other.to_string().contains(METAL_MX8), "{other}");
+    }
 }
 
 /// `BLOOMERY_MTP_WIDTH` takes its two words, unset is no word (a run that

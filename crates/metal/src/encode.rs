@@ -136,6 +136,14 @@ pub struct ComputeEncoder<'r> {
     count: EncodeCount,
     /// A dispatch was encoded since the last barrier.
     group_open: bool,
+    /// The groups a barrier has closed: the index of the group the next
+    /// dispatch belongs to.
+    closed: usize,
+    /// What the groups encoded from now on run, in the family's own numbers
+    /// (0: unnamed); it stays until the next [`ComputeEncoder::tag`].
+    tag: u8,
+    /// The profile's hold, when one asked for it.
+    probe: Option<Probe>,
     /// What this encoder was asked, for the encode trace.
     #[cfg(feature = "encode-trace")]
     trace: crate::trace::EncoderTrace,
@@ -149,6 +157,21 @@ pub struct EncodeCount {
     pub groups: usize,
     pub dispatches: usize,
     pub barriers: usize,
+}
+
+/// One group an encoder with a [`ComputeEncoder::probe_only`] hold saw: the
+/// tag in force at its first dispatch and the dispatches it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupRecord {
+    pub tag: u8,
+    pub dispatches: u32,
+}
+
+/// A profile's hold on an encoder: the one group it lets reach Metal, and
+/// the groups the encode walked past.
+struct Probe {
+    only: usize,
+    log: Vec<GroupRecord>,
 }
 
 impl core::ops::AddAssign for EncodeCount {
@@ -205,14 +228,20 @@ impl ComputeEncoder<'_> {
             max_threads_per_group: None,
             count: EncodeCount::default(),
             group_open: false,
+            closed: 0,
+            tag: 0,
+            probe: None,
             _recording: PhantomData,
         })
     }
 
     /// The pipeline the next dispatches run.
     pub fn set_pipeline(&mut self, pipeline: &Pipeline) {
-        self.encoder.setComputePipelineState(pipeline.metal());
         self.max_threads_per_group = Some(pipeline.max_threads_per_group());
+        if self.held_back() {
+            return;
+        }
+        self.encoder.setComputePipelineState(pipeline.metal());
         #[cfg(feature = "encode-trace")]
         self.trace.set_pipeline(pipeline);
     }
@@ -225,6 +254,9 @@ impl ComputeEncoder<'_> {
                 what: "binding",
                 detail: format!("index {index} is not below the {MAX_BINDINGS} slots"),
             });
+        }
+        if self.held_back() {
+            return Ok(());
         }
         let slot = to_ns(index);
         match binding.kind {
@@ -279,15 +311,57 @@ impl ComputeEncoder<'_> {
                 what: "dispatch",
                 detail: format!("{groups_x} groups of {threads_per_group} threads wrap"),
             })?;
-        self.submit(width, groups_y, threads_per_group);
-        #[cfg(feature = "encode-trace")]
-        self.trace.dispatch(groups_x, groups_y, threads_per_group);
+        if !self.held_back() {
+            self.submit(width, groups_y, threads_per_group);
+            #[cfg(feature = "encode-trace")]
+            self.trace.dispatch(groups_x, groups_y, threads_per_group);
+        }
         self.count.dispatches += 1;
         if !self.group_open {
             self.group_open = true;
             self.count.groups += 1;
+            if let Some(p) = &mut self.probe {
+                p.log.push(GroupRecord {
+                    tag: self.tag,
+                    dispatches: 0,
+                });
+            }
+        }
+        if let Some(g) = self.probe.as_mut().and_then(|p| p.log.last_mut()) {
+            g.dispatches += 1;
         }
         Ok(())
+    }
+
+    /// Name what the groups encoded from now on run, until the next tag: the
+    /// family's own number for it, 0 for none. A walk tags every group it
+    /// encodes, so a probe log reads each group's kind.
+    pub fn tag(&mut self, tag: impl Into<u8>) {
+        self.tag = tag.into();
+    }
+
+    /// Hold every group but group `only` (counted from 0, as a barrier
+    /// closes them) back from Metal: the walk runs as it does, every
+    /// binding checked and every dispatch counted, and the one group's
+    /// dispatches are all the command buffer holds. A profile runs the walk
+    /// once a group on a command buffer of its own this way.
+    pub fn probe_only(&mut self, only: usize) {
+        self.probe = Some(Probe {
+            only,
+            log: Vec::new(),
+        });
+    }
+
+    /// The groups the encode walked, each with the tag in force at its first
+    /// dispatch and its dispatches; empty without a [`ComputeEncoder::probe_only`].
+    #[must_use]
+    pub fn probe_log(&self) -> &[GroupRecord] {
+        self.probe.as_ref().map_or(&[], |p| &p.log)
+    }
+
+    /// The probe holds the group being encoded back.
+    fn held_back(&self) -> bool {
+        self.probe.as_ref().is_some_and(|p| p.only != self.closed)
     }
 
     /// What this encoder has encoded so far.
@@ -351,11 +425,16 @@ impl ComputeEncoder<'_> {
     /// call is still encoded. The barrier is the group's boundary, not a
     /// name for the group.
     pub fn memory_barrier(&mut self) {
-        self.encoder
-            .memoryBarrierWithScope(MTLBarrierScope::Buffers);
-        #[cfg(feature = "encode-trace")]
-        self.trace.barrier();
+        if !self.held_back() {
+            self.encoder
+                .memoryBarrierWithScope(MTLBarrierScope::Buffers);
+            #[cfg(feature = "encode-trace")]
+            self.trace.barrier();
+        }
         self.count.barriers += 1;
+        if self.group_open {
+            self.closed += 1;
+        }
         self.group_open = false;
     }
 
