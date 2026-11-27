@@ -774,6 +774,11 @@ generate_ds41   norm_proj_q8_f32_cols                    0           0
 generate_ds41   conv_res                                 0           0
 generate_ds41   loop_control                             0           0
 generate_ds41   qk_clip_append                           0           0
+# PIN(2026-11-27): qk_clip_conv_append (crates/gpu/src/qk_clip.rs), the decode step's k and v conv plus clip plus append in one launch: 0 spill and 0 JIT local on sm_120a (ptxas 13.3.73, 64 registers, no local depot, measured on the RTX 5090 at cc 12.0); the other tables carry the same 0/0 [derived: 64 registers is under every arch's 255 cap and the body holds no local array], not measured there until a scan on them runs.
+generate_ds41   qk_clip_conv_append                      0           0
+# PIN(2026-11-27): q8_0_gemv_conv_join and card_acc_8_conv_add (crates/gpu/src/linear/conv_tail.rs), the decode step's output projection with its post conv and join, and the card sum with its post conv and stream add, each in one launch: 0 spill and 0 JIT local on sm_120a (ptxas 13.3.73, 48 and 36 registers, no local depot, measured on the RTX 5090 at cc 12.0); the other tables carry the same 0/0 [derived: under every arch's 255-register cap and no local array in either body], not measured there until a scan on them runs.
+generate_ds41   q8_0_gemv_conv_join                      0           0
+generate_ds41   card_acc_8_conv_add                      0           0
 generate_ds41   rel_merge_h128                           0           0
 generate_ds41   rel_seg_h128                             0           0
 generate_ds41   rel_seg_h128_ring                        0           0

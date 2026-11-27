@@ -47,15 +47,32 @@
 //!    NaN input raises `linear_conv`, its own value of the token NaN and every other value of
 //!    the token finite (the conv is depthwise: one channel's NaN reaches no other channel).
 //!
+//! 9b. `conv_clip_is_the_pair`: the decode step's one launch for the k and v convs and the
+//!     epilogue (`qk_clip::enqueue_conv`) against the three launches it replaces (the k and v
+//!     `conv_res` calls, then `qk_clip::enqueue`), per token bit for bit — the query, relative,
+//!     key and value rows, the f16 planes and the conv ring — over a walk that starts at the
+//!     sequence head and wraps the ring, static and dynamic convs, a NaN input and an append
+//!     past the planes' end alike (the same fault word).
+//! 9c. `conv_tail_is_the_launches`: the output projection with its post conv and the join's add in
+//!     one launch (`conv_tail::enqueue_gemv_conv`, a Q8_0 projection at the files' 2,304 rows of
+//!     3,072 values) against `q8_0_gemv`, `conv_res` and the add it replaces, and the card
+//!     slots' eight-slot sum with the feed-forward's post conv and the stream's add in one launch
+//!     (`conv_tail::enqueue_card_acc_conv`) against `ds41_ffn_card_acc_8`, `conv_res` and the add —
+//!     per token bit for bit (the conv's output, the join, the sum) and the ring at the end, over a
+//!     walk that starts at the sequence head and wraps the ring; the projection with and without
+//!     the join (a block's first visit joins nothing) and with a NaN activation, the sum over
+//!     slots on the card, with host slots and with a place past the card (the same fault word).
 //! 10. `mix_step_is_the_mix`: the step mix (`attn_res_step`) at one row of every mix point's
 //!     shape — alone, run twice (the tickets back at zero between calls), and paired as the
 //!     second mix of a launch beside the four-query message mix — gives `enqueue_normed`'s bits;
 //!     a NaN bank value raises `f32_product` and every query row is NaN.
 //! 11. `norm_proj_is_the_sites`: the fused input norms and projections (`norm_proj`) at the
 //!     files' site shapes, with three inputs and with one, each with and without the conv taps,
-//!     give `rms_norm` and each site's own gemv's bits (`q8_0_gemv`, `f32_gemv`), the taps of a
-//!     launch without them unwritten; a NaN input value raises the norm's fault from the fused
-//!     launch, every site of that input NaN and the other inputs' sites their bits.
+//!     and at ragged rows (a Q8_0 site's last block of eight, a site of one block of eight,
+//!     F32 sites of one to three blocks), give `rms_norm` and each site's own gemv's bits
+//!     (`q8_0_gemv`, `f32_gemv`), the taps of a launch without them unwritten; a NaN input value
+//!     raises the norm's fault from the fused launch, every site of that input NaN and the other
+//!     inputs' sites their bits.
 //!
 //! The oracle clauses (`fx_ref_inkling2_a`, its positions' count read from the set, the fixture's
 //! 25-visit schedule — the stem 0-5, the core's three passes 6-11, 12-17, 18-23, the coda 24; the
@@ -95,11 +112,17 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::attn_res::{AttnResKernels, AttnResNormedArgs, MAX_NQ, MAX_VECS};
     use bloomery_gpu::attn_res_step::{AttnResStepKernels, MixStepScratch};
+    use bloomery_gpu::card_slots::{CardAcc, CardSlotKernels};
+    use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::linear::conv_res::{ConvResArgs, ConvResKernels};
+    use bloomery_gpu::linear::conv_tail::{
+        CardAccConvArgs, ConvTailKernels, GemvConvArgs, TailConvArgs,
+    };
     use bloomery_gpu::loop_control::{
         LoopControlArgs, LoopControlKernels, MAX_MODULES, MAX_N, MAX_RANK, OUT_COLS, scratch_len,
     };
     use bloomery_gpu::norm_proj::{F32Site, NormProjArgs, NormProjKernels, Q8Site};
+    use bloomery_gpu::qk_clip::{QkClipArgs, QkClipConv, QkClipKernels};
     use bloomery_gpu::{DeviceTensor, Fault, Gpu, GpuError};
     use bloomery_gpu_gates::tier::{self, Tier};
     use bloomery_gpu_gates::{
@@ -904,6 +927,10 @@ mod gate {
     /// (24 heads of 128, eight kv heads of 128, 16 relative rows a head), then the F32 `sink`,
     /// `kt` and `vt` (a sink a head, four conv taps a kv head).
     const PROJ_ROWS: [usize; 8] = [3072, 1024, 1024, 384, 3072, 24, 32, 32];
+    /// Rows no Q8_0 block of sixteen divides: sites whose last block walks eight (24, 40, 56), a
+    /// site of one block of eight (8) and one of exactly one block (16), and F32 sites of one to
+    /// three blocks of eight.
+    const PROJ_RAGGED: [usize; 8] = [24, 40, 8, 16, 56, 8, 16, 24];
     /// The input each site reads, at three inputs (`ik` 1, `iv` 2).
     const PROJ_INPUT: [usize; 8] = [0, 1, 2, 0, 0, 0, 1, 2];
     const PROJ_SITES: [&str; 8] = ["q", "k", "v", "rel", "gate", "sink", "kt", "vt"];
@@ -913,6 +940,7 @@ mod gate {
     /// One seeded `norm_proj` case: three input rows and their gains, the Q8_0 sites' words and
     /// f16 scales, the F32 sites' rows.
     struct ProjCase {
+        rows: [usize; 8],
         x: [Vec<f32>; 3],
         gain: [Vec<f32>; 3],
         q8: [(Vec<u32>, Vec<u16>); 5],
@@ -920,12 +948,12 @@ mod gate {
     }
 
     impl ProjCase {
-        fn new(seed: u64) -> ProjCase {
+        fn new(seed: u64, rows: [usize; 8]) -> ProjCase {
             let mut r = GateRng(seed);
             let x = std::array::from_fn(|_| fill(&mut r, N, -2.0, 2.0));
             let gain = std::array::from_fn(|_| fill(&mut r, N, 0.5, 1.5));
             let q8 = std::array::from_fn(|i| {
-                let rows = PROJ_ROWS[i];
+                let rows = rows[i];
                 let words = (0..rows * N / 4)
                     .map(|_| r.below(1 << 16) as u32 | ((r.below(1 << 16) as u32) << 16))
                     .collect();
@@ -937,16 +965,22 @@ mod gate {
                     .collect();
                 (words, scales)
             });
-            let f32w = std::array::from_fn(|i| fill(&mut r, PROJ_ROWS[5 + i] * N, -0.1, 0.1));
-            ProjCase { x, gain, q8, f32w }
+            let f32w = std::array::from_fn(|i| fill(&mut r, rows[5 + i] * N, -0.1, 0.1));
+            ProjCase {
+                rows,
+                x,
+                gain,
+                q8,
+                f32w,
+            }
         }
     }
 
     /// Eight outputs at the sites' rows, every value [`UNWRITTEN`].
-    fn unwritten(gpu: &Gpu) -> Result<[DeviceBuffer<f32>; 8], GateError> {
+    fn unwritten(gpu: &Gpu, rows: &[usize; 8]) -> Result<[DeviceBuffer<f32>; 8], GateError> {
         let s = gpu.stream();
         let y = |i: usize| -> Result<DeviceBuffer<f32>, GateError> {
-            Ok(DeviceBuffer::from_host(s, &vec![UNWRITTEN; PROJ_ROWS[i]])?)
+            Ok(DeviceBuffer::from_host(s, &vec![UNWRITTEN; rows[i]])?)
         };
         Ok([y(0)?, y(1)?, y(2)?, y(3)?, y(4)?, y(5)?, y(6)?, y(7)?])
     }
@@ -976,16 +1010,16 @@ mod gate {
         let mut q8 = Vec::new();
         for (i, (words, scales)) in case.q8.iter().enumerate() {
             q8.push((
-                DeviceTensor::upload(s, words, PROJ_ROWS[i], N / 4)?,
-                DeviceTensor::upload(s, scales, PROJ_ROWS[i], N / 32)?,
+                DeviceTensor::upload(s, words, case.rows[i], N / 4)?,
+                DeviceTensor::upload(s, scales, case.rows[i], N / 32)?,
             ));
         }
         let mut f32w = Vec::new();
         for (i, w) in case.f32w.iter().enumerate() {
-            f32w.push(DeviceTensor::upload(s, w, PROJ_ROWS[5 + i], N)?);
+            f32w.push(DeviceTensor::upload(s, w, case.rows[5 + i], N)?);
         }
-        let mut want = unwritten(gpu)?;
-        let mut card = unwritten(gpu)?;
+        let mut want = unwritten(gpu, &case.rows)?;
+        let mut card = unwritten(gpu, &case.rows)?;
         let mut xn = Vec::new();
         for (x, g) in xs.iter().zip(&gs) {
             let mut y = DeviceBuffer::zeroed(s, N)?;
@@ -1052,27 +1086,38 @@ mod gate {
     /// Clause `norm_proj_is_the_sites` (module doc, clause 11).
     fn norm_proj_clauses(gpu: &Gpu) -> Result<Vec<bool>, GateError> {
         let k = NormProjKernels::load(gpu.context())?;
-        let case = ProjCase::new(0x1e2a_0200);
+        let case = ProjCase::new(0x1e2a_0200, PROJ_ROWS);
+        let ragged = ProjCase::new(0x1e2a_0201, PROJ_RAGGED);
         let mut out = Vec::new();
-        for (n_in, taps) in [(3, true), (1, false), (3, false), (1, true)] {
-            let (want, card, fault) = proj_run(gpu, &k, &case, n_in, taps)?;
-            let off: Vec<&str> = PROJ_SITES
-                .iter()
-                .zip(want.iter().zip(&card))
-                .filter(|(_, (w, c))| !bits_equal(w, c))
-                .map(|(name, _)| *name)
-                .collect();
-            let kept = taps
-                || card[6..]
+        for (shape, c, combos) in [
+            (
+                "the sites' shapes",
+                &case,
+                &[(3, true), (1, false), (3, false), (1, true)][..],
+            ),
+            ("ragged rows", &ragged, &[(3, true), (1, false)][..]),
+        ] {
+            for &(n_in, taps) in combos {
+                let (want, card, fault) = proj_run(gpu, &k, c, n_in, taps)?;
+                let off: Vec<&str> = PROJ_SITES
                     .iter()
-                    .all(|y| y.iter().all(|v| v.to_bits() == UNWRITTEN.to_bits()));
-            let pass = off.is_empty() && kept && fault.is_none();
-            println!(
-                "  norm_proj_is_the_sites {n_in} input(s), taps {taps}: sites off rms_norm and \
-                 their gemvs' bits {off:?}, unrun taps unwritten {kept}, fault={fault:?}: {}",
-                verdict(pass)
-            );
-            out.push(pass);
+                    .zip(want.iter().zip(&card))
+                    .filter(|(_, (w, c))| !bits_equal(w, c))
+                    .map(|(name, _)| *name)
+                    .collect();
+                let kept = taps
+                    || card[6..]
+                        .iter()
+                        .all(|y| y.iter().all(|v| v.to_bits() == UNWRITTEN.to_bits()));
+                let pass = off.is_empty() && kept && fault.is_none();
+                println!(
+                    "  norm_proj_is_the_sites {shape}, {n_in} input(s), taps {taps}: sites off \
+                     rms_norm and their gemvs' bits {off:?}, unrun taps unwritten {kept}, \
+                     fault={fault:?}: {}",
+                    verdict(pass)
+                );
+                out.push(pass);
+            }
         }
         let mut bad = case;
         bad.x[0][7] = f32::NAN;
@@ -1365,6 +1410,634 @@ mod gate {
         );
         gpu.clear_fault()?;
         out.push(pass);
+        Ok(out)
+    }
+
+    /// The epilogue's attention shape: heads and key-value heads of [`HEAD`] values, the
+    /// relative rows of [`REL`].
+    const N_HEAD: usize = 24;
+    const HEAD: usize = 128;
+    const REL: usize = 16;
+
+    /// One token's seeded inputs of the fused launch's case: the epilogue's rows and the convs'
+    /// inputs and dynamic taps.
+    struct ClipToken {
+        q: Vec<f32>,
+        r: Vec<f32>,
+        kx: Vec<f32>,
+        vx: Vec<f32>,
+        kd: Vec<f32>,
+        vd: Vec<f32>,
+        tau: f32,
+    }
+
+    /// One chain's device state: the rows the epilogue edits in place, the f16 planes and the
+    /// conv ring.
+    struct ClipChain {
+        k: DeviceBuffer<f32>,
+        v: DeviceBuffer<f32>,
+        cache_k: DeviceBuffer<u16>,
+        cache_v: DeviceBuffer<u16>,
+        ring: DeviceBuffer<f32>,
+    }
+
+    impl ClipChain {
+        fn new(gpu: &Gpu, ctx: usize, ch: usize) -> Result<ClipChain, GateError> {
+            let s = gpu.stream();
+            let kv = KV_HEADS * HEAD;
+            Ok(ClipChain {
+                k: DeviceBuffer::zeroed(s, kv)?,
+                v: DeviceBuffer::zeroed(s, kv)?,
+                cache_k: DeviceBuffer::zeroed(s, KV_HEADS * ctx * HEAD)?,
+                cache_v: DeviceBuffer::zeroed(s, KV_HEADS * ctx * HEAD)?,
+                ring: DeviceBuffer::zeroed(s, Ring::new(TAPS).rows() * ch)?,
+            })
+        }
+    }
+
+    /// The case's shared weights and positions: the convs' filters, the clip's channel scales.
+    struct ClipCase {
+        heads: usize,
+        ctx: usize,
+        wk: DeviceBuffer<f32>,
+        wv: DeviceBuffer<f32>,
+        gq: DeviceBuffer<f32>,
+        gr: DeviceBuffer<f32>,
+        tokens: Vec<ClipToken>,
+    }
+
+    impl ClipCase {
+        /// `len` tokens, dynamic convs at `heads` (0 static), the planes `ctx` rows. The key
+        /// rows of head `h` carry the scale `0.3 + 0.5 h`, so the clip bites on some heads and
+        /// not on others; `nan_at` puts a NaN into that token's key input.
+        fn new(
+            gpu: &Gpu,
+            seed: u64,
+            (heads, len, ctx): (usize, usize, usize),
+            nan_at: Option<usize>,
+        ) -> Result<ClipCase, GateError> {
+            let s = gpu.stream();
+            let mut r = GateRng(seed);
+            let kv = KV_HEADS * HEAD;
+            let tokens = (0..len)
+                .map(|t| {
+                    let rows = |r: &mut GateRng, n: usize| -> Vec<f32> {
+                        (0..n)
+                            .map(|i| {
+                                r.uni(-1.0, 1.0) * (0.3 + 0.5 * ((i / HEAD) % KV_HEADS) as f32)
+                            })
+                            .collect()
+                    };
+                    let mut kx = rows(&mut r, kv);
+                    if nan_at == Some(t) {
+                        kx[5] = f32::NAN;
+                    }
+                    ClipToken {
+                        q: fill(&mut r, N_HEAD * HEAD, -3.0, 3.0),
+                        r: fill(&mut r, N_HEAD * REL, -2.0, 2.0),
+                        kx,
+                        vx: rows(&mut r, kv),
+                        kd: fill(&mut r, heads * TAPS, -0.5, 0.5),
+                        vd: fill(&mut r, heads * TAPS, -0.5, 0.5),
+                        tau: if heads > 0 {
+                            1.0 + 0.01 * t as f32
+                        } else {
+                            1.0
+                        },
+                    }
+                })
+                .collect();
+            Ok(ClipCase {
+                heads,
+                ctx,
+                wk: DeviceBuffer::from_host(s, &fill(&mut r, kv * TAPS, -1.0, 1.0))?,
+                wv: DeviceBuffer::from_host(s, &fill(&mut r, kv * TAPS, -1.0, 1.0))?,
+                gq: DeviceBuffer::from_host(s, &fill(&mut r, N_HEAD * HEAD, 0.5, 2.0))?,
+                gr: DeviceBuffer::from_host(s, &fill(&mut r, N_HEAD * REL, 0.5, 1.5))?,
+                tokens,
+            })
+        }
+
+        /// The walk once on the pair of launches (`fused` false) or on the one launch: each
+        /// token's query, relative, key and value rows, every `every` tokens and at the end the
+        /// planes and the ring, the fault word at the end.
+        fn run(
+            &self,
+            gpu: &Gpu,
+            (conv, clip): (&ConvResKernels, &QkClipKernels),
+            fused: bool,
+            every: usize,
+        ) -> Result<(Vec<Vec<f32>>, String), GateError> {
+            let s = gpu.stream();
+            let ring = Ring::new(TAPS);
+            let kv = KV_HEADS * HEAD;
+            let mut c = ClipChain::new(gpu, self.ctx, RING_CH)?;
+            let mut seen = Vec::new();
+            gpu.clear_fault()?;
+            for (t, tok) in self.tokens.iter().enumerate() {
+                let kx = DeviceBuffer::from_host(s, &tok.kx)?;
+                let vx = DeviceBuffer::from_host(s, &tok.vx)?;
+                // A static conv's taps stay one value: a zero-length allocation is not one the
+                // card makes, and the launch reads no tap then.
+                let taps_of = |v: &Vec<f32>| -> Result<DeviceBuffer<f32>, GateError> {
+                    Ok(DeviceBuffer::from_host(
+                        s,
+                        if v.is_empty() { &[0.0] } else { &v[..] },
+                    )?)
+                };
+                let (kd, vd) = (taps_of(&tok.kd)?, taps_of(&tok.vd)?);
+                let mut q = DeviceBuffer::from_host(s, &tok.q)?;
+                let mut r = DeviceBuffer::from_host(s, &tok.r)?;
+                let tau = DeviceBuffer::from_host(s, &[tok.tau])?;
+                let pos = DeviceBuffer::from_host(s, &[t as u32])?;
+                let scale = if self.heads > 0 {
+                    scale_dynamic()
+                } else {
+                    scale_static()
+                };
+                macro_rules! clip_args {
+                    () => {
+                        QkClipArgs {
+                            q: &mut q,
+                            k: &mut c.k,
+                            v: &mut c.v,
+                            r: &mut r,
+                            gq: &self.gq,
+                            gr: &self.gr,
+                            tau: &tau,
+                            pos: &pos,
+                            v_eps: EPS,
+                            qk_thresh: 22.627_417,
+                            r_thresh: 8.0,
+                            n_head: N_HEAD,
+                            n_kv: KV_HEADS,
+                            ctx: self.ctx,
+                            m: 1,
+                            fault: gpu.unlabelled_sink(),
+                            cache_k: &mut c.cache_k,
+                            cache_v: &mut c.cache_v,
+                        }
+                    };
+                }
+                if fused {
+                    clip.enqueue_conv(
+                        s,
+                        clip_args!(),
+                        QkClipConv {
+                            ring,
+                            ch: RING_CH,
+                            base: [K_BASE, K_BASE + kv],
+                            heads: self.heads,
+                            scale,
+                            x: [&kx, &vx],
+                            weights: [&self.wk, &self.wv],
+                            dynamic: [&kd, &vd],
+                            pos: &pos,
+                            state: &mut c.ring,
+                        },
+                    )?;
+                } else {
+                    for (j, (x, w, dynamic, y)) in [
+                        (&kx, &self.wk, &kd, &mut c.k),
+                        (&vx, &self.wv, &vd, &mut c.v),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        conv.enqueue(
+                            s,
+                            ConvResArgs {
+                                ring,
+                                d: kv,
+                                base: K_BASE + j * kv,
+                                ch: RING_CH,
+                                heads: self.heads,
+                                m: 1,
+                                x,
+                                weights: w,
+                                dynamic,
+                                pos: &pos,
+                                fault: gpu.unlabelled_sink(),
+                                scale,
+                                y,
+                                state: &mut c.ring,
+                            },
+                        )?;
+                    }
+                    clip.enqueue(s, clip_args!())?;
+                }
+                s.synchronize()?;
+                let mut row = [
+                    q.to_host_vec(s)?,
+                    r.to_host_vec(s)?,
+                    c.k.to_host_vec(s)?,
+                    c.v.to_host_vec(s)?,
+                ]
+                .concat();
+                if (t + 1) % every == 0 || t + 1 == self.tokens.len() {
+                    row.extend(c.ring.to_host_vec(s)?);
+                    row.extend(c.cache_k.to_host_vec(s)?.iter().map(|b| f32::from(*b)));
+                    row.extend(c.cache_v.to_host_vec(s)?.iter().map(|b| f32::from(*b)));
+                }
+                seen.push(row);
+            }
+            let fault = format!("{:?}", gpu.fault()?);
+            gpu.clear_fault()?;
+            Ok((seen, fault))
+        }
+    }
+
+    fn conv_clip_clauses(
+        gpu: &Gpu,
+        conv: &ConvResKernels,
+        clip: &QkClipKernels,
+    ) -> Result<Vec<bool>, GateError> {
+        let mut out = Vec::new();
+        let len = Ring::new(TAPS).rows() + 6;
+        // (what, dynamic heads, tokens, plane rows, NaN at)
+        let cases: &[(&str, usize, usize, usize, Option<usize>)] = &[
+            ("a windowed visit, static convs", 0, len, len, None),
+            (
+                "a windowless visit, dynamic convs",
+                KV_HEADS,
+                len,
+                len,
+                None,
+            ),
+            ("a NaN key input at the fourth token", 0, 8, 8, Some(3)),
+            ("an append past the planes' end", KV_HEADS, 8, 5, None),
+        ];
+        for (i, &(what, heads, n, ctx, nan_at)) in cases.iter().enumerate() {
+            let case = ClipCase::new(gpu, 0xc11b_0000 + i as u64, (heads, n, ctx), nan_at)?;
+            let (pair, pair_fault) = case.run(gpu, (conv, clip), false, 64)?;
+            let (fused, fused_fault) = case.run(gpu, (conv, clip), true, 64)?;
+            let bits = pair.len() == fused.len()
+                && pair.iter().zip(&fused).all(|(a, b)| {
+                    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+                });
+            // The fault word is the pair's: none on a clean walk, the same site on a faulty one.
+            let faults_expected = nan_at.is_some() || ctx < n;
+            let pass =
+                bits && pair_fault == fused_fault && (pair_fault != "None") == faults_expected;
+            println!(
+                "  conv_clip_is_the_pair {what} ({n} tokens, planes of {ctx} rows): bits {} fault \
+                 pair={pair_fault} fused={fused_fault}: {}",
+                if bits { "equal" } else { "differ" },
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+        Ok(out)
+    }
+
+    /// The tail clauses' shapes: the output projection's 3,072 values a row, the feed-forward's
+    /// post conv at its offset in the ring, the card's slots a token and the places the card
+    /// holds.
+    const O_K: usize = 3072;
+    const FFN_BASE: usize = 4352;
+    const CARD_SLOTS: usize = 8;
+    const N_CARD: usize = 128;
+    /// What the join's output holds before a launch that does not write it.
+    const JOIN_UNWRITTEN: f32 = -5.5;
+
+    /// One tail walk's token rows and filters: the stream's rows and the conv's filters of a
+    /// seeded walk of `len` tokens, positions `0..len` at the sequence head.
+    struct TailWalk {
+        len: usize,
+        w: Vec<f32>,
+        stream: Vec<Vec<f32>>,
+    }
+
+    impl TailWalk {
+        fn new(r: &mut GateRng, len: usize) -> TailWalk {
+            TailWalk {
+                len,
+                w: fill(r, N * TAPS, -1.0, 1.0),
+                stream: (0..len).map(|_| fill(r, N, -2.0, 2.0)).collect(),
+            }
+        }
+    }
+
+    /// Each token's values the walk leaves, the ring after the last one, and the fault word.
+    type TailOut = (Vec<Vec<f32>>, String);
+
+    /// The projection's case: Q8_0 planes at the output projection's shape and a token's
+    /// activations a position.
+    struct GemvCase {
+        walk: TailWalk,
+        words: Vec<u32>,
+        scales: Vec<u16>,
+        x: Vec<Vec<f32>>,
+    }
+
+    impl GemvCase {
+        /// `nan_at` puts a NaN into that token's activations.
+        fn new(seed: u64, len: usize, nan_at: Option<usize>) -> GemvCase {
+            let mut r = GateRng(seed);
+            let walk = TailWalk::new(&mut r, len);
+            let words = (0..N * O_K / 4)
+                .map(|_| r.below(1 << 16) as u32 | ((r.below(1 << 16) as u32) << 16))
+                .collect();
+            // Normal f16 scales of either sign in [2^-7, 2^-2).
+            let scales = (0..N * O_K / 32)
+                .map(|_| ((r.below(2) << 15) | ((8 + r.below(5)) << 10) | r.below(1 << 10)) as u16)
+                .collect();
+            let x = (0..len)
+                .map(|t| {
+                    let mut x = fill(&mut r, O_K, -1.0, 1.0);
+                    if nan_at == Some(t) {
+                        x[7] = f32::NAN;
+                    }
+                    x
+                })
+                .collect();
+            GemvCase {
+                walk,
+                words,
+                scales,
+                x,
+            }
+        }
+
+        /// The walk on the three launches (`fused` false) or the one, `join` as a block's later
+        /// visits have it: per token the conv's output and the join's row, then the ring.
+        fn run(
+            &self,
+            gpu: &Gpu,
+            (conv, tail): (&ConvResKernels, &ConvTailKernels),
+            fused: bool,
+            join: bool,
+        ) -> Result<TailOut, GateError> {
+            let s = gpu.stream();
+            let ring = Ring::new(TAPS);
+            let qs = DeviceTensor::upload(s, &self.words, N, O_K / 4)?;
+            let d = DeviceTensor::upload(s, &self.scales, N, O_K / 32)?;
+            let w = DeviceBuffer::from_host(s, &self.walk.w)?;
+            let none = DeviceBuffer::from_host(s, &[0.0f32])?;
+            let mut state = DeviceBuffer::zeroed(s, ring.rows() * RING_CH)?;
+            let mut seen = Vec::new();
+            gpu.clear_fault()?;
+            for t in 0..self.walk.len {
+                let x = DeviceBuffer::from_host(s, &self.x[t])?;
+                let stream = DeviceBuffer::from_host(s, &self.walk.stream[t])?;
+                let pos = DeviceBuffer::from_host(s, &[t as u32])?;
+                let mut out = DeviceBuffer::zeroed(s, N)?;
+                let mut joined = DeviceBuffer::from_host(s, &vec![JOIN_UNWRITTEN; N])?;
+                if fused {
+                    tail.enqueue_gemv_conv(
+                        s,
+                        GemvConvArgs {
+                            qs: &qs,
+                            d: &d,
+                            x: &x,
+                            conv: TailConvArgs {
+                                ring,
+                                ch: RING_CH,
+                                base: POST_BASE,
+                                scale: scale_static(),
+                                weights: &w,
+                                pos: &pos,
+                                state: &mut state,
+                            },
+                            join,
+                            stream: &stream,
+                            fault: gpu.unlabelled_sink(),
+                            out: &mut out,
+                            joined: &mut joined,
+                        },
+                    )?;
+                } else {
+                    let mut o = DeviceBuffer::zeroed(s, N)?;
+                    gpu.q8f32().enqueue_q8_0_gemv(s, &qs, &d, &x, 1, &mut o)?;
+                    conv.enqueue(
+                        s,
+                        ConvResArgs {
+                            ring,
+                            d: N,
+                            base: POST_BASE,
+                            ch: RING_CH,
+                            heads: 0,
+                            m: 1,
+                            x: &o,
+                            weights: &w,
+                            dynamic: &none,
+                            pos: &pos,
+                            fault: gpu.unlabelled_sink(),
+                            scale: scale_static(),
+                            y: &mut out,
+                            state: &mut state,
+                        },
+                    )?;
+                    if join {
+                        gpu.elem().enqueue_add(s, &stream, &out, N, &mut joined)?;
+                    }
+                }
+                s.synchronize()?;
+                let mut row = out.to_host_vec(s)?;
+                row.extend(joined.to_host_vec(s)?);
+                seen.push(row);
+            }
+            seen.push(state.to_host_vec(s)?);
+            let fault = format!("{:?}", gpu.fault()?);
+            gpu.clear_fault()?;
+            Ok((seen, fault))
+        }
+    }
+
+    /// The card sum's case: a token's slots' down rows, routing weights and places a position.
+    struct SumCase {
+        walk: TailWalk,
+        down: Vec<Vec<f32>>,
+        w: Vec<Vec<f32>>,
+        sel: Vec<Vec<u32>>,
+    }
+
+    impl SumCase {
+        /// Every token's places drawn on the card; `host` slots of each are the host's and
+        /// `past` puts the first token's slot 3 at a place that is neither.
+        fn new(seed: u64, len: usize, (host, past): (&[usize], bool)) -> SumCase {
+            let mut r = GateRng(seed);
+            let walk = TailWalk::new(&mut r, len);
+            let down = (0..len)
+                .map(|_| fill(&mut r, CARD_SLOTS * N, -1.0, 1.0))
+                .collect();
+            let w = (0..len)
+                .map(|_| fill(&mut r, CARD_SLOTS, 0.05, 0.5))
+                .collect();
+            let sel = (0..len)
+                .map(|t| {
+                    let mut sel: Vec<u32> =
+                        (0..CARD_SLOTS).map(|_| r.below(N_CARD) as u32).collect();
+                    for &j in host {
+                        sel[j] = HOST;
+                    }
+                    if past && t == 0 {
+                        sel[3] = N_CARD as u32 + 7;
+                    }
+                    sel
+                })
+                .collect();
+            SumCase { walk, down, w, sel }
+        }
+
+        /// The walk on the three launches or the one: per token the sum, the conv's output and
+        /// the join's row, then the ring.
+        fn run(
+            &self,
+            gpu: &Gpu,
+            (conv, slots, tail): (&ConvResKernels, &CardSlotKernels, &ConvTailKernels),
+            fused: bool,
+        ) -> Result<TailOut, GateError> {
+            let s = gpu.stream();
+            let ring = Ring::new(TAPS);
+            let cw = DeviceBuffer::from_host(s, &self.walk.w)?;
+            let none = DeviceBuffer::from_host(s, &[0.0f32])?;
+            let mut state = DeviceBuffer::zeroed(s, ring.rows() * RING_CH)?;
+            let mut seen = Vec::new();
+            gpu.clear_fault()?;
+            for t in 0..self.walk.len {
+                let down = DeviceBuffer::from_host(s, &self.down[t])?;
+                let w = DeviceBuffer::from_host(s, &self.w[t])?;
+                let sel = DeviceBuffer::from_host(s, &self.sel[t])?;
+                let inp = DeviceBuffer::from_host(s, &self.walk.stream[t])?;
+                let pos = DeviceBuffer::from_host(s, &[t as u32])?;
+                let mut acc = DeviceBuffer::zeroed(s, N)?;
+                let mut out = DeviceBuffer::zeroed(s, N)?;
+                let mut y = DeviceBuffer::zeroed(s, N)?;
+                if fused {
+                    tail.enqueue_card_acc_conv(
+                        s,
+                        CardAccConvArgs {
+                            down: &down,
+                            w: &w,
+                            sel: &sel,
+                            n_card: N_CARD,
+                            n: N,
+                            conv: TailConvArgs {
+                                ring,
+                                ch: RING_CH,
+                                base: FFN_BASE,
+                                scale: scale_static(),
+                                weights: &cw,
+                                pos: &pos,
+                                state: &mut state,
+                            },
+                            inp: &inp,
+                            fault: gpu.unlabelled_sink(),
+                            acc: &mut acc,
+                            conv_out: &mut out,
+                            y: &mut y,
+                        },
+                    )?;
+                } else {
+                    slots.enqueue_card_acc(
+                        s,
+                        &CardAcc {
+                            down: &down,
+                            w: &w,
+                            sel: &sel,
+                            n: N,
+                            m: 1,
+                            n_card: N_CARD,
+                            n_used: CARD_SLOTS,
+                            w_pitch: CARD_SLOTS,
+                            fault: gpu.unlabelled_sink(),
+                        },
+                        &mut acc,
+                    )?;
+                    conv.enqueue(
+                        s,
+                        ConvResArgs {
+                            ring,
+                            d: N,
+                            base: FFN_BASE,
+                            ch: RING_CH,
+                            heads: 0,
+                            m: 1,
+                            x: &acc,
+                            weights: &cw,
+                            dynamic: &none,
+                            pos: &pos,
+                            fault: gpu.unlabelled_sink(),
+                            scale: scale_static(),
+                            y: &mut out,
+                            state: &mut state,
+                        },
+                    )?;
+                    gpu.elem().enqueue_add(s, &inp, &out, N, &mut y)?;
+                }
+                s.synchronize()?;
+                let mut row = acc.to_host_vec(s)?;
+                row.extend(out.to_host_vec(s)?);
+                row.extend(y.to_host_vec(s)?);
+                seen.push(row);
+            }
+            seen.push(state.to_host_vec(s)?);
+            let fault = format!("{:?}", gpu.fault()?);
+            gpu.clear_fault()?;
+            Ok((seen, fault))
+        }
+    }
+
+    /// Whether a fused walk and the launches' walk agree: every value's bits and the fault word,
+    /// which is clean exactly where `faults` says the case raises.
+    fn tail_agrees(pair: &TailOut, fused: &TailOut, faults: bool) -> (bool, bool) {
+        let bits = pair.0.len() == fused.0.len()
+            && pair.0.iter().zip(&fused.0).all(|(a, b)| same_bits(a, b));
+        (
+            bits,
+            bits && pair.1 == fused.1 && (pair.1 != "None") == faults,
+        )
+    }
+
+    fn conv_tail_clauses(
+        gpu: &Gpu,
+        (conv, slots, tail): (&ConvResKernels, &CardSlotKernels, &ConvTailKernels),
+    ) -> Result<Vec<bool>, GateError> {
+        let mut out = Vec::new();
+        let len = Ring::new(TAPS).rows() + 6;
+        // (what, join, NaN at)
+        let gemv: &[(&str, bool, Option<usize>)] = &[
+            ("a later visit of a block, joined", true, None),
+            ("a block's first visit, nothing joined", false, None),
+            ("a NaN activation at the fourth token", true, Some(3)),
+        ];
+        for (i, &(what, join, nan_at)) in gemv.iter().enumerate() {
+            let case = GemvCase::new(0x7a11_0000 + i as u64, len, nan_at);
+            let pair = case.run(gpu, (conv, tail), false, join)?;
+            let fused = case.run(gpu, (conv, tail), true, join)?;
+            let (bits, pass) = tail_agrees(&pair, &fused, nan_at.is_some());
+            println!(
+                "  conv_tail_is_the_launches the output projection, {what} ({len} tokens): bits \
+                 {} fault pair={} fused={}: {}",
+                if bits { "equal" } else { "differ" },
+                pair.1,
+                fused.1,
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+        // (what, host slots, a place past the card)
+        let sums: &[(&str, &[usize], bool)] = &[
+            ("every slot on the card", &[], false),
+            ("two slots on the host", &[2, 5], false),
+            ("a place past the card at the first token", &[], true),
+        ];
+        for (i, &(what, host, past)) in sums.iter().enumerate() {
+            let case = SumCase::new(0x7a22_0000 + i as u64, len, (host, past));
+            let pair = case.run(gpu, (conv, slots, tail), false)?;
+            let fused = case.run(gpu, (conv, slots, tail), true)?;
+            let (bits, pass) = tail_agrees(&pair, &fused, past);
+            println!(
+                "  conv_tail_is_the_launches the card sum, {what} ({len} tokens): bits {} fault \
+                 pair={} fused={}: {}",
+                if bits { "equal" } else { "differ" },
+                pair.1,
+                fused.1,
+                verdict(pass)
+            );
+            out.push(pass);
+        }
         Ok(out)
     }
 
@@ -2063,6 +2736,9 @@ mod gate {
         let mix = AttnResKernels::load(ctx)?;
         let control = LoopControlKernels::load(ctx)?;
         let conv = ConvResKernels::load(ctx)?;
+        let clip = QkClipKernels::load(ctx)?;
+        let tail = ConvTailKernels::load(ctx)?;
+        let slots = CardSlotKernels::load(ctx)?;
         let mut results = Vec::new();
         results.extend(mix_clauses(&gpu, &mix)?);
         results.extend(mix_faults(&gpu, &mix)?);
@@ -2070,6 +2746,8 @@ mod gate {
         results.extend(norm_proj_clauses(&gpu)?);
         results.extend(control_clauses(&gpu, &control)?);
         results.extend(conv_clauses(&gpu, &conv)?);
+        results.extend(conv_clip_clauses(&gpu, &conv, &clip)?);
+        results.extend(conv_tail_clauses(&gpu, (&conv, &slots, &tail))?);
         results.extend(refusal_clauses(&gpu, &mix, &control, &conv)?);
         results.extend(oracle_clauses(&gpu, &mix, &control)?);
         let failed = results.iter().filter(|p| !**p).count();

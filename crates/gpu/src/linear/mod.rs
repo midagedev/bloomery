@@ -60,6 +60,7 @@
 
 pub mod conv;
 pub mod conv_res;
+pub mod conv_tail;
 pub mod delta;
 pub mod mixer_kda;
 pub mod norm_gate;

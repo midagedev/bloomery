@@ -619,10 +619,13 @@ mod gate {
     /// visit: its attention mix (a layer past the first), the input norms (one on a windowed visit
     /// without messages, else three), six projections plus a windowless visit's two conv taps —
     /// one launch for them all on a layer `norm_proj` names (the body's `norm_proj`) — the
-    /// k and v convs, the epilogue, the attention's two launches (segments, merge), the output
-    /// gate, the output projection, its post conv and the join (a copy or an add); the
-    /// feed-forward's mix, norm and router, the card leg's four launches and its sum, the post
-    /// conv and the stream's add; a visit with messages runs the message mix in its attention
+    /// epilogue (one launch with the k and v convs inside), the attention's two launches
+    /// (segments, merge), the output gate, the output projection — one launch with the post conv
+    /// and the join's add where the projection is Q8_0 (the body's `o_tail`), a block's first
+    /// visit then adding nothing but copying the stream to its bank; else the projection, its
+    /// post conv and the join (a copy or an add); the feed-forward's mix, norm and router, the
+    /// card leg's four launches and its sum (one launch with the post conv and the stream's
+    /// add); a visit with messages runs the message mix in its attention
     /// mix's pair and adds two controller launch pairs. A pass edge copies the stream (pass 0) or
     /// the bank, its last row and the prelude back (a bank of no row copies nothing). The step
     /// opens with the embedding's lookup and norm and closes with the head's mix, norm,
@@ -632,11 +635,18 @@ mod gate {
     pub(super) fn derived_nodes(
         hp: &Hparams,
         table: &[(u32, u32)],
-        norm_proj: &[bool],
+        (norm_proj, o_tail): (&[bool], &[bool]),
         loopcd: Option<u32>,
     ) -> (usize, String) {
         const MIX: usize = 2;
-        const VISIT: usize = 2 + 1 + 2 + 1 + 1 + 1 + 1 + MIX + 1 + 1 + 5 + 1 + 1;
+        // PIN(2026-11-27): the k and v convs run inside the epilogue's launch, so the visit's first
+        // term is 1 where it was 2 + 1 (-2 a visit, -96 a step).
+        // PIN(2026-11-27): the feed-forward's post conv and add run in the card sum's launch
+        // (-2 a visit), and a Q8_0 output projection runs its post conv and the join's add in its
+        // own launch (-2 a visit, -1 on a block's first visit, which still copies the stream):
+        // the visit's terms below are the epilogue, the attention's two, the gate, the output
+        // projection, the feed-forward's mix, norm and router and the card leg's five.
+        const VISIT: usize = 1 + 2 + 1 + 1 + MIX + 1 + 1 + 5;
         const MESSAGES: usize = 2 + 2;
         const EMBED: usize = 2;
         const HEAD: usize = MIX + 5;
@@ -668,8 +678,13 @@ mod gate {
             } else {
                 6 + if windowed && !msg { 1 } else { 3 } + if windowed { 0 } else { 2 }
             };
-            visit += VISIT + front + MIX * usize::from(l != 0) + if msg { MESSAGES } else { 0 };
-            if l.is_multiple_of(block) {
+            let banks = l.is_multiple_of(block);
+            // The output projection's post conv and the join: nothing but the bank's copy in its
+            // launch, else two launches.
+            let join = if o_tail[l] { usize::from(banks) } else { 2 };
+            visit +=
+                VISIT + front + join + MIX * usize::from(l != 0) + if msg { MESSAGES } else { 0 };
+            if banks {
                 pushed += 1;
             }
         }
@@ -706,19 +721,22 @@ mod gate {
         if !tier::run_clause("graph_nodes_are_the_walks", Tag::SelfConsistency)? {
             return Ok(true);
         }
-        let (table, norm_proj) = {
+        let (table, norm_proj, o_tail) = {
             let body = m.body(NAME)?;
+            let per_layer = |f: &dyn Fn(usize) -> bool| -> Vec<bool> {
+                (0..body.stored_layers()).map(f).collect()
+            };
             (
                 body.visit_table(),
-                (0..body.stored_layers())
-                    .map(|l| body.norm_proj(l))
-                    .collect::<Vec<bool>>(),
+                per_layer(&|l| body.norm_proj(l)),
+                per_layer(&|l| body.o_tail(l)),
             )
         };
-        let (want, terms) = derived_nodes(hp, &table, &norm_proj, None);
+        let flags = (&norm_proj[..], &o_tail[..]);
+        let (want, terms) = derived_nodes(hp, &table, flags, None);
         let (nodes, entries) = captured_entries(m)?;
         m.set_loopcd(LOOPCD_OMEGA, LOOPCD_REF)?;
-        let (want_on, terms_on) = derived_nodes(hp, &table, &norm_proj, Some(LOOPCD_REF));
+        let (want_on, terms_on) = derived_nodes(hp, &table, flags, Some(LOOPCD_REF));
         let (nodes_on, entries_on) = captured_entries(m)?;
         m.set_loopcd(0.0, LOOPCD_REF)?;
         m.set_mode(StepMode::Eager);
