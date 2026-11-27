@@ -249,8 +249,9 @@ forced_exact count pin, the reference gates).
   errors; an unconditional lock per chunk is a futex convoy (symptom: a flat thread-scaling curve; first question
   `SWEEP="8 16 24 32" just measure-decode`).
 - **The step does no load-time work.** Anything that does not depend on the tokens is resolved once into `Derived`.
-  `just gate-alloc` counts allocator calls per steady step and only ratchets down. Activation blocks come from
-  `Tensor2::scratch` when every cell is written; `BLOOMERY_POISON=1` turns a missed cell into a NaN the gates catch.
+  `just gate-model-host` (its `alloc` test) counts allocator calls per steady step and only ratchets down. Activation
+  blocks come from `Tensor2::scratch` when every cell is written; `BLOOMERY_POISON=1` turns a missed cell into a NaN
+  the gates catch.
 - **Runtime levers** are the rows of `crates/levers/src/registry.rs` and nothing else documents them. A binary parses the
   `parsed` rows first thing in `main` (`bloomery_levers::at_main`), refuses a value its kind does not take, and hands
   typed values down; `<bin> --levers` prints them. An `in place` row is a line of `tools/levers-direct.txt` with the
