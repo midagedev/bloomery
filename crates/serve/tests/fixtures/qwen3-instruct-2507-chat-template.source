@@ -1,0 +1,14 @@
+Source of qwen3-instruct-2507-chat-template.jinja (kept byte-exact; this file records it):
+
+The `tokenizer.chat_template` value (4040 bytes) of `/models/fixtures/qwen3moe/qwen3moe-fixture-00001-of-00001.gguf` on
+the box, the qwen3moe profile's fixture (a requant of the profile's Qwen3-30B-A3B-Instruct-2507 file), read from the GGUF
+header with no change.
+sha256 40c21f34cf67d8c760ef72f8ad3ae5afad514299d4b06e91dd9a8d705af7b541  qwen3-instruct-2507-chat-template.jinja
+
+It has the history handling of Qwen3's templates but no thinking switch: no `enable_thinking`, no effort knob, and a generation prompt
+that is only `<|im_start|>assistant\n`, so the model starts in its answer. It names `<think>` and `</think>` only to strip
+a history turn's reasoning (`content.split('</think>')`) and to write the span of an assistant turn that follows the last
+user turn. The hub's current `tokenizer_config.json` template of Qwen/Qwen3-30B-A3B-Instruct-2507 (2630 characters, fetched
+2026-11-27) names no think tag at all, so this is an earlier template of the family that GGUFs still carry; the real file the
+gate reads in the real tier was not read for this record. Not in `FIXTURE_TEMPLATES`: only `src/api.rs`'s
+`a_model_that_always_thinks_refuses_a_request_to_stop` and `props_names_how_the_template_turns_thinking_off` read it.
