@@ -55,7 +55,8 @@ reference; what follows is the contract.
     just gate-<name>          # one subsystem's tests, bounded, real exit code
     just gate-ptx-spill       # every PTX entry's spill/jit_local bytes against tools/ref/ptx-shapes.tsv
     just canon-check BASE     # the move proof in one command: both sides' --no-jit scans of the scan set, then ptx-canon on every
-                              # entry whose md5 moved; rc 0 = every entry the same program (--worktree: an uncommitted tree)
+                              # entry whose md5 moved; rc 0 = every entry the same program (--worktree: an uncommitted tree;
+                              # --all also reads the entries whose md5 did not move)
     just ptx-compare BASE BIN [--features F]   # the add class's proof in one command: BIN's JIT scan at BASE and here as
                               # one table (added, removed, changed); rc 0 = nothing existing moved, 3 changed, 4 removed, 5 both
     just mac-check / mac-lint / mac-fmt-check / mac-static / mac-test   # the Mac's static tier (above)
@@ -110,7 +111,7 @@ wrong is the finding.
 | Change class | Proof | Runtime gate | Timed A/B |
 |---|---|---|---|
 | move, split, rename | `just ptx-scan` identical (`--no-jit` suffices: no card, no gate lock; `just canon-check BASE` proves it for the whole scan set in one command); host dispatch code also keeps its structural lines (graph node count, eager = replay, e2e set identical) | none beyond those lines | none |
-| delete | ptx-scan of `generate_ds41` and `gate_e2e` = base minus exactly the deleted entries; `gate-ptx-spill` red on exactly those rows before `ptx-shapes.tsv` loses them; per entry, the grep that shows no caller. A remaining entry whose md5 moves needs `tools/ref/ptx-canon.py` = `reordered-only` and equal resource columns (`just canon-check BASE` runs it) | the owning gates of what it touched (bit-identical for a moved md5); a removed gate, case or arm is a coverage change with a dated reason | none |
+| delete | ptx-scan of `generate_ds41` and `gate_e2e` = base minus exactly the deleted entries; `gate-ptx-spill` red on exactly those rows before `ptx-shapes.tsv` loses them; per entry, the grep that shows no caller. A remaining entry whose md5 moves needs `tools/ref/ptx-canon.py` = `reordered-only` or `value-equal` and equal resource columns (`just canon-check BASE` runs it) | the owning gates of what it touched (bit-identical for a moved md5); a removed gate, case or arm is a coverage change with a dated reason | none |
 | add (no engine caller yet) | ptx-scan = base plus exactly the new entries (`just ptx-compare BASE BIN` prints it); `gate-ptx-spill` red on exactly them before pinning; the family gate green with FAIL-first per clause | the new family gate, and the owning gates of entries engine bins gained | none |
 | integer-path reorder | bit-identical by associativity | the owning gate once | none |
 | launch count only | Δt = ΔN × c_node | the owning gate | once, only if occupancy moves too |
@@ -248,7 +249,7 @@ forced_exact count pin, the reference gates).
   which that channel needs for the feature gates of `cuda-device`, `cuda-host` and `cuda-macros`). `cuda-oxide` is pinned
   by `rev` in `[workspace.dependencies]`, straight from NVIDIA/cuda-rust with no `[patch]`; `just deny` fails if it
   floats. A rev move is a codegen change (every gate) unless `just canon-check BASE` proves every entry the same program
-  (`reordered-only` or identical, equal resource columns). Each rev has its directory on the box,
+  (`reordered-only`, `value-equal` or identical, equal resource columns). Each rev has its directory on the box,
   `~/.cargo/cuda-oxide-bloomery/<rev>/`: its backend and its own `cargo-oxide` (`tools/box.sh`). The backend is built by
   `tools/oxide-backend.sh` from the rev's checkout as published, with the rev in `source-rev.txt` and its build record in
   `PROVENANCE`; the llc, the host CPU flags and that rev are checked by `tools/oxide-host.sh` before every
