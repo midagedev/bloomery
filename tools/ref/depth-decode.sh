@@ -29,6 +29,10 @@ for d in "$@" "$(basename "$PWD")"; do
   trees+=("$d")
 done
 WITNESS=(head-load indent busiest model)
+# Every depth times ik's llama-bench beside ours, a live tree no gate reads: refused by name before the lease.
+# shellcheck source=tools/ref/need-tree.sh
+source "${BASH_SOURCE[0]%/*}/need-tree.sh"
+need_tree --rc 2 depth-decode.sh IKBIN "$IKBIN" "ik's llama-bench; this runner times both engines"
 lease_take
 witness pre
 # 팔 목록: 깊이마다 트리 팔("tree:<dir>:<depth>")을 세운 뒤 ik 팔 — 같은 깊이의 비교가 임대 안에서

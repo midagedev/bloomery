@@ -1,6 +1,6 @@
 //! The K3 fixture end to end, no card: `bloomery-quantize --cpu` (the library's host path) against llama-quantize on
 //! the same input, imatrix, rules and options. The whole output file is equal by sha256, split or not, and the plan
-//! equals llama-quantize's own `--dry-run` tensor for tensor. Run by `just gate-quantize-e2e` (the box).
+//! equals llama-quantize's own `--dry-run` tensor for tensor. Run by `just lab-quantize-e2e` (the box; it needs the K3.1 quantization tree).
 
 mod common;
 

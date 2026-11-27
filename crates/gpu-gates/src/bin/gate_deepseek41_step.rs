@@ -357,13 +357,16 @@ mod gate {
         skew: skew::Clauses,
         slots: bool,
         feed: bool,
-        /// `--imatrix DIR`: the importance collection against ik's, the files written under `DIR`.
+        /// `--imatrix DIR`: the importance collection's two walks and their clauses, the files written under `DIR`.
         imatrix: Option<String>,
+        /// `--ref` (with `--imatrix`; `just lab-ds41-imatrix-ref`): ik's `llama-imatrix` over the same text, and the
+        /// clauses that hold ours to it.
+        reference: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_step [--structure] [--sets] [--select] [--kld-walk] \
-             [--skew-structure] [--skew-sets] [--skew-api] [--slots] [--feed] [--imatrix DIR]";
+             [--skew-structure] [--skew-sets] [--skew-api] [--slots] [--feed] [--imatrix DIR [--ref]]";
         let mut a = Args {
             structure: false,
             sets: false,
@@ -377,6 +380,7 @@ mod gate {
             slots: false,
             feed: false,
             imatrix: None,
+            reference: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -396,8 +400,12 @@ mod gate {
                             .ok_or_else(|| format!("--imatrix needs a directory: {USAGE}"))?,
                     );
                 }
+                "--ref" => a.reference = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
+        }
+        if a.reference && a.imatrix.is_none() {
+            return Err(format!("--ref is a flag of --imatrix: {USAGE}").into());
         }
         let others = a.structure || a.sets || a.select || a.kld_walk || a.skew.any();
         if !(others || a.slots || a.feed || a.imatrix.is_some()) {
@@ -459,11 +467,14 @@ mod gate {
         if let Some(dir) = &args.imatrix {
             let mut imx_cfg = body::OpenCfg::from_levers(&levers)?;
             imx_cfg.place = tier::plan_levers(&split, &levers, 0)?;
-            let ok = crate::imx_gate::run(dir, &path, &imx_cfg)?;
+            let ok = crate::imx_gate::run(dir, &path, &imx_cfg, args.reference)?;
             tier::expect_fixture_oracle("gate_deepseek41_step", fixture_oracle_declared(&args))?;
             println!("gate_deepseek41_step: {}", tier::tally_line());
             return if ok {
-                println!("PASSED: gate_deepseek41_step --imatrix");
+                println!(
+                    "PASSED: gate_deepseek41_step --imatrix{}",
+                    if args.reference { " --ref" } else { "" }
+                );
                 Ok(())
             } else {
                 Err(checks_failed())
@@ -600,7 +611,8 @@ mod gate {
         usize::from(args.sets) * FIXTURE_ORACLE_SETS
             + usize::from(args.select) * FIXTURE_ORACLE_SELECT
             + usize::from(args.skew.sets)
-            + usize::from(args.imatrix.is_some()) * crate::imx_gate::FIXTURE_ORACLE
+            + usize::from(args.imatrix.is_some() && args.reference)
+                * crate::imx_gate::FIXTURE_ORACLE
     }
 
     // ------------------------------------------------------------ the feed

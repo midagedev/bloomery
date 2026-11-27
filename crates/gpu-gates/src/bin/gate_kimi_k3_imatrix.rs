@@ -1,24 +1,31 @@
-//! `gate_kimi_k3_imatrix` — the importance matrix of Kimi K3's own prompt walk against `llama-imatrix`'s, on
-//! the kimi-k3 file of the profile (`BLOOMERY_REF_MODEL`; the fixture under the fixture tier).
+//! `gate_kimi_k3_imatrix` — the importance matrix of Kimi K3's own prompt walk, on the kimi-k3 file of the profile
+//! (`BLOOMERY_REF_MODEL`; the fixture under the fixture tier).
 //!
-//!     gate_kimi_k3_imatrix --dir <dir> [--arms a,bp]
+//!     gate_kimi_k3_imatrix --dir <dir> [--arms a,bp] [--ref]
 //!
-//! One text ([`TEXT_FILE`], this repository's AGENTS.md) is cut into [`CHUNKS`] chunks of [`CTX`] ids. `llama-imatrix`
-//! of the K3 quantization tree (`K3Q_TREE`, the tree `llama-quantize` of `gate_iq_quant` comes from) reads it
-//! on the CPU with `-c 512 -b 512 -ub 512 --chunks 2`, and `generate_kimi_k3 --imatrix` (beside this binary)
-//! walks the same ids on each arm of `--arms` (`a`: the whole-card load, the prompt stepped; `bp`: the placed
-//! load, `--walk pass`; the recipe's `BLOOMERY_IMAT_ARMS`). Each arm's file is held to llama's:
+//! One text ([`TEXT_FILE`], this repository's AGENTS.md) is cut into [`CHUNKS`] chunks of [`CTX`] ids, and
+//! `generate_kimi_k3 --imatrix` (beside this binary) walks them on each arm of `--arms` (`a`: the whole-card load,
+//! the prompt stepped; `bp`: the placed load, `--walk pass`; the recipe's `BLOOMERY_IMAT_ARMS`). Each arm's file is
+//! held to its own invariants, which need no reference engine (`just gate-gpu-kimik3-imatrix`):
 //!
-//! - `names`: both open through the quantizer's reader (`quantize::imatrix::Imatrix`), and ours names every
-//!   weight llama's does but those of [`NOT_COLLECTED`], each with its reason, and no weight llama's lacks;
-//!   a name of that list ours does collect is red too (the list cannot go stale).
-//! - `counts`: a weight every row reaches (every dense linear, the router) has llama's counts exactly. A routed
-//!   stack's counts total exactly the rows times the picks a row makes, and each expert's count is within
-//!   [`COUNT_FLIP`] of llama's.
+//! - `counts`: the file opens through the quantizer's reader (`quantize::imatrix::Imatrix`); a dense weight's count
+//!   is the rows walked, `CHUNKS * CTX`; every routed stack's counts total the same whole number of picks per row;
+//!   and no weight of [`NOT_COLLECTED`] is in it (the list cannot go stale).
+//!
+//! With `--ref` (`just lab-kimik3-imatrix-ref`: a lab, no landing selects it) the gate also runs `llama-imatrix` of the
+//! K3 quantization tree (`K3Q_TREE`, the tree `llama-quantize` of `gate_iq_quant --ref` comes from) over the same ids on
+//! the CPU with `-c 512 -b 512 -ub 512 --chunks 2`, and holds each arm's file to llama's:
+//!
+//! - `names`: both open through the quantizer's reader, and ours names every weight llama's does but those of
+//!   [`NOT_COLLECTED`], each with its reason, and no weight llama's lacks; a name of that list ours does collect is
+//!   red too (the list cannot go stale).
+//! - `counts` (against llama's): a weight every row reaches (every dense linear, the router) has llama's counts
+//!   exactly. A routed stack's counts total exactly the rows times the picks a row makes, and each expert's count is
+//!   within [`COUNT_FLIP`] of llama's.
 //! - `in_sum2`: every column of a dense weight within [`COL_BAND`] of its layer's, the sums of every weight
 //!   within [`TOTAL_BAND`] in total, and the middle column of a routed stack within [`ROUTED_MEDIAN`].
 //! - `quantize`: `bloomery-quantize` over the fixture (requantized to MXFP4 stacks by the tree's
-//!   `llama-quantize`, as `gate_iq_quant`'s end-to-end clause does) with the first arm's imatrix writes a
+//!   `llama-quantize`, as `gate_iq_quant --ref`'s end-to-end clause does) with the first arm's imatrix writes a
 //!   set that opens, holding both IQ1_S and IQ2_XXS stacks.
 //!
 //! The bands. Both files hold `Σ x²` over the same `N = CHUNKS · CTX` rows (the same ids: the first layer's
@@ -313,6 +320,39 @@ fn compare(arm: &str, ours: &Path, llama: &Path) -> Result<bool, GateError> {
     Ok(names && counts && sums)
 }
 
+/// Clause `counts [arm]` of `ours` alone: whether it held (module doc).
+fn counts(arm: &str, ours: &Path) -> Result<bool, GateError> {
+    let opened = quantize::imatrix::Imatrix::open(&ours.to_string_lossy()).is_ok();
+    let weights = read(ours)?;
+    let rows = (CHUNKS * CTX) as f64;
+    let total = |e: &Entry| e.counts.iter().map(|&c| f64::from(c)).sum::<f64>();
+    let stale: Vec<&String> = weights.keys().filter(|k| exempt(k).is_some()).collect();
+    let bad_dense: Vec<&String> = weights
+        .iter()
+        .filter(|(k, e)| !routed(k) && !(e.counts.len() == 1 && f64::from(e.counts[0]) == rows))
+        .map(|(k, _)| k)
+        .collect();
+    let picks: Vec<f64> = weights
+        .iter()
+        .filter(|(k, _)| routed(k))
+        .map(|(_, e)| total(e) / rows)
+        .collect();
+    let routed_ok = picks
+        .first()
+        .is_some_and(|&p0| p0 >= 1.0 && picks.iter().all(|&p| p == p0 && p.fract() == 0.0));
+    let ok = opened && stale.is_empty() && bad_dense.is_empty() && routed_ok;
+    println!(
+        "{} counts [{arm}]: the quantizer's reader opens ours ({opened}); a dense weight's count the {} rows walked, every routed stack's counts total the same whole number of picks per row ({:?}; {} weights); listed but collected {:?}; outside: {:?}",
+        verdict(ok),
+        CHUNKS * CTX,
+        picks.first(),
+        weights.len(),
+        stale,
+        &bad_dense[..bad_dense.len().min(6)]
+    );
+    Ok(ok)
+}
+
 /// The `bp` arm's card budget and the split the gate's own plan of the pass makes under it.
 struct Window {
     budget: u64,
@@ -522,16 +562,15 @@ fn quantize_clause(
     Ok(pass)
 }
 
-fn gate() -> Result<(), GateError> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let flag = |name: &str| {
-        args.iter()
-            .position(|a| a == name)
-            .and_then(|i| args.get(i + 1).cloned())
-    };
-    let dir = PathBuf::from(flag("--dir").ok_or("gate_kimi_k3_imatrix: --dir DIR is required")?);
-    let arms = flag("--arms").unwrap_or_else(|| "a,bp".to_owned());
-    std::fs::create_dir_all(&dir)?;
+/// What `--ref` reads: the fixture, the K3 quantization tree and `llama-imatrix`'s file over `text`.
+struct LlamaRef {
+    fixture: PathBuf,
+    tree: PathBuf,
+    llama: PathBuf,
+}
+
+/// `llama-imatrix` of the K3 quantization tree over `text` on the CPU (module doc), its file under `dir`.
+fn llama_imatrix(dir: &Path, text: &Path) -> Result<LlamaRef, GateError> {
     let fixture = ref_model_path()?;
     let tree = PathBuf::from(std::env::var("K3Q_TREE").map_err(|_| {
         "K3Q_TREE names the K3.1 quantization tree (the recipe sets it from tools/ref/ref-paths.sh)"
@@ -544,9 +583,6 @@ fn gate() -> Result<(), GateError> {
         )
         .into());
     }
-    let window = arms.split(',').any(|a| a == "bp").then(bp_window);
-    let text = dir.join("text.txt");
-    std::fs::copy(TEXT_FILE, &text).map_err(|e| format!("{TEXT_FILE}: {e}"))?;
     let llama = dir.join("llama.imatrix.gguf");
     let (ok, _, err) = run(
         Command::new(&imat)
@@ -554,7 +590,7 @@ fn gate() -> Result<(), GateError> {
             .arg("-m")
             .arg(&fixture)
             .arg("-f")
-            .arg(&text)
+            .arg(text)
             .arg("-o")
             .arg(&llama)
             .args(["--output-format", "gguf", "-c", &CTX.to_string()])
@@ -572,6 +608,31 @@ fn gate() -> Result<(), GateError> {
     if !ok {
         return Err(format!("llama-imatrix ended nonzero: {}", tail(&err)).into());
     }
+    Ok(LlamaRef {
+        fixture,
+        tree,
+        llama,
+    })
+}
+
+fn gate() -> Result<(), GateError> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1).cloned())
+    };
+    let dir = PathBuf::from(flag("--dir").ok_or("gate_kimi_k3_imatrix: --dir DIR is required")?);
+    let arms = flag("--arms").unwrap_or_else(|| "a,bp".to_owned());
+    std::fs::create_dir_all(&dir)?;
+    let window = arms.split(',').any(|a| a == "bp").then(bp_window);
+    let text = dir.join("text.txt");
+    std::fs::copy(TEXT_FILE, &text).map_err(|e| format!("{TEXT_FILE}: {e}"))?;
+    let live = if args.iter().any(|a| a == "--ref") {
+        Some(llama_imatrix(&dir, &text)?)
+    } else {
+        None
+    };
     let mut all = true;
     let mut first = None;
     for arm in arms.split(',') {
@@ -612,11 +673,16 @@ fn gate() -> Result<(), GateError> {
         for l in out.lines().filter(|l| l.starts_with("imatrix ")) {
             println!("  [{arm}] {l}");
         }
-        all &= compare(arm, &ours, &llama)?;
+        all &= counts(arm, &ours)?;
+        if let Some(l) = &live {
+            all &= compare(arm, &ours, &l.llama)?;
+        }
         first.get_or_insert(ours);
     }
     let first = first.ok_or("no arm produced a file")?;
-    all &= quantize_clause(&dir, &tree, &fixture, &first)?;
+    if let Some(l) = &live {
+        all &= quantize_clause(&dir, &l.tree, &l.fixture, &first)?;
+    }
     if all {
         println!("gate_kimi_k3_imatrix: PASSED");
         Ok(())

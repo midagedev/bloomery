@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Build gate_iq_quant's oracle, iq_quant_ref (tools/ref/iq_quant_ref.cpp), on the box against the K3.1 quantization
-# tree's libggml-base: the library llama-quantize links (tools/ref/build-k3-quant-tree.sh, K3_QUANT_TREE). Not the ik
-# tree of ref-build-common.sh: the oracle is the quantizer the K3.1 pipeline runs. The binary goes to
+# Build the IQ quantizer's ggml oracle, iq_quant_ref (tools/ref/iq_quant_ref.cpp), on the box against the K3.1 quantization
+# tree's libggml-base: the library llama-quantize links (tools/ref/build-k3-quant-tree.sh, K3_QUANT_TREE). No gate reads it
+# (no live reference trees); the labs `lab-iq-quant-ref` and `lab-quantize-oracle` and `iq-quant-probe --check` do, and so would a session
+# that freezes ggml's outputs as stored sets (the note on gate-gpu-iq-quant in the justfile). Not the ik tree of ref-build-common.sh: the oracle is the quantizer the
+# K3.1 pipeline runs. The binary goes to
 # $BLOOMERY_DATA/bin unless IQ_QUANT_REF_OUT says otherwise; the tree's commit and libggml-base's md5 go beside it in
 # iq_quant_ref.build.
 #

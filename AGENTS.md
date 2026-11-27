@@ -29,6 +29,13 @@ change is checked and merged is in `CONTRIBUTING.md`. A maintainer's machine may
   timing lease through `lease_take`: a machine-wide lock, a GPU-idle wait, and witness blocks around every timed
   region. A number from another machine carries `CONTRIBUTING.md`'s evidence list instead (the card and driver line,
   both commits, the model file, the commands and their output). A number with neither is not admissible.
+- **Never make a gate read a live reference tree** (an ik_llama.cpp or llama.cpp checkout and its build). A `gate-*`
+  recipe never reads one: it compares with a frozen reference set (`crates/refset`) or with the engine's own
+  invariants. A live comparison lives in a `lab-*` recipe that refuses by name without its tree (its first command,
+  `tools/ref/need-tree.sh`; no landing selects it) and selects its live clauses by an explicit flag (`--ref`), never by
+  probing whether the tree exists; the gate it left carries a dated coverage note, and the lab becomes a gate when its
+  output is frozen as a set. What writes a set (`build-*`, `dump-*`) or times a reference engine (the timing runners'
+  ik and llama.cpp arms) is an opt-in script that ends the same way, before any lease or build.
 - **Never relax a gate or a lint to make it pass.** Raise it with a dated comment and a reason, or file an issue. The
   lint levels in the root `Cargo.toml` carry the hit counts they were chosen from.
 - **Never write a number you did not measure.** If it is derived, say so. If it turns out wrong, strike it through and
@@ -42,7 +49,8 @@ reference; what follows is the contract.
     just check / lint / fmt   # check --all-targets (also refreshes Cargo.lock: commit the lock with the edit, or the
                               # timing runners refuse stale binaries, rc 3); clippy, 0 errors; cargo fmt, pinned toolchain
     just contrib-check        # what a machine with no card can run: --tier t0 any OS, t1 adds the host tier (CI runs t0)
-    just build-ref            # the C++ reference harnesses that link ggml (rerun when ik moves; gate-qdot reads them)
+    just build-ref            # writes the dumps gate-qdot reads: the C++ harnesses that link ggml, at a reference tree's pin
+                              # (onboarding or a pin move; no gate runs a harness or reads a tree)
     just deny                 # cargo deny; fails if the cuda-oxide pin floats; reaches the network
     just affected [BASE|A..B] # the gate-* recipes a change selects, from the crate graph and module trees, the scripts
                               # a recipe names, the cargo globals, each manifest by table and each lever-registry row
@@ -63,6 +71,9 @@ reference; what follows is the contract.
     just records-refresh      # tools/bloomery/schema/ and tools/flow/plans/ after a record kind or prompt-call plan
                               # change, each plan at the plan room (tools/ref/plan-room.sh)
     just lab-engram           # the engram IO lab's tests; lab-, not gate-, so no engine landing selects it
+    just lab-quantize-oracle / lab-quantize-e2e / lab-quantize-plan / lab-iq-quant-ref / lab-kimik3-imatrix-ref / lab-ds41-imatrix-ref
+                              # the comparisons with ggml and ik that need a reference tree: no landing selects them, each opens with
+                              # one named refusal when its tree is missing (the sets are frozen first, then they become gates)
     just gate-refset / refset-check   # the reference-set readers and every family's sets in place
 
 - **Bounds and exit codes.** Every `gate-*` recipe runs its tests under `timeout --kill-after=10 900`
@@ -163,7 +174,7 @@ forced_exact count pin, the reference gates).
     crates/device/      the device contract: buffers, windows, streams, events, the fault word, the census (pure)
     crates/metal/       the Metal backend of that contract, macOS only (an empty library elsewhere)
     crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile; excluded from the workspace
-    tools/ref/          C++ harnesses linking ggml, and the timing runners
+    tools/ref/          C++ harnesses linking ggml (they write the reference sets and need a tree; no gate does), the timing runners
     tools/bloomery/     the Python side's one reader per fact: records.py, manifest.py
     tools/review/       Shingler's tools, the pull-request review bot (.github/review/ holds its instructions)
     docs/research/      the design docs code cites, and the v41-placement scripts
@@ -178,7 +189,8 @@ forced_exact count pin, the reference gates).
   cannot panic raises the fault word (`crates/gpu/src/fault.rs`: one `u32` per `Gpu`, `(layer << 8) | site` by atomic
   min, read back with the token); `Head::tokens` returns `GpuError::Fault` and the model stays `Poisoned` until
   `reset`. The kernel keeps its memory accesses defined and never writes a plausible value.
-- Correctness is defined against ggml: kernels match its output within the band in each crate's RESULTS file.
+- Correctness is defined against ggml: kernels match its output within the band in each crate's RESULTS file, read from the
+  stored reference sets, not from a ggml tree run at gate time.
 - **Toolchain defects** (cuda-oxide, cutile-rs's cuda-core/cuda-bindings) go into `docs/upstream/nvlabs-ledger.md` the
   moment they are met, before any workaround. bloomery takes cuda-oxide from NVIDIA/cuda-rust as it is and carries no
   fork: a defect that shapes our code is worked around in bloomery (the ledger row names the workaround and the
@@ -293,7 +305,8 @@ forced_exact count pin, the reference gates).
   rc 2 when toktape is missing or too old), and `tape.py publish` is the maintainer's explicit command that turns them into the
   `[recorded on tape](...)` lines beside the numbers (`docs/performance.md`, "A headline number's tape").
 - **The line to beat is the reference at its fastest flags, measured interleaved** (`decode-measure.sh` runs ik at
-  default and `IK_BEST_FLAGS`); under 1 % is claimable only from `BLOOMERY_AB_IK=1 just ab-decode` rounds.
+  default and `IK_BEST_FLAGS`; the reference arms need a live ik tree and are refused by name when it is missing,
+  `IK_ARMS=0` times bloomery alone); under 1 % is claimable only from `BLOOMERY_AB_IK=1 just ab-decode` rounds.
 - **Matching the reference's sum order can be faster and exact at once.** Read the reference kernel before assuming
   SIMD opens a gate.
 - **Read chunk skew at profile level 1, never level 2** (level 2's per-row timer tax inflates the skew). A microbench
@@ -309,7 +322,7 @@ forced_exact count pin, the reference gates).
 - `just lint` runs clippy with `--features gpu`; its ratchet is `grep -c '^warning:'` (one per target a warning appears
   in), held by `tools/lint-ratchet.txt` and tracked in `docs/rust-quality.md` §0. It only goes down; the stage-0 crates
   are gone and the tree has no `undocumented_unsafe_blocks`.
-- `gate-qdot`'s hw tests read harness dumps under `$BLOOMERY_DATA/ref/` that `just build-ref` writes.
+- `gate-qdot`'s hw tests read the stored dumps under `$BLOOMERY_DATA/ref/` and run no harness; `just build-ref` writes them.
 - A V4.1 prompt batch's shadow runs the card's routed experts on the grouped int8 GEMM (`enqueue_gemm_batch`: route
   table → gate and up → down), a pick's kept and streamed passes each over the map row `ds41_ffn_pass_map` narrows to
   their experts, and the expert tier runs its block on the same sequence over its places (`gemm_place_ids`,

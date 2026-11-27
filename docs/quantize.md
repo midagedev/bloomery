@@ -5,7 +5,7 @@ intermediate set. The routed-expert stacks become IQ1_S or IQ2_XXS on the card (
 tensor the type `llama-quantize` gives it by the host's K-quant rules (Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, and the F32/F16
 copies), and the metadata, the tensor order, the alignment and the shard layout are the ones `llama-quantize` writes.
 The output is byte-identical to `llama-quantize`'s for the same input, importance matrix, rules and options.
-`llama-quantize` stays as the oracle: the gates compare against it.
+`llama-quantize` stays as the oracle: the labs compare against it ("How its bytes are proved"; no gate does).
 
 It is in the Linux archives only. It links the CUDA backend, and cargo refuses to build it without the `gpu` feature,
 so the Mac archive has no binary of it (`--cpu` included).
@@ -22,9 +22,10 @@ FP8_B128): a tensor already in it is copied, any other is refused by name (ERNIE
 Q3_K_M is `llama_tensor_get_type_impl`'s Q3_K_M branches, and a rules file is not needed to reach them: the first two
 `attn_v`-like tensors Q5_K and the rest Q4_K (Q8_0 at eight experts), `attn_output` Q4_K (Q5_K at eight experts),
 `ffn_down` Q5_K for the first `n_layer / 16` blocks and Q4_K after, `output` Q6_K, every other quantizable tensor Q3_K.
-`gate-quantize-plan` and `gate-quantize-e2e` hold it to llama-quantize's own plan and bytes on the K3 fixture
-(`general.file_type` 12 included), which has eight experts and four blocks, so they reach the eight-expert branches; the
-other branches are `tests/resolve.rs`'s, written from the same source. On a DeepSeek-V4.1 source the file type alone
+`tests/resolve.rs` holds the branches, written from the same source. `lab-quantize-plan` and `lab-quantize-e2e` hold them
+to llama-quantize's own plan and bytes on the K3 fixture (`general.file_type` 12 included), which has eight experts and
+four blocks, so they reach the eight-expert branches (labs: they need the K3.1 quantization tree, see "How its bytes are
+proved"). On a DeepSeek-V4.1 source the file type alone
 types the tensors the way the `Q3_K_M` file has them (the routed and shared `ffn_down` of blocks 0 and 1 Q5_K and the
 other blocks' Q4_K; the grouped `attn_output_a` and `attn_output_b` are not ggml's `attn_output` category and stay
 Q3_K); a rules file only changes what the file type does not say.
@@ -158,15 +159,24 @@ Nothing is turned into a plausible value.
 
 ## How its bytes are proved
 
-- `just gate-quantize-oracle`: the host K-quant rules (`gguf::kquant`: Q3_K, Q4_K, Q5_K, Q6_K, Q8_0) against ggml's
+- `just lab-quantize-oracle`: the host K-quant rules (`gguf::kquant`: Q3_K, Q4_K, Q5_K, Q6_K, Q8_0) against ggml's
   quantizer (`iq_quant_ref`, linked to the library llama-quantize calls), row for row, with and without an importance
   matrix, over seeded row families. The oracle's libggml-base has no FMA and no F16C instruction, so the host rules use
   none.
-- `just gate-quantize-e2e`: the K3 fixture through the host writer (`--cpu`) against `llama-quantize`: whole-file
+- `just lab-quantize-e2e`: the K3 fixture through the host writer (`--cpu`) against `llama-quantize`: whole-file
   sha256 equal, split and not, and with the trunk weights at Q3_K by rule.
-- Plan equality: the types and bytes of every tensor equal `llama-quantize --dry-run`'s, tensor for tensor
+- `just lab-quantize-plan`: the types and bytes of every tensor equal `llama-quantize --dry-run`'s, tensor for tensor
   (`--llama-plan`, and the writer cross-checks it on every run that has one).
-- `just gate-gpu-iq-quant`: the card's bytes against the oracle, `--cpu` equal to the card, `--check`, each refusal.
+- `just lab-iq-quant-ref`: the card's bytes against the oracle, the set's stacks and the K3 fixture's whole file against
+  `llama-quantize`.
+- These four are labs, not gates: each runs a binary of the K3.1 quantization tree (`just build-k3-quant-tree`) and the
+  first two also `iq_quant_ref` (`just build-iq-quant-ref`), and no gate reads a live reference tree. No landing selects
+  a lab, and each opens with one named refusal when the tree is missing. They are the only proof that the files we publish
+  carry ggml's bytes: run them before a quantizer change ships a file. They become gates again when ggml's outputs are
+  frozen as a stored set.
+- `just gate-gpu-iq-quant`: `bloomery-quantize` as a process over seeded inputs: the set's shards (metadata, names, dims,
+  order, the copied tensor's bytes, the stacks' types, the host K-quant rule's trunk bytes), `--cpu` equal to the card,
+  `--check`, each refusal. No tree.
 - `just gate-ernie55-quant` (ERNIE 5.5, the fixture cut and a toy folder, `--cpu`): each expert stack byte for byte the
   folder loader's made tensor and decoding to the OCP MXFP4 value of the stored planes; each Q8_0 block ggml's reference
   rule over the loader's FP8 values; the description reading the GGUF as the folder; under the lossless rule every tensor

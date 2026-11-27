@@ -23,7 +23,7 @@
 #             llama-quantize --allow-requantize --imatrix <that> --tensor-type-file <rules> [--keep-split] <in> <out> <ftype>, the map
 #             --map says (below), after llama-quantize's own --dry-run plan of every tensor's type and size over the input's headers
 #             (kept in $K3Q_WORK; the output is held to it tensor by tensor afterwards)
-#             With --gpu-quant, bloomery-quantize (crates/gpu-gates, the card's IQ1_S/IQ2_XXS quantizer, ggml's bytes by gate-gpu-iq-quant)
+#             With --gpu-quant, bloomery-quantize (crates/gpu-gates, the card's IQ1_S/IQ2_XXS quantizer, ggml's bytes by `just lab-iq-quant-ref`)
 #             first writes the input's shards again with every tensor that plan types IQ1_S or IQ2_XXS already quantized (the imatrix's
 #             importance as llama-quantize computes it) and the rest copied, to --gpu-set; llama-quantize then reads that set and
 #             copies those tensors (their type is the target), quantizing only the trunk. The card set is removed once the output passes.

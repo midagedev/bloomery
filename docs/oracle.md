@@ -136,3 +136,24 @@ i32다 — 라우터가 고른 expert 번호가 정수로 들어 있다. 라우�
   본다는 뜻이고, 매니페스트의 토큰 줄이 그것을 구분한다.
 - 이름이 그래프에서 두 번 나올 수 있다. 파일명에 발생순번이 들어가고 매니페스트가 적는다.
   이름만으로 쓰면 마지막 것만 남고 게이트는 엉뚱한 텐서를 비교하면서 녹색으로 있는다.
+
+## Which scripts need a live reference tree
+
+No gate reads a live reference tree (an ik_llama.cpp or llama.cpp checkout and its build). A gate reads a frozen set
+(`crates/refset`, `tools/bloomery/manifest.py`) or checks the engine against its own invariants, so a machine with no
+reference tree runs every gate. Three kinds of script still need a tree, and each is an opt-in:
+
+- Writers of the sets (`build-*`, `dump-*`, `ik-pin-tree.sh`): run at onboarding, when a pin moves or when a new family needs
+  a set. The build scripts that link ggml go through `ref_cxx` (`tools/ref/ref-build-common.sh`).
+- The timing runners' reference arms: ik's `llama-bench` in `decode-measure.sh` (`IK_ARMS=0` times bloomery alone),
+  `ab-decode.sh` with `BLOOMERY_AB_IK=1`, `governor-ab.sh`, `depth-decode.sh`, and the depth runners' llama.cpp and
+  mistral.rs arms.
+- Tool runs that compare with ggml by hand, such as `iq-quant-probe --check` (`just build-iq-quant-ref`).
+
+A missing tree ends each of them at the top, by name, before a lease or a build: `<script>: no live reference tree:
+<VAR>=<path> is not there; ...` and exit 66 (the timing runners exit 2, as their own `no llama-bench at` refusals do).
+`tools/ref/need-tree.sh` is the one helper; `bash tools/ref/need-tree.sh --self-test` runs its cases. A comparison that
+needs a tree and has no stored set moves to a `lab-*` recipe (`lab-quantize-oracle`, `lab-quantize-e2e`, `lab-quantize-plan`,
+`lab-iq-quant-ref`, `lab-kimik3-imatrix-ref`, `lab-ds41-imatrix-ref`), which no landing selects and which opens with that
+refusal; the gate it left carries a dated coverage note in its recipe's comment block (see `gate-gpu-iq-quant` and
+`gate-gpu-kimik3-imatrix` in the justfile). Freezing the comparison's output as a set turns the lab back into a gate.

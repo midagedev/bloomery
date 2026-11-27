@@ -1,23 +1,27 @@
-//! The V4.1 importance collection against `llama-imatrix`'s (`gate_deepseek41_step --imatrix DIR`), on the V4.1
-//! fixture (`BLOOMERY_REF_MODEL`; the fixture tier only: ik reads no real V4.1 file whole).
+//! The V4.1 importance collection's clauses (`gate_deepseek41_step --imatrix DIR`, and `--imatrix DIR --ref` for the
+//! comparison with `llama-imatrix`'s), on the V4.1 fixture (`BLOOMERY_REF_MODEL`; the fixture tier only: ik reads no real
+//! V4.1 file whole).
 //!
-//! One text ([`TEXT_FILE`], this repository's AGENTS.md) is cut into [`CHUNKS`] chunks of [`CTX`] ids. ik's
-//! `llama-imatrix` (the tree `IK` names, the V4.1 oracle) reads it on the CPU with `-c 512 -b 512 -ub 512
-//! --chunks 2` into `DIR/ik.dat`, while the gate's own load walks the same ids (`shared/ds41_imatrix.rs`: the
-//! prompt batch with the prompt triangle off, as `ppl_ds41 --imatrix` walks) into `DIR/ours-a.gguf` and, from a
-//! reset collector, again into `DIR/ours-b.gguf`. ik writes its legacy form: per weight the mean of `x²` over the
-//! rows that reached it, times its number of calls, so ours is held to it as `in_sum2 / counts * chunks`.
+//! One text ([`TEXT_FILE`], this repository's AGENTS.md) is cut into [`CHUNKS`] chunks of [`CTX`] ids. The gate's own
+//! load walks them (`shared/ds41_imatrix.rs`: the prompt batch with the prompt triangle off, as `ppl_ds41 --imatrix`
+//! walks) into `DIR/ours-a.gguf` and, from a reset collector, again into `DIR/ours-b.gguf`. Those two walks and the
+//! `counts` and `repeat` clauses need no reference tree and are all `--imatrix` runs (`just gate-gpu-ds41-step`).
 //!
-//! - `names` (fixture oracle): ours opens through the quantizer's reader, and holds every weight ik's file does but
-//!   those of [`NOT_COLLECTED`], each with its reason, and none ik's lacks but those of [`OURS_ONLY`]; a name of
-//!   either list that is on the other side's side of the rule is red too (the lists cannot go stale).
-//! - `counts` (self-consistency): a dense weight's count is the rows walked, `CHUNKS * CTX`; a routed gate or up
-//!   stack's counts total the rows times the picks a row makes; a down's counts are its up's, per expert (the
-//!   card's picks from the tile path's SwiGLU rows, the host tier's from the host union's combine, one entry a
-//!   pick whoever computed it); a gate weight's counts and sums are its up weight's, which sees the same rows
-//!   and picks.
-//! - `means` (fixture oracle): per dense weight, the median and the 99th percentile over its columns of the
-//!   relative difference of a column's mean from ik's within [`COL_MEDIAN`] and [`COL_P99`] by layer; the total
+//! With `--ref` (`just lab-ds41-imatrix-ref`: a lab, no landing selects it) ik's `llama-imatrix` (the tree `IK`
+//! names, the V4.1 oracle) reads the same text on the CPU with `-c 512 -b 512 -ub 512 --chunks 2` into `DIR/ik.dat`
+//! while the walks run, and `names` and `means` hold ours to it. ik writes its legacy form: per weight the mean of
+//! `x²` over the rows that reached it, times its number of calls, so ours is held to it as `in_sum2 / counts * chunks`.
+//!
+//! - `names` (`--ref`, fixture oracle): ours opens through the quantizer's reader, and holds every weight ik's
+//!   file does but those of [`NOT_COLLECTED`], each with its reason, and none ik's lacks but those of [`OURS_ONLY`]; a
+//!   name of either list that is on the other side's side of the rule is red too (the lists cannot go stale).
+//! - `counts` (self-consistency): ours opens through the quantizer's reader; a dense weight's count is the rows walked,
+//!   `CHUNKS * CTX`; a routed gate or up stack's counts total the rows times the picks a row makes; a down's counts are
+//!   its up's, per expert (the card's picks from the tile path's SwiGLU rows, the host tier's from the host union's
+//!   combine, one entry a pick whoever computed it); a gate weight's counts and sums are its up weight's, which sees
+//!   the same rows and picks.
+//! - `means` (`--ref`, fixture oracle): per dense weight, the median and the 99th percentile over its columns of
+//!   the relative difference of a column's mean from ik's within [`COL_MEDIAN`] and [`COL_P99`] by layer; the total
 //!   mean of every weight within [`TOTAL_BAND`] (a routed down's within [`DOWN_TOTAL`]); the middle column of a
 //!   routed gate or up stack within [`ROUTED_MEDIAN`] and of a down within [`DOWN_MEDIAN`]; and ik's number of
 //!   calls the chunks walked. A statistic over the columns, not their maximum: the widest of thousands of columns
@@ -32,8 +36,8 @@
 //! so the picks nearest the cut flip, and a flipped row moves its column sums with it.
 
 use std::collections::BTreeMap;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 
 use bloomery_gpu::imatrix;
 use bloomery_gpu::model::StepMode;
@@ -46,10 +50,10 @@ use tokenizer::Tokenizer;
 
 use crate::imx;
 
-/// The ik tree whose `llama-imatrix` reads the fixture: the recipe's `. tools/ref/ref-paths.sh && export IK`.
+/// The ik tree whose `llama-imatrix` reads the fixture (`--ref`): the lab recipe's `. tools/ref/ref-paths.sh && export IK`.
 const IK_ENV: &str = "IK";
 
-/// The fixture-oracle clauses this module decides.
+/// The fixture-oracle clauses `--ref` decides.
 pub const FIXTURE_ORACLE: usize = 2;
 
 /// The chunk length both engines run.
@@ -307,8 +311,8 @@ fn names(ours: &BTreeMap<String, Ours>, ik: &BTreeMap<String, Ik>, opened: bool)
     ok
 }
 
-/// Clause `counts` of `ours` alone: whether it held.
-fn counts(ours: &BTreeMap<String, Ours>) -> bool {
+/// Clause `counts` of `ours` alone (`opened`: the quantizer's reader opens the file): whether it held.
+fn counts(ours: &BTreeMap<String, Ours>, opened: bool) -> bool {
     let rows = (CHUNKS * CTX) as f64;
     let total = |e: &Ours| e.counts.iter().map(|&c| f64::from(c)).sum::<f64>();
     let mut bad = Vec::new();
@@ -350,9 +354,9 @@ fn counts(ours: &BTreeMap<String, Ours>) -> bool {
             unequal.push(name.clone());
         }
     }
-    let ok = bad.is_empty() && unequal.is_empty();
+    let ok = opened && bad.is_empty() && unequal.is_empty();
     println!(
-        "{} counts: a dense weight's count the {} rows walked, a routed stack's total {} rows times {N_USED} picks, a \
+        "{} counts: the quantizer's reader opens ours ({opened}); a dense weight's count the {} rows walked, a routed stack's total {} rows times {N_USED} picks, a \
          gate weight's counts and sums its up weight's, a down's counts its up's per expert ({} weights); outside \
          {:?}, gate unequal to up {unequal:?}",
         verdict(ok),
@@ -478,34 +482,28 @@ struct Worst {
     down_median: Peak,
 }
 
-/// The whole clause: ik's run beside two of our walks of the fixture, then the four clauses above. `Ok(true)` when
-/// they all held; the real tier decides none (module doc) and loads nothing.
-pub fn run(dir: &str, path: &str, cfg: &body::OpenCfg) -> Result<bool, GateError> {
-    const NAME: &str = "gate_deepseek41_step imatrix";
-    if Tier::from_env()? == Tier::Real {
-        for c in ["imatrix names against ik's", "imatrix means against ik's"] {
-            tier::run_clause(c, Tag::FixtureOracle)?;
-        }
-        println!(
-            "{NAME}: the real tier decides nothing: ik reads no real V4.1 file whole; `ppl_ds41 --imatrix` is its \
-             smoke"
-        );
-        return Ok(true);
-    }
-    let dir = Path::new(dir);
-    std::fs::create_dir_all(dir).map_err(|e| format!("{NAME}: {}: {e}", dir.display()))?;
-    let (ik_dat, ik_log) = (dir.join("ik.dat"), dir.join("ik.log"));
+/// ik's `llama-imatrix` over the fixture and the text, started on the CPU: its process and the files it writes under
+/// `dir`.
+struct IkRun {
+    child: Child,
+    dat: PathBuf,
+    log: PathBuf,
+}
+
+/// Start `llama-imatrix` of the tree `IK` names (module doc) on `path`'s fixture, its file and log under `dir`.
+fn spawn_ik(name: &str, dir: &Path, path: &str) -> Result<IkRun, GateError> {
+    let (dat, log_path) = (dir.join("ik.dat"), dir.join("ik.log"));
     let ik_tree = std::env::var(IK_ENV).map_err(|_| {
         format!(
-            "{NAME}: {IK_ENV} names the ik tree whose llama-imatrix reads the fixture (the recipe sets it from \
+            "{name}: {IK_ENV} names the ik tree whose llama-imatrix reads the fixture (the recipe sets it from \
              tools/ref/ref-paths.sh)"
         )
     })?;
-    let log =
-        std::fs::File::create(&ik_log).map_err(|e| format!("{NAME}: {}: {e}", ik_log.display()))?;
+    let log = std::fs::File::create(&log_path)
+        .map_err(|e| format!("{name}: {}: {e}", log_path.display()))?;
     let mut cmd = Command::new(format!("{ik_tree}/build/bin/llama-imatrix"));
     cmd.args(["-m", path, "-f", TEXT_FILE, "-o"])
-        .arg(&ik_dat)
+        .arg(&dat)
         .args([
             "-c",
             &CTX.to_string(),
@@ -522,9 +520,44 @@ pub fn run(dir: &str, path: &str, cfg: &body::OpenCfg) -> Result<bool, GateError
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
     die_with_parent(&mut cmd);
-    let mut ik = cmd
+    let child = cmd
         .spawn()
-        .map_err(|e| format!("{NAME}: {ik_tree}/build/bin/llama-imatrix: {e}"))?;
+        .map_err(|e| format!("{name}: {ik_tree}/build/bin/llama-imatrix: {e}"))?;
+    Ok(IkRun {
+        child,
+        dat,
+        log: log_path,
+    })
+}
+
+/// The whole clause: two walks of the fixture from a reset collector (`reference`: and ik's run beside them), then the
+/// clauses above. `Ok(true)` when they all held; the real tier decides none (module doc) and loads nothing.
+pub fn run(dir: &str, path: &str, cfg: &body::OpenCfg, reference: bool) -> Result<bool, GateError> {
+    let name = if reference {
+        "gate_deepseek41_step imatrix-ref"
+    } else {
+        "gate_deepseek41_step imatrix"
+    };
+    if Tier::from_env()? == Tier::Real {
+        if reference {
+            for c in ["imatrix names against ik's", "imatrix means against ik's"] {
+                tier::run_clause(c, Tag::FixtureOracle)?;
+            }
+            println!(
+                "{name}: the real tier decides nothing: ik reads no real V4.1 file whole; `ppl_ds41 --imatrix` is its \
+                 smoke"
+            );
+        } else {
+            println!(
+                "{name}: the real tier decides nothing: the walks run on the fixture; `ppl_ds41 --imatrix` is the real \
+                 file's smoke"
+            );
+        }
+        return Ok(true);
+    }
+    let dir = Path::new(dir);
+    std::fs::create_dir_all(dir).map_err(|e| format!("{name}: {}: {e}", dir.display()))?;
+    let mut ik = reference.then(|| spawn_ik(name, dir, path)).transpose()?;
 
     let mut cfg = cfg.clone();
     cfg.body.ced = false;
@@ -554,23 +587,35 @@ pub fn run(dir: &str, path: &str, cfg: &body::OpenCfg) -> Result<bool, GateError
             imx::chunk,
         )?;
     }
-    let status = ik.wait()?;
-    if !status.success() {
-        return Err(format!("{NAME}: llama-imatrix ended {status}: {}", tail(&ik_log)).into());
-    }
+    let theirs = match ik.as_mut() {
+        Some(ik) => {
+            let status = ik.child.wait()?;
+            if !status.success() {
+                return Err(
+                    format!("{name}: llama-imatrix ended {status}: {}", tail(&ik.log)).into(),
+                );
+            }
+            Some(read_ik(&ik.dat)?)
+        }
+        None => None,
+    };
 
     let opened = quantize::imatrix::Imatrix::open(&a.to_string_lossy()).is_ok();
-    let (ours, theirs) = (read_ours(&a)?, read_ik(&ik_dat)?);
+    let ours = read_ours(&a)?;
     let mut pass = true;
-    if tier::run_clause("imatrix names against ik's", Tag::FixtureOracle)? {
-        pass &= names(&ours, &theirs, opened);
+    if let Some(theirs) = &theirs
+        && tier::run_clause("imatrix names against ik's", Tag::FixtureOracle)?
+    {
+        pass &= names(&ours, theirs, opened);
     }
     crate::ds41_tier::sc(
         "imatrix counts: the rows walked, the picks made, a down's counts are its up's, a gate weight is its up weight",
     )?;
-    pass &= counts(&ours);
-    if tier::run_clause("imatrix means against ik's", Tag::FixtureOracle)? {
-        pass &= means(&ours, &theirs);
+    pass &= counts(&ours, opened);
+    if let Some(theirs) = &theirs
+        && tier::run_clause("imatrix means against ik's", Tag::FixtureOracle)?
+    {
+        pass &= means(&ours, theirs);
     }
     crate::ds41_tier::sc(
         "imatrix repeat: a second walk from a reset collector writes the first's bytes",

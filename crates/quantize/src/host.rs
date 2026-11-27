@@ -1,6 +1,6 @@
 //! The host's rules on all cores: the IQ search over the resident pool (`crates/threads`) as a [`Backend`] that
 //! opens no card ([`HostBackend`]), and the K-quant rules and the widening to f32 over the same pool
-//! ([`convert_rows`]). Their bytes are ggml's (`gate-quantize-oracle`, `gate-gpu-iq-quant`).
+//! ([`convert_rows`]). The rules are ggml's (`gguf::kquant`, `gguf::iq_quant`): `lab-quantize-oracle` holds them to ggml's bytes and `gate-gpu-iq-quant` holds `--cpu` to the card's.
 
 use crate::check::host_row;
 use crate::plan::Target;

@@ -1,0 +1,11 @@
+--- a/crates/gpu-gates/src/bin/gate_kimi_k3_imatrix.rs
++++ b/crates/gpu-gates/src/bin/gate_kimi_k3_imatrix.rs
+@@ -424,7 +424,7 @@
+         .arg(ours)
+         .arg("--text")
+         .arg(text)
+-        .args(["--ctx", &CTX.to_string(), "--chunks", &CHUNKS.to_string()])
++        .args(["--ctx", &CTX.to_string(), "--chunks", "1"])
+         .args(["--place", place, "--walk", walk]);
+     if let Some(budget) = budget {
+         cmd.env(CARD_BUDGET, budget.to_string())

@@ -2,7 +2,7 @@
 //! type and size) against the plan `bloomery-quantize` resolves from the same rules and options, tensor for tensor in
 //! both directions (`Plan::build` refuses a tensor the two type or size differently, a tensor either lacks, and a
 //! dimension that differs). The cases are the K3 fixture and the K3.1 type maps over the K3-shaped set. Run by
-//! `just gate-quantize-plan` (the box, no card, no data read).
+//! `just lab-quantize-plan` (the box, no card, no data read; it needs the K3.1 quantization tree).
 
 mod common;
 

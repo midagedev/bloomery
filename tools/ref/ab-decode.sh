@@ -34,6 +34,12 @@ for d in "$@" "$here"; do
   bins+=("$d")
 done
 WITNESS=(head-load indent busiest model)
+# The ik arm (BLOOMERY_AB_IK=1) runs ik's llama-bench, a live tree no gate reads: a missing one is refused by name before the lease.
+if [ "${BLOOMERY_AB_IK:-0}" = 1 ]; then
+  # shellcheck source=tools/ref/need-tree.sh
+  source "${BASH_SOURCE[0]%/*}/need-tree.sh"
+  need_tree --rc 2 ab-decode.sh IKBIN "$IKBIN" "ik's llama-bench; leave BLOOMERY_AB_IK unset to compare the trees and lever arms alone"
+fi
 lease_take
 # 러너가 실제로 읽은 값. 맥 셸의 BLOOMERY_AB_* 는 ssh를 그냥 넘지 않는다(레시피가 실어 보낸다) —
 # 이 줄이 없으면 "env가 박스에 닿았나"를 바퀴 수를 세어 추측해야 했다.

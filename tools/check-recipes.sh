@@ -364,6 +364,9 @@ blk_ikpintree() { tool_selftest ref/ik-pin-tree.sh; }
 # build-qdot-ref.sh builds only the dumpers it is named: a NAME that is not one dumper, two names in one argument included, is 64 and builds
 # nothing. Tested on a stub g++, no ik, no box.
 blk_qdotrefargs() { tool_selftest ref/build-qdot-ref.sh; }
+# need-tree.sh is the one refusal of a script that needs a live reference tree (ik, llama.cpp): the absent file and directory, the named
+# line, the exit codes and the usage error, on temporary paths, no box. build-qdot-ref.sh's self-test above holds ref_cxx's use of it.
+blk_needtree() { tool_selftest ref/need-tree.sh; }
 # The quantizer timing runner's arguments and its summary of the probe's lines, on a fixture of them (no card, no lease, no
 # box). The path is composed: a literal name would make the gate batch's walk read this file as a script that takes the lease.
 blk_quantmeasure() { local what=measure; tool_selftest "ref/quant-$what.sh"; }
@@ -1345,7 +1348,7 @@ proc_leg_gpu() {
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
   maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs wholemanifests narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macsetup roundcheck macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish nightlyreal releasesitting releasepick releasebuildmac pytools boxqcodes fixturevariants fixturedirs dsparkread
-  refsetpublish orphan archowner treecommit archivepipe fnowner wt sweep macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs quantmeasure)
+  refsetpublish orphan archowner treecommit archivepipe fnowner wt sweep macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs needtree quantmeasure)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are
 # missing or empty is no proof (a scan of the justfile or crates/ passes on empty input). procleg is never skipped.
