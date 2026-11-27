@@ -1,0 +1,34 @@
+# inkland-stack: the inkconv fold (a)+(b)+(d) on a base that already carries the rel_bias attention change (#1208). The fold removes a
+# fixed card time per token, 1/158.79 - 1/172.01 = 0.484 ms [derived from the original sitting, base 10efa0e4d: 158.79 -> 172.01 tok/s,
+# +8.33 % +-0.56, D=512 n=256 draft off, 4 rounds]; the pieces' own looks give 0.19 + 0.22 + 0.04 = 0.45 ms [derived from the three looks
+# +3.06 / +3.64 / +0.69 %, specs/inkconv/STATE.md]. The step is one captured stream and its wall is the card chain's sum (host 0.15 ms after
+# the replay, PCIe 8 B, host DRAM and NVMe 0, card DRAM 36 % busy = ~2.1 ms against a ~5.9 ms step): the largest unit's demand is well under
+# the step, so the step is launch and latency time and a removed node comes off it in full (the real Mini's decode graph, gate_inkling2_e2e at
+# the real tier on both trees: 1214 -> 934 nodes a step, dN = -280, so 0.484 ms / 280 = 1.7 us a removed node [derived]). #1208 moves the attention kernels (rel_bias ring pass 8.10 -> 3.10 us, plane pass 5.09 -> 3.26 us a launch, look: 160.6 -> 170.9
+# tok/s at P=512, +6.4 %), a different set of nodes, so the two terms are disjoint on paper. Main's base: 158.79 x 170.9 / 160.6 = 169.0 tok/s
+# = 5.92 ms [derived]; minus 0.484 ms = 5.43 ms = 184.0 tok/s, +8.9 %. Band +7.0..+10.5 % = 80 % .. 114 % of the fold's 0.484 ms saved.
+# Below +5 % would mean the attention change took part of the same term (the fold's per-node time shrank with the attention kernels).
+kind: ab
+question: does the inkconv fold (k/v conv + qk_clip, o-proj and card-sum conv tails, norm_proj one wave) still remove its 0.484 ms a token on a base that carries
+  the rel_bias attention change, i.e. are the two terms disjoint?
+term: decode tok/s (tg, N - 1 decode steps) @ n=256, depth 512 (the first 512 ids of the model's prose corpus), Inkling-2-Mini UD-Q4_K_XL whole on the RTX 5090,
+  BLOOMERY_DRAFT=off, bloomery-serve one fresh server an arm and a round, arm new (main c46751879 + #1212 + inkconv) over arm base (main c46751879 + #1212),
+  (new - base) / base
+unit: %
+predict: 7.0..10.5
+rounds: 4
+sd: 0.6 % AGENTS.md Know the ruler (same-binary runs scatter with SD 0.6 %)
+condition: one lease, one runner call, BLOOMERY_MODEL=inkling2 BLOOMERY_AB_ROUNDS=4 just depth-serve with two arms, base first (arm k of round r is arm
+  (k + r - 1) mod 2), each env=BLOOMERY_DRAFT=off (the seat's serving default is the DSpark draft, UNSET_SERVES_DSPARK in serve_seats/inkling2.rs, so unset
+  would time the verify path the fold does not touch), DEPTH_SERVE_N=256, D 512, ctx unset (the plan picks it, the same in every arm: the plan record must
+  not drift). The arms are the two trees' own builds in their remote dirs ~/repo/bloomery-inkland-base and ~/repo/bloomery-inkland (the line the justfile builds
+  bloomery-serve with, run before the lease; both binaries' sha256 recorded). Inside the window: each arm's log carries `draft rule ... BLOOMERY_DRAFT=off`;
+  the 5090 alone (no compute process but ours, ComfyUI not running, /root/agents/LEAD-TIMING-HOLD up so the other round's gates wait); a row marked [cold] is
+  out of the means. The two arms are two builds, so a difference under 1 % would carry the link layout; the band's low edge is 7 %.
+decide-in: the effect is inside the band: the fold stacks on #1208 as the paper says; the table is the lease number for the PR (with the two binaries' sha256),
+  and the pieces' 0.484 ms is confirmed on the new base
+decide-below: under +7.0 %: between +5 and +7 the fold took part of its term from the attention change (partial overlap: the per-node time shrank), report the
+  effect and the saved ms against 0.484; under +5 % the same term is shared, so name which piece lost it (a conv tail kernel waits on the attention kernel's
+  tail?) and ask for an nsys round (needs a lease) before the PR claims a number; a slow new arm (one round far from the others) first reruns the pair
+decide-above: over +10.5 %: the base arm is slow or the fold does more than its 0.484 ms; read the per-round table, then rerun with an A/A arm of base before
+  crediting

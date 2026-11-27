@@ -11,14 +11,17 @@
 //! A block of [`THREADS`] threads first norms its site's input into shared memory as `rms_norm`
 //! does: thread `tid` sums the squares of values `tid, tid + 256, …` (`acc += v · v` in that
 //! order), the warp butterfly, the fixed eight-warp tree, `rms_scale_checked`, and each value
-//! `(scale · gain) · x`. Then each warp walks one row with the site's own gemv lane walk
-//! ([`q8_0_lane_partial_1col`], [`f32_lane_partial_1col`]) over the normed row and the warp
-//! butterfly, and lane 0 writes the sum. Every block of a site norms the same input in the same
-//! order, so every block's normed row is `rms_norm`'s bits, and every output the site's gemv's.
+//! `(scale · gain) · x`. Then each warp walks its rows with the site's own gemv lane walk over the
+//! normed row and the warp butterfly, and lane 0 writes the sum: one row an F32 site's block
+//! ([`f32_lane_partial_1col`], [`ROWS`] rows), two a Q8_0 site's ([`q8_0_pair_partials`] at one
+//! token, rows `r` and `r + ROWS`, [`STEP_Q8_ROWS`] rows, the last block of a site the rows its
+//! count leaves). Every block of a site norms the same input in the same order, so every block's
+//! normed row is `rms_norm`'s bits, and every output the site's gemv's.
 //!
 //! Two entries:
 //!
-//! - `norm_proj_q8_f32`: one token, the block above.
+//! - `norm_proj_q8_f32`: one token, the block above, four blocks an SM: the launch's blocks (about
+//!   550 on the Mini) are one wave of the card.
 //! - `norm_proj_q8_f32_cols`: `m` (1..=[`MAX_COLS`]) tokens of each input, token after token, in
 //!   groups of `cols` tokens (`cols · k` at most [`GROUP_VALUES`], `cols` at most
 //!   [`GROUP_COLS`]): a block is one group of [`COLS_ROWS`] rows of a Q8_0 site or [`ROWS`] of an
@@ -41,7 +44,7 @@ use crate::elem::{RMS_THREADS, RMS_WARPS, rms_scale_checked, rms_warp_tree};
 use crate::fault::FaultSink;
 use crate::q8f32::{
     Q8_0Bytes, Q8_STEP, block_code, f32_lane_partial_1col, f32_lane_partials, gemv_lane_sums,
-    q8_0_lane_partial_1col, q8_0_lane_partials_mcol, word_dot,
+    q8_0_lane_partials_mcol, word_dot,
 };
 use crate::{DeviceTensor, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -55,8 +58,11 @@ use std::sync::Arc;
 /// Threads a block: `rms_norm`'s block, eight warps.
 pub const THREADS: usize = 256;
 const WARPS: usize = THREADS / 32;
-/// Rows a block: one a warp.
+/// Rows a block of an F32 site, and the rows of one pass of a Q8_0 block: one a warp.
 pub const ROWS: usize = WARPS;
+/// Rows a `norm_proj_q8_f32` block of a Q8_0 site walks: two a warp, rows `r` and `r + ROWS` of
+/// its warp's pair ([`q8_0_pair_partials`]), so a block's norm is paid once for sixteen rows.
+pub const STEP_Q8_ROWS: usize = 2 * ROWS;
 /// The widest input row a launch norms (its shared row).
 pub const MAX_K: usize = 3072;
 /// The sites a launch projects: five Q8_0, three F32.
@@ -188,22 +194,29 @@ unsafe fn stage_group(xn: *mut f32, src: &[f32], len: usize, tid: usize) {
     store!(vals, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
 }
 
-/// Rows a `_cols` block of site `site` walks: [`COLS_ROWS`] for a Q8_0 site (four a warp, a pair
-/// at a time by [`q8_0_pair_partials`]), [`ROWS`] for an F32 site (one a warp).
+/// Rows a block of site `site` walks when a block of a Q8_0 site walks `q8`: `q8` for a Q8_0 site
+/// ([`COLS_ROWS`] in the `_cols` entry, four a warp, a pair at a time by [`q8_0_pair_partials`];
+/// [`STEP_Q8_ROWS`] in the one-token entry, two a warp), [`ROWS`] for an F32 site (one a warp).
 #[inline(always)]
-const fn cols_rows(site: usize) -> usize {
-    if site < 5 { COLS_ROWS } else { ROWS }
+const fn block_rows(site: usize, q8: usize) -> usize {
+    if site < 5 { q8 } else { ROWS }
 }
 
-/// The site whose `_cols` blocks hold block `blk` ([`SITES`] past the last), its first block, and
-/// the input it reads: `norm_proj`'s block-to-site rule at [`cols_rows`] rows a block, a site's
-/// last block holding the rows its count leaves.
+/// Rows a `_cols` block of site `site` walks ([`block_rows`] at [`COLS_ROWS`]).
 #[inline(always)]
-fn cols_site_of(blk: usize, rows: [u32; SITES], ik: u32, iv: u32) -> (usize, usize, u32) {
+const fn cols_rows(site: usize) -> usize {
+    block_rows(site, COLS_ROWS)
+}
+
+/// The site whose blocks hold block `blk` ([`SITES`] past the last), its first block, and the
+/// input it reads: the block-to-site rule at [`block_rows`] rows a block (`q8` a Q8_0 site's), a
+/// site's last block holding the rows its count leaves.
+#[inline(always)]
+fn site_of(blk: usize, rows: [u32; SITES], (ik, iv): (u32, u32), q8: usize) -> (usize, usize, u32) {
     let mut site = 0usize;
     let mut first = 0usize;
-    while site < SITES && blk >= first + (rows[site] as usize).div_ceil(cols_rows(site)) {
-        first += (rows[site] as usize).div_ceil(cols_rows(site));
+    while site < SITES && blk >= first + (rows[site] as usize).div_ceil(block_rows(site, q8)) {
+        first += (rows[site] as usize).div_ceil(block_rows(site, q8));
         site += 1;
     }
     let input = match site {
@@ -375,19 +388,37 @@ unsafe fn q8_0_pair_partials<const M: usize>(
     [[p00, p01, p02, p03], [p10, p11, p12, p13]]
 }
 
+/// A Q8_0 site's output at `row` and, when `nr` is 2, at `row + ROWS`: the warp's pair of sums.
+///
+/// # Safety
+///
+/// `y` holds a value at `row` and, when `nr` is 2, at `row + ROWS`, and the caller alone writes
+/// them.
+#[inline(always)]
+unsafe fn store_pair(y: &mut DisjointSlice<f32>, row: usize, (s0, s1): (f32, f32), nr: usize) {
+    // SAFETY: row < y.len() by this fn's contract.
+    unsafe { *y.get_unchecked_mut(row) = s0 };
+    if nr == 2 {
+        // SAFETY: row + ROWS < y.len() by this fn's contract.
+        unsafe { *y.get_unchecked_mut(row + ROWS) = s1 };
+    }
+}
+
 #[cuda_module]
 mod norm_proj_kernels {
     use super::*;
 
-    /// The norms and the eight projections (module doc): block `b` is rows `8·(b − first) ..`
-    /// of the site whose blocks hold `b`, `first` that site's first block.
+    /// The norms and the eight projections (module doc): block `b` is rows
+    /// `STEP_Q8_ROWS · (b − first) ..` of the Q8_0 site, `ROWS · (b − first) ..` of the F32 site,
+    /// whose blocks hold `b`, `first` that site's first block. Four blocks an SM: the register cap
+    /// the fourth sets (64) is what keeps the launch's blocks one wave of the card.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "kernel entry: the device ABI takes the eight sites' planes and outputs flat (rust-quality R8)"
     )]
     #[kernel]
-    #[launch_bounds(256)]
+    #[launch_bounds(256, 4)]
     #[launch_contract(
         domain = 1,
         block = (256, 1, 1),
@@ -473,22 +504,12 @@ mod norm_proj_kernels {
         let blk = thread::blockIdx_x() as usize;
         let tid = thread::threadIdx_x() as usize;
         let k_us = k as usize;
-        // The site whose blocks hold this block, and the block's first row in it.
+        // The site whose blocks hold this block, and the block's first block in it.
         let rows = [rq, rk, rv, rr, rg, rs, rkt, rvt];
-        let mut site = 0usize;
-        let mut first = 0usize;
-        while site < SITES && blk >= first + rows[site] as usize / ROWS {
-            first += rows[site] as usize / ROWS;
-            site += 1;
-        }
+        let (site, first, input) = site_of(blk, rows, (ik, iv), STEP_Q8_ROWS);
         if site >= SITES {
             return; // block-uniform: past the last site's blocks
         }
-        let input = match site {
-            1 | 6 => ik,
-            2 | 7 => iv,
-            _ => 0,
-        };
         let (x, g) = match input {
             0 => (x0, g0),
             1 => (x1, g1),
@@ -533,34 +554,48 @@ mod norm_proj_kernels {
         // past it.
         let xs: &[f32] = unsafe { core::slice::from_raw_parts(xn.cast_const(), k_us) };
         let lane = warp::lane_id() as usize;
-        let row = (blk - first) * ROWS + tid / 32;
-        // Each arm: the site's gemv lane walk of `row` (row < the site's rows: the block's rows
-        // are the site's, ROWS | rows), the butterfly, lane 0's store into the site's output.
-        // SAFETY (every arm): row < the site's rows puts the row's words and scales (or values)
-        // inside its planes by the contract, xs holds k values, k a multiple of 32 (host-checked)
-        // and lane < 32; y has the site's rows by the contract, and only lane 0 of the row's warp
-        // writes slot row.
+        let wi = tid / 32;
+        if site < 5 {
+            // A Q8_0 site: this warp's rows `row0` and `row0 + ROWS` (the second only when the
+            // site's count leaves it), walked together by the `_cols` entry's pair walk at one
+            // token, whose sums are the one-row walk's bit for bit.
+            // The site's planes and row count by a select, then one call: `rows` is indexed only
+            // by the loop that finds the site, so it stays out of local memory.
+            let (qs, d, site_rows) = match site {
+                0 => (qs_q, d_q, rq),
+                1 => (qs_k, d_k, rk),
+                2 => (qs_v, d_v, rv),
+                3 => (qs_r, d_r, rr),
+                _ => (qs_g, d_g, rg),
+            };
+            let row0 = (blk - first) * STEP_Q8_ROWS + wi;
+            let nr = 1 + usize::from(row0 + ROWS < site_rows as usize);
+            // SAFETY: the rows row0 + ROWS · i below the site's count (i < nr) lie inside its
+            // planes by the contract, xs holds k values, k a multiple of 32 (host-checked) and
+            // lane < 32.
+            let p = unsafe { q8_0_pair_partials::<1>(qs, d, xs, k_us, row0, nr, lane) };
+            let (s0, s1) = (warp::reduce_sum_f32(p[0][0]), warp::reduce_sum_f32(p[1][0]));
+            if lane == 0 {
+                // SAFETY: row0 and, when nr is 2, row0 + ROWS are below the site's rows, which the
+                // site's output holds by the contract; only lane 0 of the warp writes them.
+                unsafe {
+                    match site {
+                        0 => store_pair(&mut y_q, row0, (s0, s1), nr),
+                        1 => store_pair(&mut y_k, row0, (s0, s1), nr),
+                        2 => store_pair(&mut y_v, row0, (s0, s1), nr),
+                        3 => store_pair(&mut y_r, row0, (s0, s1), nr),
+                        _ => store_pair(&mut y_g, row0, (s0, s1), nr),
+                    }
+                }
+            }
+            return;
+        }
+        // An F32 site: each warp walks one row, ROWS | the site's rows.
+        let row = (blk - first) * ROWS + wi;
+        // SAFETY (every arm): row < the site's rows puts the row's values inside its plane by the
+        // contract, xs holds k values, k a multiple of 32 (host-checked) and lane < 32; y has the
+        // site's rows by the contract, and only lane 0 of the row's warp writes slot row.
         let s = match site {
-            // SAFETY: as above.
-            0 => warp::reduce_sum_f32(unsafe {
-                q8_0_lane_partial_1col(qs_q, d_q, xs, k, row, 0, lane)
-            }),
-            // SAFETY: as above.
-            1 => warp::reduce_sum_f32(unsafe {
-                q8_0_lane_partial_1col(qs_k, d_k, xs, k, row, 0, lane)
-            }),
-            // SAFETY: as above.
-            2 => warp::reduce_sum_f32(unsafe {
-                q8_0_lane_partial_1col(qs_v, d_v, xs, k, row, 0, lane)
-            }),
-            // SAFETY: as above.
-            3 => warp::reduce_sum_f32(unsafe {
-                q8_0_lane_partial_1col(qs_r, d_r, xs, k, row, 0, lane)
-            }),
-            // SAFETY: as above.
-            4 => warp::reduce_sum_f32(unsafe {
-                q8_0_lane_partial_1col(qs_g, d_g, xs, k, row, 0, lane)
-            }),
             // SAFETY: as above.
             5 => warp::reduce_sum_f32(unsafe { f32_lane_partial_1col(w_s, xs, k, row, lane) }),
             // SAFETY: as above.
@@ -572,11 +607,6 @@ mod norm_proj_kernels {
             // SAFETY: as above.
             unsafe {
                 match site {
-                    0 => *y_q.get_unchecked_mut(row) = s,
-                    1 => *y_k.get_unchecked_mut(row) = s,
-                    2 => *y_v.get_unchecked_mut(row) = s,
-                    3 => *y_r.get_unchecked_mut(row) = s,
-                    4 => *y_g.get_unchecked_mut(row) = s,
                     5 => *y_s.get_unchecked_mut(row) = s,
                     6 => *y_kt.get_unchecked_mut(row) = s,
                     _ => *y_vt.get_unchecked_mut(row) = s,
@@ -587,7 +617,7 @@ mod norm_proj_kernels {
 
     /// The norms and the eight projections of `m` tokens in groups of `cols` (module doc): block
     /// `b` is token group `b % groups` of rows `cols_rows · (b / groups − first) ..` of the site
-    /// whose blocks hold `b / groups` ([`cols_site_of`]), `groups = ⌈m / cols⌉`.
+    /// whose blocks hold `b / groups` ([`site_of`] at [`COLS_ROWS`]), `groups = ⌈m / cols⌉`.
     /// Two blocks an SM: two blocks' shared rows fit an SM's shared memory, and the register
     /// cap the second block sets is what keeps both resident.
     #[allow(
@@ -692,7 +722,7 @@ mod norm_proj_kernels {
         let groups = m_us.div_ceil(cols_us);
         let (row_block, group) = (blk / groups, blk % groups);
         let rows = [rq, rk, rv, rr, rg, rs, rkt, rvt];
-        let (site, first, input) = cols_site_of(row_block, rows, ik, iv);
+        let (site, first, input) = site_of(row_block, rows, (ik, iv), COLS_ROWS);
         if site >= SITES {
             return; // block-uniform: past the last site's blocks
         }
@@ -972,7 +1002,8 @@ impl NormProjKernels {
     }
 
     /// Enqueue the norms and the projections of `a` over `m` tokens (module doc): at `m` 1
-    /// `norm_proj_q8_f32`, `Σ rows / 8` blocks of 256 threads; past it `norm_proj_q8_f32_cols`,
+    /// `norm_proj_q8_f32`, `Σ ⌈q8 rows / 16⌉ + Σ f32 rows / 8` blocks of 256 threads; past it
+    /// `norm_proj_q8_f32_cols`,
     /// `Σ ⌈rows / cols_rows⌉` blocks for each group of `cols = min(GROUP_COLS, GROUP_VALUES / k)`
     /// tokens. An input is `m · k` values, token after token, and a site's output `m` times its
     /// rows, token-major. A width that is not a positive multiple of 32 or past [`MAX_K`], `m`
@@ -1049,7 +1080,13 @@ impl NormProjKernels {
         } else {
             (0, 0)
         };
-        let blocks: usize = (q8_rows.iter().sum::<usize>() + rs + rkt + rvt) / ROWS;
+        // The one-token entry's blocks: a Q8_0 site's rows in blocks of `STEP_Q8_ROWS`, its last
+        // block the rows its count leaves, an F32 site's in blocks of `ROWS`.
+        let blocks: usize = q8_rows
+            .iter()
+            .map(|r| r.div_ceil(STEP_Q8_ROWS))
+            .sum::<usize>()
+            + (rs + rkt + rvt) / ROWS;
         // The `_cols` entry's blocks: each site's rows in blocks of `cols_rows`, its last block the
         // rows its count leaves.
         let cols_blocks: usize = q8_rows

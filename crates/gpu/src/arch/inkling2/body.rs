@@ -18,16 +18,18 @@
 //!    k and v norms);
 //! 4. the projections of q, k, v, the relative rows, the sink logits and the output gate (and a
 //!    windowless visit's conv taps), one launch with the input norms (`norm_proj`) where q, k, v,
-//!    rel and gate are Q8_0 and the sinks and taps F32, the k and v short convs on the visit's
-//!    ring, the epilogues
-//!    and the f16 append (`qk_clip`), the rel-bias attention with the per-query sink
-//!    (`rel_bias`), the sigmoid output gate, the output projection and its post conv;
+//!    rel and gate are Q8_0 and the sinks and taps F32, then one launch (`qk_clip`) for the k and
+//!    v short convs on the visit's ring, the epilogues and the f16 append, the rel-bias attention
+//!    with the per-query sink (`rel_bias`), the sigmoid output gate, the output projection and
+//!    its post conv (one launch where the projection is Q8_0, `conv_tail`);
 //! 5. the block join: a visit of a block's first layer banks the stream and the attention output
-//!    is the new stream; any other adds the two;
+//!    is the new stream; any other adds the two (the add is in the output projection's launch
+//!    where that runs the post conv);
 //! 6. the feed-forward block in the three parts a placed body attaches its host tier between:
 //!    the front ([`Walk::ffn_front`]: the mix, the ffn controller where the messages run, the
 //!    ffn norm and the router), the shadow ([`Walk::ffn_shadow`]: the card's slots, every expert
-//!    resident) and the back ([`Walk::ffn_back`]: the post conv and the stream's sum).
+//!    resident, and in the sum's launch the post conv and the stream's sum) and the back
+//!    ([`Walk::ffn_back`], where the host tier made the sum: the post conv and the stream's sum).
 //!
 //! After the last visit the head's mix of the banked blocks and the stream is the output head's
 //! input; the head softcaps the logits and writes the padded columns past the unpadded
@@ -49,7 +51,7 @@ use super::state::{self, StepIn, VisitStore, WORD_POS, WORD_RING, WORD_TOKEN};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs, MAX_NQ, MAX_VECS};
 use crate::attn_res_step::{AttnResStepKernels, MixStepScratch};
-use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
+use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
 use crate::draft_taps::DraftTaps;
 use crate::flash_gqa::{FlashGqaKernels, window_segments};
 use crate::folder::Model;
@@ -61,6 +63,7 @@ use crate::host::swap::Residency;
 use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec, hosted_stacks_named};
 use crate::kquant::Act;
 use crate::linear::conv_res::{ConvResArgs, ConvResKernels};
+use crate::linear::conv_tail::{CardAccConvArgs, ConvTailKernels, GemvConvArgs, TailConvArgs};
 use crate::linear::out_gate::{OutGateArgs, OutGateKernels};
 use crate::loop_control::{LoopControlArgs, LoopControlKernels, MAX_MODULES, scratch_len};
 use crate::model::{
@@ -70,7 +73,7 @@ use crate::model::{
 use crate::norm_proj::{self, F32Site, NormProjArgs, NormProjKernels, Q8Site};
 use crate::norm_proj_bf16::{self, Bf16Site, NormProjBf16Args, NormProjBf16Kernels};
 use crate::q38::{EmbedIo, Q38Kernels};
-use crate::qk_clip::{QkClipArgs, QkClipKernels};
+use crate::qk_clip::{CONV_TAPS, QkClipArgs, QkClipConv, QkClipKernels};
 use crate::rel_bias::{REL, RelBiasArgs, RelBiasKernels};
 use crate::routed_block::RouteIn;
 use crate::site::{self, KGemvKernels, SiteTy};
@@ -127,6 +130,8 @@ pub(super) const DENSE_TYPES: &[SiteTy] = &[
     SiteTy::F32,
     SiteTy::Bf16,
 ];
+// The shadow's sum is the eight-slot entry's.
+const _: () = assert!(N_USED == crate::card_slots::SLOTS_8);
 /// The logit the head writes at a padded column: far under any softcapped logit, finite, so the
 /// argmax reads the unpadded vocabulary and the finite argmax's check holds.
 pub const PAD_LOGIT: f32 = -1.0e30;
@@ -260,6 +265,8 @@ struct Kernels {
     proj_bf16: NormProjBf16Kernels,
     ctrl: LoopControlKernels,
     conv: ConvResKernels,
+    /// The post convs run in the tails of the output projection and the card sum.
+    tail: ConvTailKernels,
     clip: QkClipKernels,
     rel: RelBiasKernels,
     out_gate: OutGateKernels,
@@ -283,6 +290,7 @@ impl Kernels {
             proj_bf16: NormProjBf16Kernels::load(ctx)?,
             ctrl: LoopControlKernels::load(ctx)?,
             conv: ConvResKernels::load(ctx)?,
+            tail: ConvTailKernels::load(ctx)?,
             clip: QkClipKernels::load(ctx)?,
             rel: RelBiasKernels::load(ctx)?,
             out_gate: OutGateKernels::load(ctx)?,
@@ -1070,6 +1078,16 @@ impl Body {
                 ),
             ));
         }
+        if hp.conv != CONV_TAPS {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} conv taps: the step's k and v convs run inside the epilogue launch, \
+                     built for {CONV_TAPS}",
+                    hp.conv
+                ),
+            ));
+        }
         let kvw = n_kv * HEAD;
         let d = Dims {
             n,
@@ -1312,6 +1330,13 @@ impl Body {
     #[must_use]
     pub fn norm_proj(&self, l: usize) -> bool {
         self.layers.get(l).is_some_and(|x| x.norm_proj)
+    }
+
+    /// Whether stored layer `l`'s output projection runs its post conv and join in its own launch
+    /// (a Q8_0 projection) on a step without the imatrix collector.
+    #[must_use]
+    pub fn o_tail(&self, l: usize) -> bool {
+        self.layers.get(l).is_some_and(|x| x.o.ty == SiteTy::Q8_0)
     }
 
     /// The stored layers the visits run.
@@ -1590,8 +1615,7 @@ impl Body {
                     let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
                     walk.attn_half(slot, (l, layer), &mut stores[slot], msg)?;
                     walk.ffn_front(slot, layer, msg)?;
-                    walk.ffn_shadow(slot, layer)?;
-                    walk.ffn_back(slot, layer, &mut stores[slot])?;
+                    walk.ffn_shadow(slot, layer, &mut stores[slot])?;
                     if let Some(t) = taps.as_mut() {
                         walk.tap(t, slot)?;
                     }
@@ -2061,44 +2085,14 @@ impl<'a> Walk<'a> {
                 tv.project(cx, acts, slot, &s.xn[iv], &mut s.v_taps)?;
             }
         }
-        // The k and v short convs on the visit's ring.
+        // The k and v short convs on the visit's ring run inside the epilogue's launch, which
+        // appends the key and value rows.
         let ring = Ring::new(d.taps);
         let (heads, dynamic) = if layer.windowed {
             (0, false)
         } else {
             (d.n_kv, true)
         };
-        {
-            let s = &mut *self.s;
-            let kvw = d.n_kv * HEAD;
-            for (j, (x, taps, y)) in [
-                (&s.k_raw, &s.k_taps, &mut s.k),
-                (&s.v_raw, &s.v_taps, &mut s.v),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                self.k.conv.enqueue(
-                    stream,
-                    ConvResArgs {
-                        ring,
-                        d: kvw,
-                        base: d.bases[j],
-                        ch: d.ch,
-                        heads,
-                        m: 1,
-                        x,
-                        weights: w.f32_buf(STEP, &layer.convs[j])?,
-                        dynamic: taps,
-                        pos: &self.step_in.pos,
-                        fault,
-                        scale: conv_scale(d.taps, dynamic),
-                        y,
-                        state: &mut store.conv,
-                    },
-                )?;
-            }
-        }
         {
             let (s, step_in) = (&mut *self.s, &*self.step_in);
             let word = if store.shape.ring {
@@ -2107,7 +2101,7 @@ impl<'a> Walk<'a> {
                 WORD_POS
             };
             let at = Window::<u32>::of(&step_in.words, word * 4, 1)?;
-            self.k.clip.enqueue(
+            self.k.clip.enqueue_conv(
                 stream,
                 QkClipArgs {
                     q: &mut s.q,
@@ -2132,6 +2126,21 @@ impl<'a> Walk<'a> {
                     fault,
                     cache_k: &mut store.kc,
                     cache_v: &mut store.vc,
+                },
+                QkClipConv {
+                    ring,
+                    ch: d.ch,
+                    base: [d.bases[0], d.bases[1]],
+                    heads,
+                    scale: conv_scale(d.taps, dynamic),
+                    x: [&s.k_raw, &s.v_raw],
+                    weights: [
+                        w.f32_buf(STEP, &layer.convs[0])?,
+                        w.f32_buf(STEP, &layer.convs[1])?,
+                    ],
+                    dynamic: [&s.k_taps, &s.v_taps],
+                    pos: &step_in.pos,
+                    state: &mut store.conv,
                 },
             )?;
             self.k.rel.enqueue(
@@ -2171,7 +2180,44 @@ impl<'a> Walk<'a> {
                 },
             )?;
         }
-        {
+        // The block join: a block's first layer banks the stream and its attention output is the
+        // new stream; any other adds the two.
+        let banked = l % self.block == 0;
+        if banked && self.pushed + 1 >= MAX_VECS {
+            return Err(GpuError::shape(
+                STEP,
+                format!("a bank past {} blocks at visit {slot}", self.pushed),
+            ));
+        }
+        // A Q8_0 output projection runs its post conv and the add of the join in its own launch,
+        // unless the imatrix collector reads the projection's input.
+        let in_tail = layer.o.ty == SiteTy::Q8_0 && crate::imatrix::collector().is_none();
+        if in_tail {
+            let (qs, planes) = w.q8_planes(STEP, &layer.o.name)?;
+            let s = &mut *self.s;
+            self.k.tail.enqueue_gemv_conv(
+                stream,
+                GemvConvArgs {
+                    qs,
+                    d: planes,
+                    x: &s.gated,
+                    conv: TailConvArgs {
+                        ring,
+                        ch: d.ch,
+                        base: d.bases[2],
+                        scale: conv_scale(d.taps, false),
+                        weights: w.f32_buf(STEP, &layer.convs[2])?,
+                        pos: &self.step_in.pos,
+                        state: &mut store.conv,
+                    },
+                    join: !banked,
+                    stream: &s.x,
+                    fault,
+                    out: &mut s.attn_out,
+                    joined: &mut s.ffn_inp,
+                },
+            )?;
+        } else {
             let (cx, acts, s) = (&self.cx, &mut *self.acts, &mut *self.s);
             layer.o.project(cx, acts, slot, &s.gated, &mut s.o)?;
             self.k.conv.enqueue(
@@ -2194,20 +2240,14 @@ impl<'a> Walk<'a> {
                 },
             )?;
         }
-        // The block join: a block's first layer banks the stream and its attention output is the
-        // new stream; any other adds the two.
         let s = &mut *self.s;
-        self.banked = l % self.block == 0;
-        if self.banked {
-            if self.pushed + 1 >= MAX_VECS {
-                return Err(GpuError::shape(
-                    STEP,
-                    format!("a bank past {} blocks at visit {slot}", self.pushed),
-                ));
-            }
+        self.banked = banked;
+        if banked {
             let mut row = WindowMut::<f32>::of_mut(&mut s.banks, self.pushed * n * 4, n)?;
             copy_row(stream, &s.x, &mut row, n)?;
             self.pushed += 1;
+            Ok(())
+        } else if in_tail {
             Ok(())
         } else {
             gpu.elem()
@@ -2302,10 +2342,19 @@ impl<'a> Walk<'a> {
             .transpose()
     }
 
-    /// The feed-forward block's shadow: every pick on the card's slots (every expert resident,
-    /// so a pick's id is its place), the slots' weighted sum.
-    fn ffn_shadow(&mut self, slot: usize, layer: &Layer) -> Result<(), GpuError> {
+    /// The feed-forward block's shadow and back where every expert is resident: every pick on the
+    /// card's slots (every expert resident, so a pick's id is its place), then one launch for the
+    /// slots' weighted sum, the post conv of the sum and the stream's add. A placed layer's host
+    /// tier makes the sum another way and runs [`Walk::ffn_back`].
+    fn ffn_shadow(
+        &mut self,
+        slot: usize,
+        layer: &Layer,
+        store: &mut VisitStore,
+    ) -> Result<(), GpuError> {
         let (gpu, w) = (self.cx.gpu, self.cx.w);
+        let stream = gpu.stream();
+        let d = self.d;
         let stacks = layer_card_stacks(w, layer)?;
         let forced = self.forced_picks(slot)?;
         let s = &mut *self.s;
@@ -2319,21 +2368,39 @@ impl<'a> Walk<'a> {
             normed: &s.fxn,
             m: 1,
             sel,
-            n_card: self.d.n_expert,
+            n_card: d.n_expert,
             rule: self.act,
         };
-        self.k.leg.enqueue(
-            gpu,
-            &mut s.leg,
-            &run,
-            Some(LegSum {
+        self.k.leg.enqueue(gpu, &mut s.leg, &run, None)?;
+        let inp = if self.banked { &s.attn_out } else { &s.ffn_inp };
+        self.k.tail.enqueue_card_acc_conv(
+            stream,
+            CardAccConvArgs {
+                down: s.leg.down(),
                 w: weights,
+                sel,
+                n_card: d.n_expert,
+                n: d.n,
+                conv: TailConvArgs {
+                    ring: Ring::new(d.taps),
+                    ch: d.ch,
+                    base: d.bases[3],
+                    scale: conv_scale(d.taps, false),
+                    weights: w.f32_buf(STEP, &layer.convs[3])?,
+                    pos: &self.step_in.pos,
+                    state: &mut store.conv,
+                },
+                inp,
+                fault: gpu.layer_sink(slot)?,
                 acc: &mut s.moe,
-            }),
+                conv_out: &mut s.ffn_out,
+                y: &mut s.x,
+            },
         )
     }
 
-    /// The feed-forward block's back: the post conv of the routed sum, the stream's sum.
+    /// The feed-forward block's back where the host tier made the routed sum: its post conv and
+    /// the stream's sum.
     fn ffn_back(
         &mut self,
         slot: usize,
