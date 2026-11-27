@@ -36,8 +36,11 @@ For each entry it prints the unified diff of the two canonical bodies (N lines o
 ENTRY:NEW_ENTRY compares a renamed entry. --all compares every entry the two files share and lists
 the ones only one file has (`only in base`, `only in new`: a deleted or an added kernel), then a
 count line. Exit 0 when every compared entry is identical, reordered-only with every swapped pair
-independent (below) or value-equal (below), 1 when one differs or its reorder is not shown
-independent, 2 on a usage error or a named entry that a file does not hold.
+independent and the value proof holding (below) or value-equal (below), 1 when one differs or its
+reorder is not shown safe, 2 on a usage error or a named entry that a file does not hold. --all also
+ends 1 with a named line when an entry is on one side only (a deleted or an added kernel is no proof
+of an unchanged program) or when the two files share no entry (nothing was compared), and 2 when a
+file holds no `.visible .entry` at all (an empty or unreadable module).
 
 --scans compares two saved `tools/ptx-scan.sh` outputs (stdout, or stdout and stderr together): the
 table rows by entry, column by column, and the md5 block by entry. Two md5 blocks compare only under
@@ -58,13 +61,16 @@ over a skipped cell) or that holds a skipped cell in any other column is refused
 every pair of lines whose relative order changed: the pair is independent when the two lines share
 no register and neither is a memory, synchronisation or control line (anything but the pure
 arithmetic, move, convert, compare and select opcodes listed in PURE: a load, a store, an atomic,
-a barrier, a shuffle, a branch, a call, a label, a directive, and every opcode not in PURE). All
-pairs independent: no swapped line touches a register the other touches, and neither touches
-memory or control flow, so the swap cannot change a value. Otherwise the line says `read the diff`
-and the exit code is 1: a same-multiset reorder can still move a value. A reorder that
-changes the order in which one register class first appears renumbers everything after it and
-reads `differs` unless the `value-equal` proof below holds: the verdict errs toward `differs`,
-never toward `identical`.
+a barrier, a shuffle, a branch, a call, a label, a directive, and every opcode not in PURE). That
+screen reads an opcode's root and a register's name only, so it cannot see a carry flag (`addc`,
+`.cc`), a read of `%clock` or of a register outside REG_CLASSES (`%SPL`), or a second instruction
+on one line. A reorder therefore reads `reordered-only` with exit 0 only when every swapped pair
+passes the screen AND the `value-equal` proof below holds over the same two bodies: the proof
+classifies every line with the one rule (`classify`), the screen is a label. A reorder that passes
+the screen and not the proof, or fails the screen, says `read the diff` and the exit code is 1: a
+same-multiset reorder can still move a value. A reorder that changes the order in which one
+register class first appears renumbers everything after it and reads `differs` unless the
+`value-equal` proof below holds: the verdict errs toward `differs`, never toward `identical`.
 
 `value-equal` is the verdict for what numbering by first appearance cannot absorb. It is not a
 renaming: the same value may sit in another register, and pure lines may change places inside a
@@ -87,7 +93,12 @@ naming why.
   - The two bodies must also hold the same lines once register names are erased: no line added,
     dropped or rewritten, an immediate included.
 What it does not prove: it knows no arithmetic. A changed opcode, modifier, width or immediate, a
-line added or dropped, a swapped commutative operand and a folded constant all read `differs`; a line
+line added or dropped, a swapped commutative operand and a folded constant all read `differs`. An
+integer constant is a decimal (the bare `0` or a nonzero-led one), a negative one or a `0x` hex on an
+integer or bit move, and a hex-float literal (`0f…`, `0d…`) one on a bit or float move; an octal literal
+(`010` is 8 in PTX), an integer literal on a float move (the value or the bits: the ISA text does not
+say) and a hex-float literal on a signed or unsigned move are no constant and compare by their text. A
+line holding two instructions (`a; b;`) ends the proof. A line
 whose opcode is in neither the PURE list nor the anchor lists ends the proof there (`differs`, never
 a guess). It compares values, not timing: a pure line may move, so when a value is ready is not
 compared. It says nothing about the registers, spills or SASS the backend makes of the bodies
@@ -97,7 +108,11 @@ cannot show independent (two lines that read one register) is tried here too.
 
 The body is cut as `ptx::body` cuts it: from just past `.visible .entry <name>(` to the line of
 the next `.entry` or `.func` directive. The body of a device function the entry calls lies outside
-it, as it does for the scan's digest.
+it, as it does for the scan's digest. Three things are therefore compared by no verdict here, and
+`identical` says nothing about them: the body of a `.func` an entry calls, the initializer of a
+module table that is not a generated symbol (kept by name), and which of two generated symbols with
+one signature an entry names (each entry is a renaming of itself, the module need not be). A change
+that touches one of them is not provable by this tool or by `tools/canon-check.sh`: run the owning gates.
 
 Getting the module PTX of a gate binary (what ptx-scan reads), once for the base tree's binary and
 once for the changed tree's, on the box:
@@ -399,7 +414,9 @@ ANCHOR_DEF0 = {"ld", "ldu", "atom", "shfl", "vote", "match", "redux", "ldmatrix"
                "elect"}
 # Pure by root, but they carry the hidden carry flag, so they are anchors too.
 CARRY_ROOTS = {"addc", "subc", "madc"}
-IMMEDIATE = re.compile(r"-?(0[xX][0-9a-fA-F]+|[0-9]+)")
+# A PTX decimal literal starts with a nonzero digit: `010` is octal 8, not 10. Only the bare `0`, a nonzero-led decimal
+# and a `0x` hex are read as constants; an octal or binary literal (and any suffixed one) is no constant here.
+IMMEDIATE = re.compile(r"-?(0[xX][0-9a-fA-F]+|0|[1-9][0-9]*)")
 MOV_TYPE = re.compile(r"[busf](8|16|32|64)")
 
 
@@ -506,6 +523,9 @@ def line_parts(toks):
     rest = toks[i:]
     if rest and rest[-1] == ";":
         rest = rest[:-1]
+    if ";" in rest:
+        # a second instruction on the line would be read as operands of the first and its effect left out
+        raise Unproved(f"two instructions on one line: {line_text(toks)}")
     ops, cur, depth = [], [], 0
     for t in rest:
         if t == " ":
@@ -665,12 +685,15 @@ def const_bits(mnem, cls, o):
     m = MOV_TYPE.fullmatch(mnem.rsplit(".", 1)[-1])
     if m is None:
         return None
-    width = int(m.group(1))
-    if re.fullmatch(r"0[fF][0-9a-fA-F]{8}", text) and width == 32:
+    width, kind = int(m.group(1)), m.group(0)[0]
+    # A hex-float literal is the bits of a float: read on a bit or float move only, not on a signed or unsigned one.
+    if re.fullmatch(r"0[fF][0-9a-fA-F]{8}", text) and width == 32 and kind in "bf":
         return (cls, 32, int(text[2:], 16))
-    if re.fullmatch(r"0[dD][0-9a-fA-F]{16}", text) and width == 64:
+    if re.fullmatch(r"0[dD][0-9a-fA-F]{16}", text) and width == 64 and kind in "bf":
         return (cls, 64, int(text[2:], 16))
-    if IMMEDIATE.fullmatch(text):
+    if IMMEDIATE.fullmatch(text) and kind != "f":
+        # An integer literal on a float move may be the float's value or its bits (ptxas decides, the ISA text does not):
+        # it is no constant, and stays a literal operand compared by its text.
         neg = text.startswith("-")
         digits = text.lstrip("-")
         v = int(digits, 16) if digits[:2] in ("0x", "0X") else int(digits, 10)
@@ -827,7 +850,8 @@ def prove_value_equal(ba, bb, base_name, new_name, base_decls, new_decls):
 
 def compare(base, new, base_name, new_name, context):
     """Print one entry's diff and verdict line; return the verdict word and whether it fails the
-    run (`differs`, or a reorder not shown independent). `base` and `new` are (path, text, decls)."""
+    run (`differs`, or a reorder not shown safe: dependent pairs, or a screen the value proof does not back).
+    `base` and `new` are (path, text, decls)."""
     (base_path, base_text, base_decls), (new_path, new_text, new_decls) = base, new
     ba, bb = body(base_text, base_name), body(new_text, new_name)
     if ba is None:
@@ -843,29 +867,34 @@ def compare(base, new, base_name, new_name, context):
                                      n=context, lineterm=""))
     for line in diff:
         print(line)
-    reorder = None
+    reorder = None  # a same-multiset reorder's note when it is not shown safe
+    screened = None  # the note of a same-multiset reorder whose every swapped pair passes the opcode screen
     if sorted(a) == sorted(b):
         pairs, width = moved_pairs(a, b)
         if pairs is None:
-            bad = True
-            note = f"a window of {width} lines, too wide to check pairs; read the diff"
+            reorder = f"a window of {width} lines, too wide to check pairs; read the diff"
         else:
             dependent = [p for p in pairs if not independent(*p)]
-            bad = bool(dependent)
-            note = (f"{len(pairs)} swapped pair(s) in a {width}-line window, every one independent "
-                    "(pure opcodes, no shared register)" if not bad else
-                    f"{len(dependent)} of {len(pairs)} swapped pair(s) share a register or hold a "
-                    "memory, synchronisation or control line; read the diff (first: "
-                    f"{dependent[0][0]!r} / {dependent[0][1]!r})")
-        if not bad:
-            print(f"ptx-canon: {label} reordered-only (same line multiset); {note}")
-            return "reordered-only", False
-        reorder = note
+            if dependent:
+                reorder = (f"{len(dependent)} of {len(pairs)} swapped pair(s) share a register or hold a "
+                           "memory, synchronisation or control line; read the diff (first: "
+                           f"{dependent[0][0]!r} / {dependent[0][1]!r})")
+            else:
+                screened = f"{len(pairs)} swapped pair(s) in a {width}-line window"
+    # The opcode screen reads an opcode's root and a register's name: it cannot see a carry flag, a clock, a register
+    # outside REG_CLASSES or a second instruction on a line. So a reorder that passes it is `reordered-only` with exit 0
+    # only when the value proof also holds over the same two bodies.
     try:
         st = prove_value_equal(ba, bb, base_name, new_name, base_decls, new_decls)
     except Unproved as e:
         unproved = str(e)
+        if screened is not None:
+            reorder = f"{screened} pass the opcode screen, but the value proof does not hold; read the diff"
     else:
+        if screened is not None:
+            print(f"ptx-canon: {label} reordered-only (same line multiset); {screened}, every one independent "
+                  "(pure opcodes, no shared register)")
+            return "reordered-only", False
         print(f"ptx-canon: {label} value-equal ({st['lines']} lines in {st['blocks']} basic "
               f"blocks; {st['anchors']} anchors in the same order on equal operand values; "
               f"{st['exits']} registers leave their blocks equal under a bijection of {st['regs']} "
@@ -1774,6 +1803,81 @@ def value_equal_cases(expect):
     i = dep.index("add.s32 %r6742, %r6742, 1;")
     dep[i], dep[i + 4] = dep[i + 4], dep[i]
     never(rb, dep, "real pair: a store above the add it stores")
+    # --- the soundness review's holes, one pair each (each fails on the tool without its fix)
+    st_r5 = ["st.global.u32 [%rd1+8], %r5;", "ret;"]
+    # an octal literal is not the decimal of its digits: PTX reads `010` as 8
+    never(pre + ["mov.u32 %r5, 010;", "mov.u32 %r6, 10;"] + st_r5,
+          pre + ["mov.u32 %r5, 10;", "mov.u32 %r6, 010;"] + st_r5,
+          "review H1: an octal 010 and a decimal 10 exchanged between two registers", "does not hold")
+    same(pre + ["mov.u32 %r5, 0x10;", "mov.u32 %r6, 16;"] + st_r5,
+         pre + ["mov.u32 %r5, 16;", "mov.u32 %r6, 0x10;"] + st_r5,
+         "review H1: a hex 0x10 and a decimal 16 are one value")
+    # a second instruction on a line is read as operands of the first, and its store would leave the anchors
+    hidden_a = ["ld.global.u32 %r5, [%rd1+16];", "add.s32 %r6, %r2, 1; st.global.u32 [%rd1+16], %r2;",
+                "st.global.u32 [%rd1+20], %r5;", "ret;"]
+    hidden_b = [hidden_a[1], hidden_a[0]] + hidden_a[2:]
+    never(pre + hidden_a, pre + hidden_b,
+          "review H2: a store hidden after a pure instruction on one line moved across the load of its word",
+          "two instructions on one line")
+    # an integer literal on a float move is not the bits of the float literal of that number
+    fmov = ["st.global.f32 [%rd1+8], %f5;", "ret;"]
+    never(pre + ["mov.f32 %f5, 1;", "mov.f32 %f6, 0f00000001;"] + fmov,
+          pre + ["mov.f32 %f6, 1;", "mov.f32 %f5, 0f00000001;"] + fmov,
+          "review H3: an integer literal on a float move read as the bits 0f00000001", "does not hold")
+    same(pre + ["mov.f32 %f5, 1;", "mov.f32 %f6, 2;", "st.global.f32 [%rd1+8], %f5;",
+                "st.global.f32 [%rd1+12], %f6;", "ret;"],
+         pre + ["mov.f32 %f6, 2;", "mov.f32 %f5, 1;", "st.global.f32 [%rd1+8], %f5;",
+                "st.global.f32 [%rd1+12], %f6;", "ret;"],
+         "review H3: the same integer literals on float moves in the other order still prove")
+    # a reorder that passes the opcode screen is `reordered-only` with exit 0 only when the value proof holds too
+    def screened_but_unproved(base, new, what, why):
+        verdict, fails, out, st = judge(base, new)
+        expect(verdict == "reordered-only" and fails and "pass the opcode screen" in out
+               and "every one independent" not in out,
+               f"{what}: want reordered-only refused with the screen passed and the proof not, got {verdict} "
+               f"fails={fails} {out!r}")
+        expect(isinstance(st, str) and why in st, f"{what}: the proof should fail with {why!r}, got {st!r}")
+    named = ["mov.u32 %r5, 0;", "mov.u32 %r6, 0;", "mov.u32 %r7, 0;"]
+    clk = ["sub.s32 %r7, %r6, %r5;", "st.global.u32 [%rd1+16], %r7;", "ret;"]
+    screened_but_unproved(
+        named + ["mov.u32 %r5, %clock;", "mov.u32 %r6, %clock;"] + clk,
+        named + ["mov.u32 %r6, %clock;", "mov.u32 %r5, %clock;"] + clk,
+        "review H4: two reads of %clock swapped", "reads a value")
+    cry = ["st.global.u32 [%rd1+16], %r6;", "ret;"]
+    loaded = pre + ["ld.global.u32 %r3, [%rd1+8];", "ld.global.u32 %r4, [%rd1+12];"] + named
+    screened_but_unproved(
+        loaded + ["add.cc.u32 %r5, %r1, %r2;", "addc.u32 %r6, %r3, %r3;", "add.cc.u32 %r7, %r4, %r4;"] + cry,
+        loaded + ["add.cc.u32 %r5, %r1, %r2;", "add.cc.u32 %r7, %r4, %r4;", "addc.u32 %r6, %r3, %r3;"] + cry,
+        "review H4: an addc moved past the add.cc that is not the one it reads", "anchor")
+    two = ["mov.b64 %rd2, %rd1;", "mov.b64 %rd3, %rd1;"] + named
+    both = ["add.s32 %r5, %r1, 1; st.global.u32 [%rd2+16], %r1;",
+            "add.s32 %r6, %r2, 1; st.global.u32 [%rd3+16], %r2;"]
+    screened_but_unproved(pre + two + both, pre + two + both[::-1],
+                          "review H4: two lines hiding stores to one word through two copies of its address swapped",
+                          "two instructions on one line")
+    spl = ["mov.b64 %SPL, __local_depot0;", "add.u64 %rd2, %SPL, 0;", "st.local.u32 [%rd2], %r1;",
+           "ld.local.u32 %r5, [%rd2];", "st.global.u32 [%rd1+16], %r5;", "ret;"]
+    screened_but_unproved(pre + spl, pre + [spl[1], spl[0]] + spl[2:],
+                          "review H4: the frame pointer %SPL read before it is set", "anchor")
+    # ... and the passing case stays reordered-only with exit 0
+    both_named = pre + ["mov.u32 %r3, 0;", "mov.u32 %r4, 0;"]
+    verdict, fails, out, st = judge(both_named + ["add.s32 %r3, %r1, 1;", "mul.lo.s32 %r4, %r2, 3;"] + post[:2] + ["ret;"],
+                                    both_named + ["mul.lo.s32 %r4, %r2, 3;", "add.s32 %r3, %r1, 1;"] + post[:2] + ["ret;"])
+    expect(verdict == "reordered-only" and not fails and "every one independent" in out and isinstance(st, dict),
+           f"two independent pure lines swapped: reordered-only, exit 0, proof holding: {verdict} {out!r}")
+    expect(const_bits("mov.u32", "r", ["010"]) is None and const_bits("mov.u32", "r", ["00"]) is None
+           and const_bits("mov.u32", "r", ["0"]) == ("r", 32, 0)
+           and const_bits("mov.u32", "r", ["0x10"]) == const_bits("mov.u32", "r", ["16"]),
+           "a decimal is 0 or nonzero-led, a hex is 0x…, an octal is no constant")
+    expect(const_bits("mov.f32", "f", ["1"]) is None and const_bits("mov.f16", "h", ["1"]) is None
+           and const_bits("mov.f32", "f", ["0f3F800000"]) == ("f", 32, 0x3F800000)
+           and const_bits("mov.b32", "r", ["0f3F800000"]) == ("r", 32, 0x3F800000)
+           and const_bits("mov.b32", "r", ["1"]) == ("r", 32, 1),
+           "an integer literal on a float move is no constant; a hex float and an integer on a bit move are")
+    expect(const_bits("mov.u32", "r", ["0f3F800000"]) is None and const_bits("mov.s32", "r", ["0f3F800000"]) is None
+           and const_bits("mov.u64", "rd", ["0d3FF0000000000000"]) is None
+           and const_bits("mov.b64", "rd", ["0d3FF0000000000000"]) == ("rd", 64, 0x3FF0000000000000),
+           "a hex-float literal on a signed or unsigned move is no constant")
     # --- the bijection itself
     from_b = Binder()
     expect(from_b.bind("r1", "r2") and from_b.bind("r1", "r2"), "a pair binds, and again")
@@ -1963,6 +2067,32 @@ def self_test():
                    .replace("16 12 0", "16 12 0 1"))
         msg = refused(lambda: compare_scans(a, wide))
         expect(msg is not None and "other table columns" in msg, f"two tables of other columns refused: {msg}")
+
+        # --all reads nothing it was not given: a file with no entry is refused, and no shared entry or an entry on one
+        # side only is a named exit 1 (a deleted or an added kernel is no proof of an unchanged program)
+        def entry_module(*names):
+            return "".join(f".visible .entry {n}(\n)\n{{\n\tret;\n}}\n" for n in names)
+
+        def run_all(x, y):
+            with contextlib.redirect_stdout(io.StringIO()) as o:
+                code = main(["--all", x, y])
+            return code, o.getvalue()
+        ab = put("ab.ptx", entry_module("alpha", "beta"))
+        code, out = run_all(ab, ab)
+        expect(code == 0 and "2 shared entries: 2 identical" in out and "--all:" not in out,
+               f"--all over equal modules is exit 0 and says nothing more: {code} {out!r}")
+        for x, y, which in ((ab, put("none.ptx", ""), "none.ptx"), (put("text.ptx", "no entry here\n"), ab, "text.ptx")):
+            msg = refused(lambda: run_all(x, y))
+            expect(msg is not None and which in msg and "holds no `.visible .entry`" in msg,
+                   f"--all over a file with no entry is refused by name ({which}): {msg}")
+        code, out = run_all(ab, put("gamma.ptx", entry_module("gamma")))
+        expect(code == 1 and "ptx-canon: --all: the two files share no entry: nothing was compared" in out,
+               f"--all over modules sharing no entry is exit 1, named: {code} {out!r}")
+        for x, y, counts in ((put("abc.ptx", entry_module("alpha", "beta", "gamma")), ab, "1 only in base, 0 only in new"),
+                             (ab, put("abc2.ptx", entry_module("alpha", "beta", "gamma")), "0 only in base, 1 only in new")):
+            code, out = run_all(x, y)
+            expect(code == 1 and f"ptx-canon: --all: entries on one side only ({counts})" in out,
+                   f"--all with an entry on one side only is exit 1, named ({counts}): {code} {out!r}")
     value_equal_cases(expect)
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
@@ -2002,6 +2132,10 @@ def main(argv):
     rc = 0
     if everything:
         in_base, in_new = entries(base_text), entries(new_text)
+        for path, found in ((base_path, in_base), (new_path, in_new)):
+            if not found:
+                raise Refused(f"{path} holds no `.visible .entry`: nothing to compare (an empty or unreadable "
+                              "module proves nothing)")
         shared = [n for n in in_base if n in set(in_new)]
         tally = {"identical": 0, "reordered-only": 0, "value-equal": 0, "differs": 0}
         for name in shared:
@@ -2018,6 +2152,13 @@ def main(argv):
               f"{tally['reordered-only']} reordered-only, {tally['value-equal']} value-equal, "
               f"{tally['differs']} differ; "
               f"{len(only_base)} only in base, {len(only_new)} only in new")
+        if not shared:
+            print("ptx-canon: --all: the two files share no entry: nothing was compared")
+            rc = 1
+        if only_base or only_new:
+            print(f"ptx-canon: --all: entries on one side only ({len(only_base)} only in base, {len(only_new)} only in "
+                  "new): a deleted or an added kernel is not shown to be the same program")
+            rc = 1
         return rc
     for spec in args[2:]:
         base_name, _, new_name = spec.partition(":")

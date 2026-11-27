@@ -20,7 +20,8 @@
 # Output: one line per entry that moved or is on one side only, then
 #   canon-check: <bins> bins, <entries> entries: <i> identical, <r> reordered-only, <v> value-equal, <d> differs, <o> only-on-one-side; rows <equal|moved: ...>
 # <entries> counts each bin's entries of both sides once; <i> the entries whose md5 is equal and those whose md5 moved and
-# whose canonical body is identical; <r> the reordered-only entries whose every swapped pair ptx-canon shows independent;
+# whose canonical body is identical; <r> the reordered-only entries whose every swapped pair ptx-canon shows independent and
+# whose value proof also holds (a reorder that passes the opcode screen alone is its exit 1, counted as differs);
 # <v> the value-equal entries (ptx-canon's checked proof that the loads, stores, barriers and branches run in the same order on
 # equal values, whatever registers hold them); <d> the entries that differ and the reorders it cannot show independent (its own
 # exit 1: `read the diff`); <o> the entries one side lacks. `rows equal` carries the note when the scans were `--no-jit` (their
@@ -34,11 +35,13 @@
 # and each entry that is not identical is named (`md5 equal; ptx-canon: ...`). <d> there makes the exit code 1 (the digest hid a
 # changed program); reordered-only and value-equal are information only. The default run reads no such entry and its lines and
 # code are the same with or without the flag. It costs one ptx-canon process per pair of kept modules of a bin (about 40 s for
-# the 591 entries of one big module), so it is not the default.
+# the 591 entries of one big module), so it is not the default. A module that holds no `.visible .entry` is left out of the pairs
+# (ptx-canon --all refuses one); an md5-equal entry that no remaining pair answers is still refused by name.
 #
 # Exit codes: 0 only when no entry differs, none is on one side only, every swapped pair is independent and every compared
 # row column is equal; 1 when any of those fails (under `--all` also an md5-equal entry that ptx-canon reads as differing); 2 on
-# a usage error, a scan or log ptx-canon refuses (a failed scan, two digest methods, a column it cannot read), a moved entry
+# a usage error, a scan or log ptx-canon refuses (a failed scan, two digest methods, a column it cannot read), a bin whose two
+# scans hold no entry at all (an empty extraction compared nothing), a moved entry
 # whose module is missing (or in several), a ptx-canon answer this script cannot read (a verdict word it does not know, a
 # known one with the wrong exit code, `renamed-only` included), under `--all` a md5-equal entry no pair of modules answers (or
 # several do), or a narrow-scan run that did not complete — each named, never a silent pass; 75 when narrow-scan is held by
@@ -132,6 +135,9 @@ judge_entry() {
   esac
 }
 
+# has_entry <module>: whether the module text holds a `.visible .entry` (what `ptx-canon --all` reads; it refuses a module with none).
+has_entry() { grep -qE '\.visible \.entry [A-Za-z0-9_$]+\(' "$1"; }
+
 # judge_equal <dir> <bin> <names file>: `--all`'s reading of the bin's entries whose md5 did not move (their names, one per line,
 # from ptx-canon --scans --list-equal). One `ptx-canon --all` per pair of kept modules answers every shared entry of the pair; the
 # answers for the named entries are kept, and each named entry must be answered by exactly one pair. The entries that are not
@@ -145,8 +151,10 @@ judge_equal() {
   done
   for bm in "$dir/base/$b.ptx"/mod[0-9]*.ptx; do
     [ -e "$bm" ] || continue
+    has_entry "$bm" || continue # a module with no entry answers none; the coverage check below still names an entry nobody answers
     for hm in "$dir/head/$b.ptx"/mod[0-9]*.ptx; do
       [ -e "$hm" ] || continue
+      has_entry "$hm" || continue
       run=$dir/canon/$b.all.$(basename "$bm" .ptx)-$(basename "$hm" .ptx)
       python3 "$CANON" --all "$bm" "$hm" > "$run.txt" 2> "$run.err"
       rc=$?
@@ -220,6 +228,7 @@ judge_bin() {
   line=$(sed -En 's/^ptx-canon: scans method=[^ ]+ entries base=([0-9]+) new=([0-9]+) only-base=([0-9]+) only-new=([0-9]+)$/\1 \2 \3 \4/p' "$out")
   [ -n "$line" ] || { refuse "$b: ptx-canon --scans printed no entries line this script can read: $out"; return; }
   read -r nb nn ob on <<< "$line"
+  [ $((nb + nn)) -gt 0 ] || { refuse "$b: both scans hold no entry: nothing was compared (an empty extraction is no proof): $out"; return; }
   line=$(sed -En 's/^ptx-canon: md5 identical=([0-9]+) moved=([0-9]+)$/\1 \2/p' "$out")
   [ -n "$line" ] || { refuse "$b: ptx-canon --scans printed no md5 line this script can read: $out"; return; }
   read -r idn mvn <<< "$line"
@@ -575,6 +584,39 @@ CANON_STUB_PY_EOF
   [ "$rc" = 0 ] && ! grep -qF -- "--all" <<< "$got"; ok "(m) default run, md5s equal over a module ptx-canon would refuse: rc 0 (nothing is read)" $?
   judge_all "$d"
   [ "$rc" = 2 ] && grep -qF "gx: --all: ptx-canon --all" <<< "$got" && grep -qF "entry gamma names __shared_mem_9" <<< "$got" && ! grep -q '^canon-check: 1 bins' <<< "$got"; ok "(m) --all, ptx-canon refuses a module: rc 2, its message named" $?
+  # (n) a bin whose two scans hold no entry compared nothing: refused by name (2), never "0 entries" and rc 0
+  fx "$d" "" ""
+  judge "$d"
+  [ "$rc" = 2 ] && grep -qF "gx: both scans hold no entry: nothing was compared" <<< "$got" && ! grep -q '^canon-check: 1 bins' <<< "$got"; ok "(n) both scans with no entry: rc 2 by name, no summary" $?
+  judge_all "$d"
+  [ "$rc" = 2 ] && grep -qF "gx: both scans hold no entry: nothing was compared" <<< "$got"; ok "(n) --all, both scans with no entry: rc 2 by name" $?
+  # (o) a reorder whose every swapped pair passes ptx-canon's opcode screen but not its value proof (two reads of %clock, a
+  # volatile special register the screen reads as a plain move): rc 1, counted as differs, by default and under --all
+  fx_clk() { # fx_clk <file> <ab|ba>
+    local f=$1 order=$2 c1 c2
+    c1="mov.u32 	%r5, %clock;" c2="mov.u32 	%r6, %clock;"
+    {
+      printf '.version 8.0\n.target sm_86\n.visible .entry alpha(\n\t.param .u64 alpha_param_0\n)\n{\n'
+      printf '\tld.param.u64 \t%%rd1, [alpha_param_0];\n\tmov.u32 \t%%r5, 0;\n\tmov.u32 \t%%r6, 0;\n\tmov.u32 \t%%r7, 0;\n'
+      if [ "$order" = ab ]; then printf '\t%s\n\t%s\n' "$c1" "$c2"; else printf '\t%s\n\t%s\n' "$c2" "$c1"; fi
+      printf '\tsub.s32 \t%%r7, %%r6, %%r5;\n\tst.global.u32 \t[%%rd1], %%r7;\n\tret;\n}\n.visible .entry beta(\n)\n{\n\tret;\n}\n'
+    } > "$f"
+  }
+  fx "$d" "alpha=1 beta=2" "alpha=3 beta=2"
+  fx_clk "$d/base/gx.ptx/mod1.ptx" ab
+  fx_clk "$d/head/gx.ptx/mod1.ptx" ba
+  judge "$d"
+  [ "$rc" = 1 ] && grep -qF "ptx-canon: reordered-only (same line multiset); 1 swapped pair(s) in a 2-line window pass the opcode screen, but the value proof does not hold" <<< "$got" && grep -qF "counted as differs" <<< "$got" && grep -qF ": 1 identical, 0 reordered-only, 0 value-equal, 1 differs" <<< "$got"; ok "(o) md5 moved, a reorder past the opcode screen but not the value proof: rc 1, counted as differs" $?
+  fx "$d" "alpha=1 beta=2" "alpha=1 beta=2"
+  fx_clk "$d/base/gx.ptx/mod1.ptx" ab
+  fx_clk "$d/head/gx.ptx/mod1.ptx" ba
+  judge_all "$d"
+  [ "$rc" = 1 ] && grep -qF "pass the opcode screen, but the value proof does not hold" <<< "$got" && grep -qxF "canon-check: --all: 2 md5-equal entries read: 1 identical, 0 reordered-only, 0 value-equal, 1 differs" <<< "$got"; ok "(o) --all, md5 equal over the same reorder: counted differs, rc 1" $?
+  # (p) --all leaves a module with no entry out of the pairs (ptx-canon --all refuses one) and still reads the others
+  fx "$d" "alpha=1 beta=2" "alpha=1 beta=2"
+  for side in base head; do printf '.version 8.0\n.target sm_86\n' > "$d/$side/gx.ptx/mod2.ptx"; done
+  judge_all "$d"
+  [ "$rc" = 0 ] && grep -qxF "canon-check: --all: 2 md5-equal entries read: 2 identical, 0 reordered-only, 0 value-equal, 0 differs" <<< "$got"; ok "(p) --all, a module with no entry beside the real one: left out, rc 0" $?
   # the whole command, in a throwaway tree beside a stub narrow-scan.sh (no box)
   w=$t/bloomery-cc
   mkdir -p "$w/tools/ref" "$t/home"
