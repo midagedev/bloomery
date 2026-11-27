@@ -38,15 +38,22 @@
 #                                  (tools/gate-bound.sh; empty, the default handle): a runner with two servers up at
 #                                  once starts each under a handle of its own and stops each by it
 #   lcpp_srv_request <ids> <n_predict> <bound>  one POST /completion: the comma-separated ids as the prompt,
-#                                  greedy (temperature 0, top_k 1), ignore_eos, cache_prompt off,
-#                                  return_tokens; pgmajfault read just before and after (SRV_F0, SRV_F1). Into
+#                                  greedy (temperature 0, top_k 1), ignore_eos (LCPP_WARM_EOS below),
+#                                  cache_prompt off, return_tokens; pgmajfault read just before and after
+#                                  (SRV_F0, SRV_F1). Into
 #                                  SRV_PROMPT_N, SRV_PROMPT_MS, SRV_PROMPT_TPS, SRV_PRED_N, SRV_PRED_MS,
 #                                  SRV_PRED_TPS, SRV_CACHE_N, SRV_TOKENS (the generated ids, comma-separated),
 #                                  SRV_DRAFT_N and SRV_DRAFT_ACC (the timings' draft_n and draft_n_accepted,
 #                                  0 when the server drafts nothing).
 #                                  1 with SRV_WHY when the request fails, answers other than 200, has no
 #                                  timings, or prompt_n is not the ids' count, cache_n is not 0, or
-#                                  predicted_n is not n_predict
+#                                  predicted_n is not n_predict; 1 with SRV_WHY, before any request, on
+#                                  an LCPP_WARM_EOS word that is not `ignore` or `stop`
+#   LCPP_WARM_EOS                  the request's end-of-generation rule, an input of lcpp_srv_request: `ignore`
+#                                  (the default) puts ignore_eos in the body, the fixed-length arm every runner
+#                                  times; `stop` leaves it out, so a request that reaches the end-of-generation id
+#                                  ends there and a speculating server (one whose draft is off under
+#                                  ignore_eos) runs its drafts. Any other word is refused by name
 #   lcpp_srv_arm <ids> <n_predict> <bound>  the warm-up request, then the timed one: WARM_TPS (the warm-up's
 #                                  rate, the arm's kind of rate), WARM_FAULTS (pgmajfault across it),
 #                                  WARM_TOKENS, SRV_SAME (lcpp_srv_same of the warm-up's continuation and the
@@ -365,11 +372,20 @@ lcpp_srv_request() {
   body=$(mktemp "${TMPDIR:-/tmp}/lcpp-warm-body.XXXXXX") || return 2
   resp=$(mktemp "${TMPDIR:-/tmp}/lcpp-warm-resp.XXXXXX") || { rm -f "$body"; return 2; }
   status=$(mktemp "${TMPDIR:-/tmp}/lcpp-warm-status.XXXXXX") || { rm -f "$body" "$resp"; return 2; }
-  python3 -c '
+  # The body's python writes its refusal of a bad LCPP_WARM_EOS to $resp (curl overwrites it later).
+  if ! python3 -c '
 import json, sys
 ids = [int(t) for t in sys.stdin.read().split(",") if t.strip()]
+eos = sys.argv[2]
+if eos not in ("ignore", "stop"):
+    sys.exit("LCPP_WARM_EOS is %r: ignore (the request carries ignore_eos, the default) or stop (it does not; a drafted seat then runs passes)" % eos)
 print(json.dumps({"prompt": ids, "n_predict": int(sys.argv[1]), "temperature": 0, "top_k": 1,
-                  "ignore_eos": True, "cache_prompt": False, "return_tokens": True, "stream": False}))' "$np" <<< "$ids" > "$body"
+                  **({"ignore_eos": True} if eos == "ignore" else {}),
+                  "cache_prompt": False, "return_tokens": True, "stream": False}))' "$np" "${LCPP_WARM_EOS:-ignore}" <<< "$ids" > "$body" 2> "$resp"; then
+    SRV_WHY=$(cat "$resp")
+    rm -f "$body" "$resp" "$status"
+    return 1
+  fi
   SRV_F0=$(lcpp_srv_majflt)
   # A command substitution would defer the runner's signal trap until the request ended.
   run_bounded timeout --kill-after=10 "$bound" curl -sS -o "$resp" -w '%{http_code}' -H 'Content-Type: application/json' \
@@ -636,7 +652,7 @@ srv_tree() {
 # srv_dry_cmd <i>: server arm <i>'s command line as a dry run prints it.
 srv_dry_cmd() {
   srv_cmd_of "$1" || { echo "refused: $SRV_WHY"; return 0; }
-  echo "timeout --kill-after=10 $BOUND ${SRV_CMD[*]}   # row label '${A_LABEL[$1]}', ids=${A_IDS[$1]} (${A_DEP[$1]} ids): one POST /completion discarded, then the same timed, n_predict $SRV_NP, greedy, ignore_eos, cache_prompt off, -c $SRV_CTX ($SRV_CTX_SRC)$(srv_pp "${A_ENG[$1]}" && echo ", $SRV_BATCH")"
+  echo "timeout --kill-after=10 $BOUND ${SRV_CMD[*]}   # row label '${A_LABEL[$1]}', ids=${A_IDS[$1]} (${A_DEP[$1]} ids): one POST /completion discarded, then the same timed, n_predict $SRV_NP, greedy, $([ "${LCPP_WARM_EOS:-ignore}" = stop ] && echo "no ignore_eos (LCPP_WARM_EOS=stop)" || echo ignore_eos), cache_prompt off, -c $SRV_CTX ($SRV_CTX_SRC)$(srv_pp "${A_ENG[$1]}" && echo ", $SRV_BATCH")"
 }
 # srv_config: the [config] lines of the server arms.
 srv_config() {
@@ -887,7 +903,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   # the listening line and answers /health and /completion with timings. STUB_SRV_BADN answers with one
   # predicted token too few, STUB_SRV_CACHED with cache_n 3, STUB_SRV_DRAFT with draft_n 7 and 5 accepted,
   # STUB_SRV_EXIT exits 5 before it listens after an allocation failure line, STUB_SRV_PORT0 logs port 0,
-  # STUB_SRV_HANG never listens (it ends on the TERM).
+  # STUB_SRV_HANG never listens (it ends on the TERM), STUB_SRV_BODY writes each request's body to that file.
   cat > "$t/llama-server" << 'EOF'
 #!/usr/bin/env python3
 import http.server, json, os, signal, sys, time
@@ -924,6 +940,9 @@ class H(http.server.BaseHTTPRequestHandler):
                 f.write("ready\n")
             while True: time.sleep(1)
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if os.environ.get("STUB_SRV_BODY"):
+            with open(os.environ["STUB_SRV_BODY"], "w") as f:
+                json.dump(req, f)
         n, p = len(req["prompt"]), req["n_predict"]
         if os.environ.get("STUB_SRV_BADN"): p -= 1
         t = {"cache_n": 3 if os.environ.get("STUB_SRV_CACHED") else 0, "prompt_n": n, "prompt_ms": 100.0,
@@ -979,6 +998,20 @@ EOF
   lcpp_srv_start "$sb" "$t/log" STUB_SRV_DRAFT=1 && {
     lcpp_srv_request 1,2,3 4 20 && r=0 || r=1
     check draft "$r|$SRV_DRAFT_N|$SRV_DRAFT_ACC" "0|7|5"
+    lcpp_srv_stop
+  }
+  lcpp_srv_start "$sb" "$t/log" STUB_SRV_BODY="$t/body" && {
+    body_eos() { python3 -c 'import json, sys; print("ignore_eos" in json.load(open(sys.argv[1])))' "$t/body"; }
+    lcpp_srv_request 1,2,3 4 20 && r=0 || r=1
+    check eos-default "$r|$(body_eos)" "0|True"
+    LCPP_WARM_EOS=ignore lcpp_srv_request 1,2,3 4 20 && r=0 || r=1
+    check eos-ignore "$r|$(body_eos)" "0|True"
+    LCPP_WARM_EOS=stop lcpp_srv_request 1,2,3 4 20 && r=0 || r=1
+    check eos-stop "$r|$(body_eos)" "0|False"
+    rm -f "$t/body"
+    LCPP_WARM_EOS=eos lcpp_srv_request 1,2,3 4 20 && r=0 || r=1
+    check eos-other "$r|$SRV_WHY|$([ -e "$t/body" ] && echo sent || echo none)" \
+      "1|LCPP_WARM_EOS is 'eos': ignore (the request carries ignore_eos, the default) or stop (it does not; a drafted seat then runs passes)|none"
     lcpp_srv_stop
   }
   lcpp_srv_start "$sb" "$t/log" STUB_SRV_NOCTX=1 && {

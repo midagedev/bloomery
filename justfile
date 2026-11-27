@@ -4933,6 +4933,14 @@ gate-gpu-inkling2-draft:
 gate-gpu-inkling2-draft-gguf:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-inkling2-draft-gguf && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,dspark-hf --release --bin gate_inkling2_draft_gguf && . tools/ref/ref-paths.sh && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_draft_gguf --draft "$DSPARK_HF" --prompts "$BLOOMERY_DATA/inkling2-draft-prompts"'
 
+# The recall draft on the Inkling 2 seat of bloomery-serve over the Mini's real file (crates/gpu-gates/src/bin/gate_inkling2_recall.rs): one server
+# under BLOOMERY_DRAFT=off and one under recall answer three prompts at temperature 0 from an empty cache; the repeating prompt's answer carries
+# proposals and the records count a window that kept all eight rows, the short question's answer carries a rejected proposal and the records a window
+# that took rows back, and every prompt's ids are the off server's. Real tier only: the fixture's random weights repeat no id, so a recall server
+# on it proposes nothing (gate-inkling2-serve holds that case). Wall [derived: two loads under a minute each, three prompts of 256 greedy ids on each].
+gate-inkling2-recall:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/real-only.sh gate-inkling2-recall && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,ernie55,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_inkling2_recall && D=target/inkling2-recall-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_recall --dir $D'
+
 # --- inkling2-ref (Inkling 2's oracle: the patched PR tree and its node dumps) --------------------------------------------------------
 # Inkling 2's oracle tree: llama.cpp PR #32695 at its head 6196d9802 (the naming the Mini's file uses) carrying tools/ref/inkling2-scale.patch —
 # upstream master's own a1f422260 ("model : load ffn_gate_up_exps scales", #32657) unedited, which the PR branch lacks: without it the loader

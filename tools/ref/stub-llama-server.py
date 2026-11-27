@@ -14,6 +14,7 @@ answers /health, and /completion with prompt_n the ids, prompt_ms 100, prompt_pe
 warm-up, 2 the timed request, 3 a retry), adds 1000000 to the fault counter file $STUB_MAJFLT at those;
 STUB_SRV_BADN answers request 2 with one predicted token too few; STUB_SRV_EXIT exits 5 before it listens;
 STUB_SRV_HANG never listens; STUB_SRV_TPS answers its predicted_per_second in place of 20.0;
+STUB_SRV_DRAFT=1 puts draft_n 7 and draft_n_accepted 5 in the timings (a drafting server's);
 STUB_SRV_NOTIMINGS answers with the tokens and no `timings`; STUB_SRV_LISTEN_CTX puts ` ctx=<n>` before the
 `listening on` words, as bloomery-serve's listening record has it (`argv`: the value of --ctx-size, --ctx or -c).
 POST /tokenize answers one token a whitespace-separated word of `content` (STUB_SRV_TOKENIZE_N, that many in its stead).
@@ -142,6 +143,8 @@ class H(http.server.BaseHTTPRequestHandler):
         tps = float(os.environ.get("STUB_SRV_TPS", "20.0"))
         t = {"cache_n": 0, "prompt_n": n, "prompt_ms": 100.0, "prompt_per_second": n * 10.0,
              "predicted_n": p, "predicted_ms": 50.0 * max(p - 1, 0), "predicted_per_second": tps if p > 1 else 0.0}
+        if os.environ.get("STUB_SRV_DRAFT"):
+            t["draft_n"], t["draft_n_accepted"] = 7, 5
         if "--spec-type" in sys.argv and not os.environ.get("STUB_SRV_NODRAFT"):
             t["draft_n"], t["draft_n_accepted"] = 4, 3
             print("slot print_timing: id  0 | task 0 | draft acceptance = 0.75000 (    3 accepted /     4 generated), mean len = 1.75", flush=True)

@@ -506,16 +506,26 @@ fn preflight_ds41_draft() {
     );
 }
 
-/// The seats whose pass verifies two rows or none refuse the recall draft's word by name, each
-/// in its own words, before the fetch; the seats that serve it (qwen3, inkling2) are held to take
-/// it where the boundary table below lists them.
+/// The seats whose pass verifies two rows or none refuse the recall draft's word by name before
+/// the fetch, the V4.1 and tiered seats in one wording that names no model; the seats that serve
+/// it (qwen3, inkling2) are held to take it where the boundary table below lists them.
 #[test]
 fn preflight_ds41_recall() {
     checked_refusal(
         "ds41_recall",
         &["--model", "ds41", "--hf", "o/r"],
         &[("BLOOMERY_DRAFT", "recall")],
-        "BLOOMERY_DRAFT=recall: a V4.1 pass verifies two rows",
+        "BLOOMERY_DRAFT=recall: this seat's pass verifies two rows",
+    );
+}
+
+#[test]
+fn preflight_mistrallarge4_recall() {
+    checked_refusal(
+        "mistrallarge4_recall",
+        &["--model", "mistrallarge4", "-m", "/x.gguf"],
+        &[("BLOOMERY_DRAFT", "recall")],
+        "BLOOMERY_DRAFT=recall: this seat's pass verifies two rows",
     );
 }
 

@@ -17,8 +17,8 @@
 //! [`CardDspark`], every seat's): a seat names its draft's layers, never a
 //! copy of these calls.
 //!
-//! The lookup and recall arms hold the serve seats' one owner of the
-//! drafts of the token history, [`Lookups`]: a context and a width chooser a
+//! The lookup and recall arms hold the serve seats' one owner of the drafts
+//! of the token history, [`HistoryDrafts`]: a context and a width chooser a
 //! resident slot, the context one the V4.1 seat rebuilds from its body's
 //! token history when it falls behind.
 //!
@@ -39,7 +39,7 @@ use runtime::width::{Choosing, Chosen, Mode as WidthMode};
 use runtime::{Advance, Committed, Draft as RtDraft, Speculative, Widths, Window};
 use serve::{DeviceProps, DraftProps, Drafted, EngineProps, PlacementProps};
 
-use super::drafted::{History, Lookups, Taking, drafted};
+use super::drafted::{History, HistoryDrafts, Taking, drafted};
 use crate::draft::Draft;
 
 /// The class `/props` files the draft's resident bytes under.
@@ -373,7 +373,7 @@ impl<B: ChainBody + 'static> ServedSpark<B> {
 /// pass behind the width chooser.
 pub struct ServedDraft<B: ChainBody + 'static> {
     dspark: Option<ServedSpark<B>>,
-    lookup: Option<Lookups<Session<B>>>,
+    history_drafts: Option<HistoryDrafts<Session<B>>>,
 }
 
 impl<B> ServedDraft<B>
@@ -381,27 +381,27 @@ where
     B: Prompt + Keep + Slots + 'static,
     B::Seq: 'static,
 {
-    /// The lookup's table, for a round of several slots' lookup windows
-    /// (`serve_seats::rounds::pass_rows_lookup`); `None` under the DSpark
-    /// draft or none.
+    /// The history draft's table (the lookup's or the recall's), for a round
+    /// of several slots' windows (`serve_seats::rounds::pass_rows_history`);
+    /// `None` under the DSpark draft or none.
     #[allow(
         dead_code,
-        reason = "the lookup rounds of a seat that drafts by lookup read it; the V4.1 binary that includes this file serves no such seat"
+        reason = "the history-draft rounds of a seat that drafts from the token history read it; the V4.1 binary that includes this file serves no such seat"
     )]
-    pub(crate) fn lookups_mut(&mut self) -> Option<&mut Lookups<Session<B>>> {
-        self.lookup.as_mut()
+    pub(crate) fn history_drafts_mut(&mut self) -> Option<&mut HistoryDrafts<Session<B>>> {
+        self.history_drafts.as_mut()
     }
 
     /// No draft: every call is the seat's plain one.
     pub fn off() -> Self {
         ServedDraft {
             dspark: None,
-            lookup: None,
+            history_drafts: None,
         }
     }
 
     /// The lookup draft on each of `slots` resident slots of `s`
-    /// ([`Lookups::lookup`]), each behind a width chooser of `mode`, each
+    /// ([`HistoryDrafts::lookup`]), each behind a width chooser of `mode`, each
     /// served slot's verify pass captured now (`log` told of each); `history`
     /// the body's token history, where it keeps one.
     pub fn lookup(
@@ -414,17 +414,17 @@ where
     where
         B: Rows + Rollback,
     {
-        Ok(Self::of_history(Lookups::lookup(
+        Ok(Self::of_history(HistoryDrafts::lookup(
             s, slots, mode, log, history,
         )?))
     }
 
     /// The seat's draft of `history`'s table (a history draft, opened by the
     /// lookup's constructor here or the recall's in `recalled`).
-    pub(super) fn of_history(history: Lookups<Session<B>>) -> Self {
+    pub(super) fn of_history(history: HistoryDrafts<Session<B>>) -> Self {
         ServedDraft {
             dspark: None,
-            lookup: Some(history),
+            history_drafts: Some(history),
         }
     }
 
@@ -445,13 +445,13 @@ where
     {
         Ok(ServedDraft {
             dspark: Some(ServedSpark::open::<D, M>(s, draft, mode, log, file)?),
-            lookup: None,
+            history_drafts: None,
         })
     }
 
     /// The most rows [`Seat::pass`](bloomery_gpu_gates::bind::Seat::pass) runs.
     pub fn rows(&self) -> usize {
-        match (&self.dspark, &self.lookup) {
+        match (&self.dspark, &self.history_drafts) {
             (Some(d), _) => d.rows(),
             (None, Some(l)) => l.rows(),
             (None, None) => 1,
@@ -461,7 +461,7 @@ where
     /// Whether the draft's state is per slot (`Seat::slot_drafts`): the
     /// lookup's is, a context a slot.
     pub fn slot_drafts(&self) -> bool {
-        self.lookup.is_some()
+        self.history_drafts.is_some()
     }
 
     /// The prompt call of `ids`: under the DSpark draft the draft's own, fed
@@ -474,7 +474,7 @@ where
         ids: &[u32],
         plain: impl FnOnce(&mut Session<B>) -> Result<u32, GateError>,
     ) -> Result<u32, GateError> {
-        match (&mut self.dspark, &mut self.lookup) {
+        match (&mut self.dspark, &mut self.history_drafts) {
             (Some(d), _) => d.prefill(s, ids),
             (None, Some(l)) => {
                 let slot = s.selected();
@@ -503,7 +503,7 @@ where
     /// The seat's plain step of `last` took `next`: the draft takes in the
     /// position.
     pub fn stepped(&mut self, s: &mut Session<B>, last: u32, next: u32) -> Result<(), GateError> {
-        match (&mut self.dspark, &mut self.lookup) {
+        match (&mut self.dspark, &mut self.history_drafts) {
             (Some(d), _) => d.stepped(s, last, next),
             (None, Some(l)) => l.stepped(s, s.selected(), last, next),
             (None, None) => Ok(()),
@@ -519,7 +519,7 @@ where
         last: u32,
         out: &mut Vec<u32>,
     ) -> Result<Option<Drafted>, GateError> {
-        match (&mut self.dspark, &mut self.lookup) {
+        match (&mut self.dspark, &mut self.history_drafts) {
             (Some(d), _) => Ok(Some(d.pass(s, last, out)?)),
             (None, Some(l)) => {
                 let slot = s.selected();
@@ -544,7 +544,7 @@ where
     /// starts over (from the body's history where it keeps one).
     pub fn replaced(&mut self, slot: usize) -> Result<(), GateError> {
         self.moved();
-        if let Some(l) = &mut self.lookup {
+        if let Some(l) = &mut self.history_drafts {
             l.forget(slot)?;
         }
         Ok(())
@@ -555,7 +555,7 @@ where
         if let Some(d) = &mut self.dspark {
             d.reset()?;
         }
-        if let Some(l) = &mut self.lookup {
+        if let Some(l) = &mut self.history_drafts {
             l.forget(slot)?;
         }
         Ok(())
@@ -567,7 +567,7 @@ where
         if let Some(d) = &mut self.dspark {
             d.close();
         }
-        if let Some(l) = &mut self.lookup {
+        if let Some(l) = &mut self.history_drafts {
             l.close();
         }
     }
@@ -598,7 +598,7 @@ where
     /// row, the class `draft` (a row of its own when the target has no layer
     /// there). The card's index missing leaves the device out.
     pub fn props(&self, p: EngineProps) -> EngineProps {
-        if let Some(l) = &self.lookup {
+        if let Some(l) = &self.history_drafts {
             return l.props(p);
         }
         match &self.dspark {
@@ -621,15 +621,15 @@ where
 /// The slot count the DSpark draft decides, when it does: its window is one
 /// sequence's, on its own card, and a select would start it over. Several
 /// slots (`parallel` above 1) are refused by name; none given is one slot
-/// ([`SlotsFrom::Dspark`]); `None` where `draft` decides nothing, or the flag
-/// names one slot. `lookup` is whether the seat serves the lookup draft too,
-/// which the refusal then offers.
+/// ([`SlotsFrom::Dspark`]); `None` where the draft is not DSpark (`dspark`
+/// false), or the flag names one slot. `lookup` is whether the seat serves
+/// the lookup draft too, which the refusal then offers.
 pub fn draft_slots(
     parallel: Option<usize>,
-    draft: Draft,
+    dspark: bool,
     lookup: bool,
 ) -> Result<Option<(usize, SlotsFrom)>, GateError> {
-    if draft != Draft::Dspark {
+    if !dspark {
         return Ok(None);
     }
     match parallel {

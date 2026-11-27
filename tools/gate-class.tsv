@@ -322,6 +322,7 @@ gate-gpu-hy4-serve	family	hy_v4_flash	serve+ship	seats_serve_engine+serve_toolca
 gate-inkling2-attn	family	inkling2	kernel	attn_rel_bias
 gate-inkling2-pp	family	inkling2	kernel	attn_rel_prefill+loop_control
 gate-inkling2-serve	family	inkling2	serve+ship	seats_serve_engine+serve_toolcall
+gate-inkling2-recall	family	inkling2	serve	seats_serve_engine+drafts_mtp
 gate-inkling2-official-card	family	inkling2	by-hand	checkpoint_folder+weights_load+tier_legs+head_sample
 gate-gpu-inkling2-draft	family	inkling2	draft	drafts_dspark
 gate-gpu-inkling2-draft-gguf	family	inkling2	draft	drafts_dspark

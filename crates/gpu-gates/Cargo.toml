@@ -437,6 +437,12 @@ required-features = ["deepseek41", "ernie55"]
 name = "gate_inkling2_serve"
 required-features = ["deepseek41"]
 
+# inkling2-recall: the recall draft on the Inkling 2 seat over the Mini's real file (gate_inkling2_recall's doc): a repeating
+# prompt's proposals verified in a window of the body's whole pass, a rejected one taken back, the ids the off server's. Real tier only.
+[[bin]]
+name = "gate_inkling2_recall"
+required-features = ["deepseek41"]
+
 [[bin]]
 name = "gate_mimo2_serve"
 required-features = ["glm5next", "clef", "mimo2"]

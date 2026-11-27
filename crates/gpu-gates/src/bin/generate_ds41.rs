@@ -1258,7 +1258,6 @@ mod drive {
                 after_passes(&mut s, ran)
             }
             (Draft::Dspark, None, _) => Err("generate_ds41: the DSpark draft did not load".into()),
-            (Draft::Recall, ..) => Err(Draft::RECALL_REFUSED.into()),
         };
         if done.is_ok() {
             warm_save(&mut s, warm.as_mut())?;

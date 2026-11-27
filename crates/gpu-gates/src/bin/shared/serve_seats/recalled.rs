@@ -12,8 +12,19 @@ use bloomery_gpu_gates::GateError;
 use runtime::Recall;
 use runtime::width::Mode as WidthMode;
 
-use super::drafted::{History, Lookups, RECALL_ROWS, RECALL_WIDTH};
+use super::drafted::{History, HistoryDrafts};
 use super::served::ServedDraft;
+
+/// The rows a recall pass verifies on a body whose pass holds eight rows
+/// ([`runtime::Verify::MAX_ROWS`]): the token at the target's position and the
+/// recall draft's seven proposed ids. A seat names this pair beside the
+/// body's own limit, so a body of fewer rows fails to compile where it
+/// would drive it ([`runtime::Draft::FITS`]), and the draft word is refused there by
+/// name.
+pub(super) const RECALL_ROWS: usize = 8;
+
+/// The most ids a recall proposal holds on a body of [`RECALL_ROWS`] rows.
+pub(super) const RECALL_WIDTH: usize = RECALL_ROWS - 1;
 
 impl<B> ServedDraft<B>
 where
@@ -37,7 +48,7 @@ where
     where
         B: Rows + Rollback,
     {
-        let table = Lookups::open::<Recall<RECALL_WIDTH>, RECALL_ROWS>(
+        let table = HistoryDrafts::open::<Recall<RECALL_WIDTH>, RECALL_ROWS>(
             s,
             slots,
             mode,

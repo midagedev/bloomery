@@ -80,6 +80,9 @@
 # and for every arm after the first arm of its D the difference against that first arm in tok/s and in percent with
 # its 95 % interval: the pooled-SD two-sample interval (tools/ref/card.py's half_width at df 2N - 2, the ruler of
 # AGENTS.md 「Know the ruler」), arm minus first, so + is the arm that is faster. Arms at different D are never compared.
+# A row whose request the server drafted for carries ` | draft <n>/<acc>` after `majflt` (the request's timings.draft_n
+# and draft_n_accepted): a speculating arm's proposals sit beside its rate. A server that proposed nothing prints no
+# draft column.
 #
 # Order. The arms rotate by one place every round (arm k of round r is arm (k + r - 1) mod n, ab-decode.sh's rule),
 # BLOOMERY_AB_ROUNDS rounds, default 4.
@@ -1112,7 +1115,7 @@ ds_server_start() {
 # first request, which is the fresh server's), and its ROW into ROWS_PENDING. A later request of a folded server carries
 # ` [shared]`: it followed another request on its server, so it is a fold's row and the tables keep it apart.
 ds_serve_request() {
-  local r=$1 i=$2 pos=$3 label=${A_LABEL[$2]} dep=${A_DEP[$2]} ids row maj win tg pp shared=''
+  local r=$1 i=$2 pos=$3 label=${A_LABEL[$2]} dep=${A_DEP[$2]} ids row maj win tg pp draft shared=''
   if [ "$pos" -gt 1 ]; then
     CPU_BUSY_TAG='' OTHER_BUSY_TAG='' COLD_TAG=''
     shared=' [shared]'
@@ -1141,7 +1144,10 @@ ds_serve_request() {
   if ! awk -v v="$tg" 'BEGIN { exit !(v > 0) }'; then
     ds_fail "$r" "$i" "timings.predicted_per_second is '$SRV_PRED_TPS', not a rate"
   fi
-  ROWS_PENDING+=("ROW r$r $row D=$dep | tg_tok/s $tg | pp_tok/s $pp | load_s $LOAD_S | majflt $maj${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}${COLD_TAG:-}${PLAN_TAG:-}$shared")
+  # A request whose server proposed nothing carries no draft counts (lcpp_srv_request sets both to 0): no column.
+  draft=''
+  if [ "${SRV_DRAFT_N:-0}" -gt 0 ]; then draft=" | draft $SRV_DRAFT_N/$SRV_DRAFT_ACC"; fi
+  ROWS_PENDING+=("ROW r$r $row D=$dep | tg_tok/s $tg | pp_tok/s $pp | load_s $LOAD_S | majflt $maj${draft}${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}${COLD_TAG:-}${PLAN_TAG:-}$shared")
   if [ -n "$TAPE" ] && [ "$r" = 1 ]; then ds_tape_run "$r" "$i"; fi
   if [ -n "$AFTER" ] && [ "$r" = 1 ] && [ "${A_HOOK[$i]}" = 1 ]; then ds_hook_run "$r" "$i"; fi
 }
@@ -1701,6 +1707,17 @@ WRAP
   # shellcheck disable=SC2012 # the dumps are named by the wrapper
   [ "$(grep -l "^$lever=1\$" "$C"/env.a.* 2> /dev/null | wc -l | tr -d ' ')" = 1 ] && ok envarm-env-reaches-one-arm || bad envarm-env-reaches-one-arm "$lever=1 was not in exactly one server's environment"
   st_servers envarm-servers-stopped 2
+  ST_ENV=()
+
+  # --- a server that proposed ids shows its counts in the row; one that proposed none has no draft column.
+  st_case draft
+  st_tree dr 20 STUB_SRV_DRAFT=1
+  st_tree pl 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1)
+  st_run dr:6 pl:6
+  st_check draft-column 0 "ROW r1 dr/place=a/ctx=16384 D=6 | tg_tok/s 20.00 | pp_tok/s 60.00 | load_s"
+  [ "$(grep '^ROW r1 dr' "$C/out" | grep -c ' | majflt 0 | draft 7/5$')" = 1 ] && ok draft-column-counts || bad draft-column-counts "the drafting arm's row does not end ' | majflt 0 | draft 7/5'"
+  [ "$(grep '^ROW r1 pl' "$C/out" | grep -c ' | draft ')" = 0 ] && ok draft-column-absent-without-proposals || bad draft-column-absent-without-proposals "the plain arm's row carries a draft column"
   ST_ENV=()
 
   # --- a server's failure under the lease: named, the server stopped, no row.
