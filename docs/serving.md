@@ -913,10 +913,11 @@ template uses is read from the call it renders, and a `tool_choice` that forces 
   reasoning: a template whose thinking is off until `enable_thinking` is set (V4.1's) gets `enable_thinking: true`, and
   `max` also adds its maximum-effort header. A `chat_template_kwargs` `enable_thinking` in the same request wins.
   A top-level `enable_thinking` (a boolean, as Qwen's clients send it) is the same request as the one in
-  `chat_template_kwargs`, and two that disagree are a 400. A template that has no switch, no effort knob and a think
-  span of its own (the model always thinks) refuses `"none"` and `enable_thinking: false` with a 400 naming the field,
-  and one line at start says so; a template that writes no think span either (Qwen3-Coder's) has nothing to turn off
-  and renders as it does.
+  `chat_template_kwargs`, and two that disagree are a 400. A template that has no switch, no effort knob and a
+  generation prompt that leaves a think span open (the model always thinks) refuses `"none"` and
+  `enable_thinking: false` with a 400 naming the field, and one line at start says so; a template whose generation
+  prompt opens no span has nothing to turn off and renders as it does, whether it never names the tags (Qwen3-Coder's)
+  or names them only to strip a history turn's reasoning (a Qwen3-2507 GGUF's).
   Inkling 2's template writes no generation prompt (the model opens its own block, thinking among them) and its effort
   `none` is level 0, which does not stop the reasoning. There `"none"`, `enable_thinking: false` (top level or in the
   kwargs), a kwargs `reasoning_effort` of `"none"` and `reasoning_budget: 0` each render the effort-0 prompt and end

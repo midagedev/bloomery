@@ -3548,12 +3548,13 @@ enum ThinkingOff {
     /// the word itself.
     OffWord(&'static str),
     /// Neither knob changes the prompt: `"none"` sets `enable_thinking`
-    /// `false`, as llama-server does, and there is nothing to map it to. The template
-    /// writes no think span either, so there is no thinking to turn off.
+    /// `false`, as llama-server does, and there is nothing to map it to. The generation
+    /// prompt opens no think span either (a template may name the tags only to strip a
+    /// history turn's reasoning), so the template has no thinking to turn off.
     Neither,
-    /// Neither knob changes the prompt and the template writes a think span (its source
-    /// names the span's tags): the model always thinks, and a request for no thinking is
-    /// a 400, not a request the template would drop.
+    /// Neither knob changes the prompt and the generation prompt itself leaves a think span
+    /// open: the model always thinks, and a request for no thinking is a 400, not a request
+    /// the template would drop.
     Fixed,
 }
 
@@ -3614,18 +3615,20 @@ const PROBE_EFFORT: &str = "bloomery-probe-effort";
 /// one of [`OFF_WORDS`] apart from no effort is
 /// [`OffWord`](ThinkingOff::OffWord) of that word; otherwise one
 /// where `reasoning_effort: "low"` renders differently from no effort is
-/// [`LowEffort`](ThinkingOff::LowEffort); otherwise one whose source names a
-/// think span's tags is [`Fixed`](ThinkingOff::Fixed) and one that names none
-/// [`Neither`](ThinkingOff::Neither). A render that fails is the bind's
+/// [`LowEffort`](ThinkingOff::LowEffort); otherwise one whose generation prompt
+/// (the render's text past the same conversation's render with no generation
+/// prompt) ends inside an open think span is [`Fixed`](ThinkingOff::Fixed) and
+/// any other [`Neither`](ThinkingOff::Neither): a source that names the span's
+/// tags is not the prompt that opens it. A render that fails is the bind's
 /// error, naming the probe: the answer is never guessed.
 fn probe_thinking_off(t: &ChatTemplate) -> Result<ThinkingOff, TemplateError> {
-    let render = |extra: Option<(&str, Value)>| {
+    let render_with = |generation_prompt: bool, extra: Option<(&str, Value)>| {
         let mut vars = Map::new();
         vars.insert(
             "messages".into(),
             json!([{"role": "user", "content": "hi"}]),
         );
-        vars.insert("add_generation_prompt".into(), json!(true));
+        vars.insert("add_generation_prompt".into(), json!(generation_prompt));
         vars.insert("bos_token".into(), json!(""));
         vars.insert("eos_token".into(), json!(""));
         if let Some((k, v)) = extra {
@@ -3634,6 +3637,7 @@ fn probe_thinking_off(t: &ChatTemplate) -> Result<ThinkingOff, TemplateError> {
         t.render(&vars)
             .map_err(|e| TemplateError(format!("thinking probe: {}", e.0)))
     };
+    let render = |extra: Option<(&str, Value)>| render_with(true, extra);
     let off = render(Some(("enable_thinking", json!(false))))?;
     let on = render(Some(("enable_thinking", json!(true))))?;
     if off != on {
@@ -3649,9 +3653,18 @@ fn probe_thinking_off(t: &ChatTemplate) -> Result<ThinkingOff, TemplateError> {
         }
     }
     let low = render(Some(("reasoning_effort", json!("low"))))?;
-    Ok(if low != unset {
-        ThinkingOff::LowEffort
-    } else if ::models::ReasoningFormat::of_template(t.source()).is_some() {
+    if low != unset {
+        return Ok(ThinkingOff::LowEffort);
+    }
+    let bare = render_with(false, None)?;
+    let generation_prompt = unset.strip_prefix(bare.as_str()).unwrap_or(&unset);
+    let leaves_span_open = ::models::ReasoningFormat::of_template(t.source()).is_some_and(|f| {
+        let (open, close) = f.think();
+        generation_prompt
+            .rfind(open)
+            .is_some_and(|at| !generation_prompt[at + open.len()..].contains(close))
+    });
+    Ok(if leaves_span_open {
         ThinkingOff::Fixed
     } else {
         ThinkingOff::Neither
@@ -7205,6 +7218,10 @@ mod tests {
                 include_str!("../tests/fixtures/hy4-chat-template.jinja"),
                 "off_word",
             ),
+            (
+                include_str!("../tests/fixtures/qwen3-instruct-2507-chat-template.jinja"),
+                "neither",
+            ),
             (super::testserve::TEMPLATE, "neither"),
         ];
         for (template, want) in cases {
@@ -10665,26 +10682,35 @@ mod tests {
         assert!(body.contains("enable_thinking"), "{body}");
     }
 
-    /// A template that writes a think span and has neither switch
-    /// ([`ThinkingOff::Fixed`]) belongs to a model that always thinks: a
-    /// request for no thinking, in any of its spellings, is a 400 naming it, and
-    /// a request that asks for thinking or for nothing renders. A template that
-    /// writes no span ([`ThinkingOff::Neither`]) has no thinking to turn off, and
-    /// the same requests render.
+    /// A template whose generation prompt leaves a think span open and that has
+    /// neither switch ([`ThinkingOff::Fixed`]) belongs to a model that always
+    /// thinks: a request for no thinking, in any of its spellings, is a 400 naming
+    /// it, and a request that asks for thinking or for nothing renders. A template
+    /// whose generation prompt opens no span ([`ThinkingOff::Neither`]) has no
+    /// thinking to turn off, and the same requests render: one that never names
+    /// the tags, one that names them only to strip a history turn's reasoning (a
+    /// Qwen3-2507 GGUF's) and one that closes the span it opens.
     #[test]
     fn a_model_that_always_thinks_refuses_a_request_to_stop() {
         const ALWAYS: &str = "{% for m in messages %}{{ m.content }}\n{% endfor %}\
                               {% if add_generation_prompt %}<think>\n{% endif %}";
         const NEVER: &str = "{% for m in messages %}{{ m.content }}\n{% endfor %}";
+        const CLOSED: &str = "{% for m in messages %}{{ m.content }}\n{% endfor %}\
+                              {% if add_generation_prompt %}<think>\n\n</think>\n\n{% endif %}";
+        const HISTORY: &str =
+            include_str!("../tests/fixtures/qwen3-instruct-2507-chat-template.jinja");
         let parsed = |source: &str| ChatTemplate::parse(source).expect("a template");
         assert_eq!(
             probe_thinking_off(&parsed(ALWAYS)).expect("renders"),
             ThinkingOff::Fixed
         );
-        assert_eq!(
-            probe_thinking_off(&parsed(NEVER)).expect("renders"),
-            ThinkingOff::Neither
-        );
+        for (name, source) in [("never", NEVER), ("closed", CLOSED), ("history", HISTORY)] {
+            assert_eq!(
+                probe_thinking_off(&parsed(source)).expect("renders"),
+                ThinkingOff::Neither,
+                "{name}"
+            );
+        }
         let messages = || json!([{ "role": "user", "content": "Hi" }]);
         let stops = [
             ("reasoning_effort", json!({ "reasoning_effort": "none" })),
@@ -10696,8 +10722,9 @@ mod tests {
         ];
         let (always, _state, _ended) =
             super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(ALWAYS));
-        let (never, _state, _ended) =
-            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(NEVER));
+        let quiet = [NEVER, CLOSED, HISTORY].map(|source| {
+            super::testserve::spawn(Box::new(crate::MockEngine::new(64)), templated(source))
+        });
         for (param, extra) in stops {
             let mut body = json!({ "messages": messages() });
             body.as_object_mut()
@@ -10710,8 +10737,10 @@ mod tests {
                     && answer.contains(&format!("\"param\":\"{param}\"")),
                 "{param}: {answer}"
             );
-            let (status, answer) = applied(never, &body);
-            assert_eq!(status, 200, "{param}: {answer}");
+            for &(addr, _, _) in &quiet {
+                let (status, answer) = applied(addr, &body);
+                assert_eq!(status, 200, "{param}: {answer}");
+            }
         }
         for body in [
             json!({ "messages": messages() }),
