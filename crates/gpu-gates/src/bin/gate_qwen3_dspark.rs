@@ -5,7 +5,7 @@
 //! same draft beside the renamed copy of the target (`renamed/`, a file whose `general.name`
 //! differs: a draft fits a target by its shapes, not by its name), and the full-vocabulary
 //! synthetic draft (borrowing the target's Q6_K `output.weight` in place and its
-//! `token_embd.weight` rows), and the n-gram lookup draft on the same target.
+//! `token_embd.weight` rows), and the n-gram lookup draft and the recall draft on the same target.
 //!
 //!     gate_qwen3_dspark --dir <dir>
 //!
@@ -33,7 +33,12 @@
 //! seat that names the lookup and steps plain does not pass; file-bound: a fixture's
 //! random-weight target repeats no n-gram of its own, so the real tier runs it, and the
 //! headline seat's `lookup_{i}_verifies_proposals` in `gate_qwen38_serve` pins the same
-//! path); then the refusals,
+//! path); then the recall draft on the target, one server with it against the plain one: its ids
+//! are the plain run's on both prompts (`ids_are_the_plain_ids`, and
+//! `recall_repeats_are_the_plain_ids` on the repeating one), `/props` names it as the draft the
+//! seat serves with the width of the body's whole pass (`recall_is_served`), and the prompt that
+//! repeats a phrase gets proposals (`recall_proposes`: `timings.draft_n` above 0, file-bound as the
+//! lookup's is); then the refusals,
 //! each named on the server's stderr:
 //!
 //! - `cross_target_is_refused`: the mismatched synthetic draft (`dspark/mismatched`, whose
@@ -45,8 +50,9 @@
 //!   exits before listening with the whole-card sentence;
 //! - `parallel_two_is_refused`: `--parallel 2` exits before listening with the one-slot
 //!   sentence;
-//! - `qwen3moe_lookup_is_refused`: a qwen3moe file (the family's fixture) with the lookup
-//!   draft exits before listening, naming the body's own reason;
+//! - `qwen3moe_lookup_is_refused` and `qwen3moe_recall_is_refused`: a qwen3moe file (the family's
+//!   fixture) with the lookup draft, and with the recall draft, exits before listening, naming the
+//!   body's own reason;
 //! - `qwen3moe_dspark_is_refused`: a qwen3moe file with the DSpark draft exits before
 //!   listening, naming the family the DSpark draft serves.
 //!
@@ -100,6 +106,10 @@ mod gate {
     /// The ids compared and the tokens the any-draft arms decode.
     const N: usize = 16;
 
+    /// The most ids the recall draft proposes a pass: the qwen35moe body's pass of eight rows
+    /// less the token at the position.
+    const RECALL_PROPOSES: u64 = 7;
+
     /// The context the placed refusal's load is planned at.
     const PLACED_CTX: usize = 4096;
 
@@ -142,6 +152,8 @@ mod gate {
         Dspark(PathBuf),
         /// The n-gram lookup draft: no file, no weights.
         Lookup,
+        /// The recall draft: no file, no weights.
+        Recall,
     }
 
     /// A target and the DSpark draft beside it.
@@ -249,6 +261,9 @@ mod gate {
             Some(Arm::Lookup) => {
                 cmd.env("BLOOMERY_DRAFT", "lookup");
             }
+            Some(Arm::Recall) => {
+                cmd.env("BLOOMERY_DRAFT", "recall");
+            }
             None => {}
         }
         cmd.envs(env.iter().copied());
@@ -295,6 +310,12 @@ mod gate {
         text.contains(want)
     }
 
+    /// What one arm answered: the ids of [`PROMPT`] and of [`REPEATS`].
+    struct Ids {
+        prompt: Vec<u32>,
+        repeats: Vec<u32>,
+    }
+
     /// One arm's ids: the plain arm's, the drafted arm's, and the drafted arm's
     /// own evidence (its load record, its proposals and its chat answers).
     fn one(
@@ -303,7 +324,7 @@ mod gate {
         arm: Option<&Arm>,
         tag: &str,
         ok: &mut bool,
-    ) -> Result<Vec<u32>, GateError> {
+    ) -> Result<Ids, GateError> {
         let run = root.join(format!("{}-{tag}", case.name));
         let (mut served, err) = spawn(case, arm, &run, &[], &[])?;
         let addr = served.address(&err, 3000, POLL)?;
@@ -312,6 +333,14 @@ mod gate {
         let answer = completion(&url, &ids, N, false)?;
         let tokens = ids_of(&answer["tokens"])?;
         println!("{tag} {} tokens {tokens:?}", case.name);
+        // The prompt that repeats a phrase: the ids it answers, and the proposals the draft made
+        // for it where the arm has one.
+        let repeats = completion(&url, &tokenized(&url, REPEATS)?, N, false)?;
+        let proposed = repeats["timings"]["draft_n"]
+            .as_u64()
+            .is_some_and(|n| n > 0);
+        let repeat_ids = ids_of(&repeats["tokens"])?;
+        println!("{tag} {} repeats {repeat_ids:?}", case.name);
         match arm {
             Some(Arm::Dspark(_)) => {
                 let log = server_log(&err, &[&record::LOAD_DRAFT])?;
@@ -343,20 +372,34 @@ mod gate {
                 // The lookup proposes only where the text repeats an n-gram of its own: a
                 // fixture's random-weight target writes none, so the file answers it.
                 if tier::run_clause("lookup_proposes", Tag::FileBound)? {
-                    let repeats = completion(&url, &tokenized(&url, REPEATS)?, N, false)?;
-                    check(
-                        ok,
-                        "lookup_proposes",
-                        repeats["timings"]["draft_n"]
-                            .as_u64()
-                            .is_some_and(|n| n > 0),
-                    );
+                    check(ok, "lookup_proposes", proposed);
+                }
+            }
+            Some(Arm::Recall) => {
+                // The seat's own word for the draft it serves, and the most ids it proposes:
+                // the body's pass of rows less the token at the position.
+                let (st, body) = curl(&url("/props"), None, false)?;
+                let props = json_of("/props", st, &body)?;
+                let draft = &props["engine"]["draft"];
+                check(
+                    ok,
+                    "recall_is_served",
+                    draft["kind"].as_str() == Some("recall")
+                        && draft["n_max"].as_u64() == Some(RECALL_PROPOSES),
+                );
+                // The recall draft proposes only where a tail of the text recurs: a fixture's
+                // random-weight target writes none, so the file answers it.
+                if tier::run_clause("recall_proposes", Tag::FileBound)? {
+                    check(ok, "recall_proposes", proposed);
                 }
             }
             None => {}
         }
         drop(served);
-        Ok(tokens)
+        Ok(Ids {
+            prompt: tokens,
+            repeats: repeat_ids,
+        })
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -385,13 +428,34 @@ mod gate {
                 "draft",
                 &mut ok,
             )?;
-            check(&mut ok, "ids_are_the_plain_ids", drafted == plain);
+            check(
+                &mut ok,
+                "ids_are_the_plain_ids",
+                drafted.prompt == plain.prompt,
+            );
             plains.push(plain);
         }
         // The lookup draft on the target: the same target, the other draft.
         let qwen = &cases[0];
         let lookup = one(qwen, &root, Some(&Arm::Lookup), "lookup", &mut ok)?;
-        check(&mut ok, "ids_are_the_plain_ids", lookup == plains[0]);
+        check(
+            &mut ok,
+            "ids_are_the_plain_ids",
+            lookup.prompt == plains[0].prompt,
+        );
+        // The recall draft on the same target: a window of the body's whole pass of rows, its
+        // ids the plain run's on both prompts.
+        let recall = one(qwen, &root, Some(&Arm::Recall), "recall", &mut ok)?;
+        check(
+            &mut ok,
+            "ids_are_the_plain_ids",
+            recall.prompt == plains[0].prompt,
+        );
+        check(
+            &mut ok,
+            "recall_repeats_are_the_plain_ids",
+            recall.repeats == plains[0].repeats,
+        );
         // The mismatched draft beside the target: the ids line of a draft written for another
         // vocabulary, refused before any weight is read.
         let wrong = Case {
@@ -455,6 +519,18 @@ mod gate {
             &mut ok,
             "qwen3moe_lookup_is_refused",
             hint(&lookup_refused, "BLOOMERY_DRAFT=lookup on a qwen3moe file"),
+        );
+        let recall_refused = refusal(
+            &qwen3moe,
+            Some(&Arm::Recall),
+            &root.join("qwen3moe-recall"),
+            &[],
+            &[],
+        )?;
+        check(
+            &mut ok,
+            "qwen3moe_recall_is_refused",
+            hint(&recall_refused, "BLOOMERY_DRAFT=recall on a qwen3moe file"),
         );
         let dspark_refused = refusal(
             &qwen3moe,

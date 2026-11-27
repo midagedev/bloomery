@@ -29,27 +29,37 @@
 //! 8. `moe_rows`: the prompt route block (route table, the 32-value GEMMs over the file's NVFP4
 //!    planes with their per-expert scales or its Q8_0 blocks, SiTU between gate·up and down)
 //!    over 512 seeded rows against the step's leg on the same rows, an NVFP4 layer and the Q8_0
-//!    coda, within [`MOE_BAND`] (derived at the constant).
+//!    coda, within [`MOE_BAND`] (derived at the constant); on a native FP4 build the NVFP4
+//!    layer's block also over FP4 rows, both roles' (`full`) within [`MOE_FP4_BAND`] and the
+//!    gate·up's alone (`gate-up`) within [`MOE_FP4_GATE_UP_BAND`] (derived at `moe_clauses`).
 //! 9. `moe_leg_rows`: the leg over the 512 rows equals the leg over one row, bit for bit.
 //! 10. `pass_is_steps`: the whole-card prompt pass (`GpuModel::prompt_pass`, passes of up to 512
 //!     rows over every visit) against the step chain over two calls of set `e` under its forced
 //!     picks — the second call carries every store across a call boundary and wraps the windowed
-//!     visits' rings. The first visit's stores (keys, values, conv rings) within
-//!     `FIRST_VISIT_BAND` (derived at the constant), blocks 0 and 1 within the e2e's forced stage
-//!     bands, the later blocks and the kept logits (every 64th row and each call's last) printed;
-//!     and `pass_is_single_rows`: the same calls run one row a pass equal the 512-row passes, the
-//!     kept logits and every written store row the same bits, so the carry across pass, call and
-//!     ring boundaries is exact.
-//! 11. `pass_is_the_oracle`: the pass's taps at the last row under the vendor's picks within
-//!     `gate_inkling2_e2e`'s forced bands by block, and the free pass's greedy id against every
-//!     fixture set's `greedy.tsv` under the e2e's pin (σ `SIGMA_FIXTURE`, margins at or past
+//!     visits' rings, under each word of `BLOOMERY_INK2_PASS_ACT` (the rows an NVFP4 layer's
+//!     routed GEMMs read: `exact` 8 bits, `full` FP4 in both roles, `gate-up` FP4 in the gate·up).
+//!     `exact`: the first visit's stores (keys, values, conv rings) within `FIRST_VISIT_BAND`
+//!     (derived at the constant), blocks 0 and 1 within the e2e's forced stage bands, the later
+//!     blocks and the kept logits (every 64th row and each call's last) printed. `full` and
+//!     `gate-up`: the first two visits within `FULL_VISITS` / `GATE_UP_VISITS` (derived at the
+//!     constants), the rest printed. `pass_is_single_rows` (`exact` and `full`): the same calls run
+//!     one row a pass equal the 512-row passes, the kept logits and every written store row the
+//!     same bits, so the carry across pass, call and ring boundaries is exact.
+//! 11. `pass_is_the_oracle`: the pass's taps at the last row under the vendor's picks, under each
+//!     word: `exact` within `gate_inkling2_e2e`'s forced bands by block, `full` and `gate-up` the
+//!     first two visits' within `FULL_TAPS` / `GATE_UP_TAPS`; and the free pass's greedy id against
+//!     every fixture set's `greedy.tsv` under the e2e's pin (σ `SIGMA_FIXTURE`, margins at or past
 //!     `MARGIN_FLOOR`).
 //! 12. `pass_reserve`: the bytes the pass's buffers take equal the plan's reserve
 //!     (`place::pass_bytes` at the pass's rows), which the load refuses past by name.
+//! 13. `pass_act_words`: one forced call of set `e` under each word leaves its own stores (the
+//!     three pairwise different: each word reaches the role it names), and `exact` again after the
+//!     others leaves the first `exact`'s bits (the setter turns the FP4 rows off and on without a
+//!     trace).
 //!
 //! Clauses 8 and 9 read the tier's model file (the fixture's on the fixture tier, the Mini's on
-//! the real tier): its expert stacks, nothing else. Clauses 10 to 12 load the whole file; 10 and
-//! 11 run on the fixture tier, where the sets are; the real tier runs 12 and the development
+//! the real tier): its expert stacks, nothing else. Clauses 10 to 13 load the whole file; 10, 11
+//! and 13 run on the fixture tier, where the sets are; the real tier runs 12 and the development
 //! timing (the pass at `DEV_P` rows and the graph step at `DEV_DEPTH`, printed, no pin).
 //!
 //! [derived] [`PP_BAND`]: the two kernels compute the same f32 rule in two orders — the step's
@@ -67,6 +77,9 @@
 //! SwiGLU in SiTU's place in the route block turns `moe_rows`; the conv rings cleared at a pass
 //! boundary turn `pass_is_steps`; every visit routed by the first visit's picks turns
 //! `pass_is_the_oracle`; a pass buffer one row short turns `pass_reserve`.
+//! A native fill that scales its codes by half turns `moe_rows`' FP4 clauses and the first visits
+//! of `full` and `gate-up`; the `exact` word left reading the FP4 rows turns `exact`'s clauses and
+//! `pass_act_words`; `gate-up` left running the down GEMM in FP4 turns `pass_act_words`.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -717,6 +730,12 @@ mod gate {
     /// [derived] The prompt route block's down rows against the step leg's, rel-L2 over every
     /// slot (module doc, clause 8).
     const MOE_BAND: f64 = 3e-2;
+    /// PIN(2026-11-27): the prompt route block over FP4 rows in both roles (`full`) against the
+    /// step leg, rel-L2 over every slot ([`moe_clauses`]' FP4 note).
+    const MOE_FP4_BAND: f64 = 2.2e-1;
+    /// PIN(2026-11-27): the same with the down rows in 8 bits (`gate-up`), under `full`'s own
+    /// reading so a `gate-up` that ran the down GEMM in FP4 is out of it.
+    const MOE_FP4_GATE_UP_BAND: f64 = 1.7e-1;
     const RECIPE: &str = "gate-inkling2-pp";
 
     /// The leg's gate·up and down arms: the family's NVFP4 planes and Q8_0 blocks.
@@ -781,6 +800,27 @@ mod gate {
     /// where the gate sums reach the cap: past the band at these rows, not by order 1; the wrong
     /// expert's rows move them by order 1. The f32 order of the block sums (the gemv's lane fold
     /// against the GEMM's k walk, ~√72 · 2⁻²⁴) is three orders under it.
+    ///
+    /// On a native FP4 build the same block also runs over FP4 rows (an E2M1 code a value, a UE4M3
+    /// scale of `amax/6` a block of 16, rounded to nearest), the rows of both roles (`full`) and
+    /// of the gate·up alone (`gate-up`), each within its band of the leg's rows.
+    /// [derived] [`MOE_FP4_BAND`], [`MOE_FP4_GATE_UP_BAND`]: the format rounds a block of 16 by
+    /// 10.1 % of a seeded uniform row and 9.1 % of SiTU rows (amax/rms ≈ 2.7 over a block). A
+    /// GEMM's sums keep their input's ratio (a weight's noise projection is the row's), so the gate
+    /// and up sums each carry 10.1 %, the SiTU product √2 of it less the tanh·sigmoid's damping:
+    /// `gate-up`'s down rows read 14.6 %, `full`'s add the down input's 9.1 % in quadrature, 17.3 %
+    /// (a numpy walk of this recipe over random weights; the card reads 14.8 % and 17.4 % on the
+    /// fixture, within 1.5 % of it). The format's other rounding rules (the scale exact, rounded
+    /// up to the next UE4M3 value, a power of two, one scale a 32) read 17.0 to 20.8 % (`full`) and
+    /// 14.2 to 16.4 % (`gate-up`): a quantizer's choice, inside the bands; a truncating round
+    /// (48.7 %) and a code scaled by half (88 %) are defects, outside. `full`'s band is the
+    /// largest rule's reading with the model's gap on it, 20.8 % · 1.05 = 21.9 %; `gate-up`'s is
+    /// the largest of its own, 16.4 % · 1.01 = 16.6 %, which lies under `full`'s reading.
+    /// [measured] On the Mini's own expert stacks (the real tier) `full` reads 17.0 % (the worst
+    /// slot 22.5 %) and `gate-up` 14.3 % (19.2 %), on the fixture's 17.4 % and 14.8 %: 1.29 and
+    /// 1.19 under the bands on the real file, 1.26 and 1.15 on the fixture. `full` on the real
+    /// file reads at `gate-up`'s band, so there this clause does not tell the two words apart;
+    /// the fixture tier's `pass_act_words` does.
     fn moe_clauses(dev: &Dev, rng: &mut GateRng) -> Result<Vec<bool>, GateError> {
         let path = bloomery_gpu_gates::ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -934,6 +974,60 @@ mod gate {
                      the worst slot {worst:.3e}; the gate·up stage (SiTU rows) {situ_rel:.3e}"
                 ),
             ));
+            // The same block over the native FP4 planes (`BLOOMERY_INK2_PASS_ACT`'s `full`: the
+            // rows of both roles in FP4; `gate-up`: the gate·up's alone) against the step's leg.
+            if scaled && bloomery_gpu::NATIVE_FP4 {
+                for (word, band, down_fp4) in [
+                    ("full", MOE_FP4_BAND, true),
+                    ("gate-up", MOE_FP4_GATE_UP_BAND, false),
+                ] {
+                    let mut x32n = GemmAct32::new_routed(s, t, embd)?;
+                    g32.enqueue_quantize_gemm32(s, &x, t, &mut x32n, fault)?;
+                    let mut h32n = if down_fp4 {
+                        GemmAct32::new_routed(s, slots, ff)?
+                    } else {
+                        GemmAct32::new(s, slots, ff)?
+                    };
+                    let mut gn = DeviceBuffer::<f32>::zeroed(s, slots * ff)?;
+                    let mut un = DeviceBuffer::<f32>::zeroed(s, slots * ff)?;
+                    let mut yn = DeviceBuffer::<f32>::zeroed(s, slots * embd)?;
+                    block.enqueue_rule(
+                        gpu,
+                        (None, &g32),
+                        (&route, n_used),
+                        slots,
+                        (
+                            RouteIo {
+                                x128: None,
+                                x32: Some(&x32n),
+                                g: &mut gn,
+                                u: &mut un,
+                                h128: None,
+                                h32: Some(&mut h32n),
+                                y: &mut yn,
+                            },
+                            rule,
+                        ),
+                        fault,
+                    )?;
+                    let got = dev.read(&yn)?;
+                    let rel = rel_l2(&got, &leg_all);
+                    let worst = (0..slots)
+                        .map(|sl| {
+                            let span = sl * embd..(sl + 1) * embd;
+                            rel_l2(&got[span.clone()], &leg_all[span])
+                        })
+                        .fold(0.0f64, f64::max);
+                    ok.push(clause(
+                        &format!("moe_rows l={l} ({quant}) {word} FP4 rows vs the step leg"),
+                        rel <= band,
+                        &format!(
+                            "{t} rows x {n_used} slots, ff {ff}: rel-L2 {rel:.3e} (band {band:.2e}), \
+                             the worst slot {worst:.3e}"
+                        ),
+                    ));
+                }
+            }
             ok.push(clause(
                 &format!("moe_leg_rows l={l} ({quant})"),
                 one_same,
@@ -958,6 +1052,7 @@ mod gate {
             GateError, RefManifest, RowKind, bits_equal, open_split, ref_tensor_logical_in,
             topk_ids_logical_within,
         };
+        use bloomery_levers::Ink2PassAct;
         use gguf::quant::half_to_f32;
         use model::arch::Arch;
         use model::arch::inkling2::hparams::Hparams;
@@ -1002,6 +1097,26 @@ mod gate {
         /// times the worst of these; a ring that forgets its rows at a boundary moves those rows
         /// by order 1.
         const FIRST_VISIT_BAND: f64 = 4e-2;
+        /// PIN(2026-11-27): the FP4 arms' first visits (`full`: both roles' rows in FP4;
+        /// `gate-up`: the gate·up's), one rel-L2 band a visit of the key/value rows and the conv
+        /// ring; the visits past the list are printed ([`Bands::visits`]).
+        /// [derived] Visit 0's keys and values are the base's (no routed layer before them), so
+        /// its worst figure is the conv ring's, which holds the routed sum: at most the route
+        /// block's own FP4 error (`MOE_FP4_BAND`'s derivation: 17.4 % `full`, 14.8 % `gate-up`
+        /// on the fixture), less what the ring's other contents dilute; visit 1's keys and values
+        /// are the first made of a routed state. Each band is the arm's reading times the model's
+        /// largest quantizer rule over the clean one and its gap to the card, 1.20 · 1.05 = 1.26.
+        /// Past visit 1 the pass's stores and the steps' decorrelate (the unrelated pair of equal
+        /// norm reads 1.41, `full` reads 0.6 to 0.7 at visit 5 and 1.2 at visit 11, where the 8-bit
+        /// arm's bands run to visit 11 at 0.1 to 0.26), so a band there holds nothing: printed.
+        const FULL_VISITS: [f64; 2] = [1.8e-1, 3.2e-1];
+        const GATE_UP_VISITS: [f64; 2] = [1.5e-1, 2.7e-1];
+        /// PIN(2026-11-27): the FP4 arms' taps at the last row against the vendor's nodes, the
+        /// first [`FP4_TAP_VISITS`] visits' entries within one rel-L2 band, the later printed:
+        /// [derived] the same factor 1.26 on the arm's worst reading over those visits.
+        const FP4_TAP_VISITS: usize = 2;
+        const FULL_TAPS: f64 = 3.3e-1;
+        const GATE_UP_TAPS: f64 = 2.9e-1;
         /// `gate_inkling2_e2e`'s `SIGMA_FIXTURE`: the fixture's logit deviation between two
         /// implementations, the σ of the greedy pin ([`greedy_pin`]).
         const SIGMA_FIXTURE: f64 = 1.5;
@@ -1233,20 +1348,117 @@ mod gate {
             stores: Vec<Vec<StoreHost>>,
         }
 
-        /// Clause 10 `pass_is_steps` (module doc): three arms over two calls of set `e` with the
-        /// vendor's picks forced — the pass, the pass one row a call and the steps.
-        #[allow(clippy::too_many_lines, reason = "three arms and their comparisons")]
-        fn pass_is_steps(
-            m: &mut GpuModel<Body>,
-            s: &SetE,
-            (block, vocab): (usize, usize),
-        ) -> Result<Vec<bool>, GateError> {
-            let p = s.prompt.len();
+        /// How an arm holds clause 11's taps.
+        enum TapsHeld {
+            /// Every entry the e2e's bands cover within them times this share.
+            Shares(f64),
+            /// The entries of the first `.0` visits within one rel-L2 band `.1`; the later visits'
+            /// are printed.
+            Visits(usize, f64),
+        }
+
+        /// What one arm of clauses 10 and 11 holds.
+        struct Bands {
+            /// Clause 10's first visits: visit `v`'s worst key/value row and conv ring within
+            /// `visits[v]` by rel-L2; the later visits are printed.
+            visits: &'static [f64],
+            /// Clause 10's blocks 0 and 1: every visit's stores within the e2e's stage bands times
+            /// this share; `None` prints them.
+            blocks: Option<f64>,
+            taps: TapsHeld,
+            /// Whether the arm also runs one row a call and is held to the 512-row passes' bits:
+            /// the kernels of the arm are the same under each word, so one arm per kernel set.
+            single_rows: bool,
+        }
+
+        /// `exact`'s bands, the 8-bit rows' pins: the first visit by [`FIRST_VISIT_BAND`], every
+        /// visit of blocks 0 and 1 and every tap at most its e2e band.
+        const EXACT_BANDS: Bands = Bands {
+            visits: &[FIRST_VISIT_BAND],
+            blocks: Some(1.0),
+            taps: TapsHeld::Shares(1.0),
+            single_rows: true,
+        };
+
+        /// `full`'s bands, the FP4 rows' ([`FULL_VISITS`], [`FULL_TAPS`]).
+        const FULL_BANDS: Bands = Bands {
+            visits: &FULL_VISITS,
+            blocks: None,
+            taps: TapsHeld::Visits(FP4_TAP_VISITS, FULL_TAPS),
+            single_rows: true,
+        };
+
+        /// `gate-up`'s bands: the FP4 gate·up rows beside the 8-bit down rows
+        /// ([`GATE_UP_VISITS`], [`GATE_UP_TAPS`]). Its kernels are `full`'s gate·up and `exact`'s
+        /// down, each held to the 512-row passes' bits under its own arm.
+        const GATE_UP_BANDS: Bands = Bands {
+            visits: &GATE_UP_VISITS,
+            blocks: None,
+            taps: TapsHeld::Visits(FP4_TAP_VISITS, GATE_UP_TAPS),
+            single_rows: false,
+        };
+
+        /// A clause's name for the arm `act` runs: `exact`'s keep the names its bands had.
+        fn arm_name(name: &str, act: Ink2PassAct) -> String {
+            if act == Ink2PassAct::Exact {
+                name.to_string()
+            } else {
+                format!("{name} [{act}]")
+            }
+        }
+
+        /// The kept logits rows of a call of `p` rows: every [`SCORE_EVERY`]th and the last.
+        fn scored_rows(p: usize) -> Vec<usize> {
             let mut scored: Vec<usize> = (0..p).step_by(SCORE_EVERY).collect();
             if scored.last() != Some(&(p - 1)) {
                 scored.push(p - 1);
             }
+            scored
+        }
+
+        /// The steps arm of clause 10: the step chain over two calls of set `e` under the
+        /// vendor's picks, one step an id. A step reads no prompt-pass rows, so one run serves
+        /// every `BLOOMERY_INK2_PASS_ACT` arm.
+        fn steps_arm(m: &mut GpuModel<Body>, s: &SetE) -> Result<Arm, GateError> {
+            let p = s.prompt.len();
+            let scored = scored_rows(p);
             m.set_mode(StepMode::Eager);
+            m.reset()?;
+            let mut arm = Arm {
+                logits: Vec::new(),
+                stores: Vec::new(),
+            };
+            for call in 0..2 {
+                for (t, &id) in s.prompt.iter().enumerate() {
+                    let (ids, ws) = picks_at(s, call * p + t, 1);
+                    {
+                        let (gpu, _, body) = m.body_parts(NAME)?;
+                        body.force_picks(gpu, (&ids, &ws))?;
+                    }
+                    m.step(&[id])?;
+                    if scored.contains(&t) {
+                        arm.logits.push(m.logits()?);
+                    }
+                }
+                arm.stores.push(stores(m)?);
+            }
+            m.body_parts(NAME)?.2.unforce_picks();
+            Ok(arm)
+        }
+
+        /// Clause 10 `pass_is_steps` (module doc) under the prompt pass's rows `act` and the arm's
+        /// `bands`: the pass, and where the arm holds it the pass one row a call, two calls of set
+        /// `e` with the vendor's picks forced, against the steps arm ([`steps_arm`]).
+        #[allow(clippy::too_many_lines, reason = "two arms and their comparisons")]
+        fn pass_is_steps(
+            m: &mut GpuModel<Body>,
+            s: &SetE,
+            (block, vocab): (usize, usize),
+            (act, bands, steps): (Ink2PassAct, &Bands, &Arm),
+        ) -> Result<Vec<bool>, GateError> {
+            let p = s.prompt.len();
+            let scored = scored_rows(p);
+            m.set_pass_act(act)?;
             // The pass: each call one forced pass call.
             m.reset()?;
             let mut pass = Arm {
@@ -1263,58 +1475,42 @@ mod gate {
                 pass.logits.extend(kept);
                 pass.stores.push(stores(m)?);
             }
-            // The pass one row a call, and the steps, at the same positions.
-            let mut arms = Vec::new();
-            for rows_arm in [true, false] {
+            // The pass one row a call, at the same positions.
+            let rows = if bands.single_rows {
                 m.reset()?;
-                let mut arm = Arm {
+                let mut rows = Arm {
                     logits: Vec::new(),
                     stores: Vec::new(),
                 };
                 for call in 0..2 {
                     for (t, &id) in s.prompt.iter().enumerate() {
                         let (ids, ws) = picks_at(s, call * p + t, 1);
-                        let keep = scored.contains(&t);
-                        if rows_arm {
-                            {
-                                let (gpu, _, body) = m.body_parts(NAME)?;
-                                body.force_pass_picks(gpu, (&ids, &ws), 1)?;
-                            }
-                            let (_, kept) =
-                                m.prompt_pass_scored(&[id], if keep { &[0] } else { &[] })?;
-                            arm.logits.extend(kept);
-                        } else {
-                            {
-                                let (gpu, _, body) = m.body_parts(NAME)?;
-                                body.force_picks(gpu, (&ids, &ws))?;
-                            }
-                            m.step(&[id])?;
-                            if keep {
-                                arm.logits.push(m.logits()?);
-                            }
+                        {
+                            let (gpu, _, body) = m.body_parts(NAME)?;
+                            body.force_pass_picks(gpu, (&ids, &ws), 1)?;
                         }
+                        let keep = scored.contains(&t);
+                        let (_, kept) =
+                            m.prompt_pass_scored(&[id], if keep { &[0] } else { &[] })?;
+                        rows.logits.extend(kept);
                     }
-                    arm.stores.push(stores(m)?);
+                    rows.stores.push(stores(m)?);
                 }
-                arms.push(arm);
-            }
-            {
-                let body = m.body_parts(NAME)?.2;
-                body.unforce_pass_picks();
-                body.unforce_picks();
-            }
-            let steps = arms.pop().ok_or("the steps arm")?;
-            let rows = arms.pop().ok_or("the rows arm")?;
+                Some(rows)
+            } else {
+                None
+            };
+            m.body_parts(NAME)?.2.unforce_pass_picks();
             let blocks = blocks_of(&m.body(NAME)?.visit_table(), block);
             let mut ok = Vec::new();
-            // The pass against the steps: the first visit held, every visit and kept row printed,
-            // the blocks of the e2e's stage bands held.
-            let mut first_worst = 0.0f64;
+            // The pass against the steps: the first visits held, every visit and kept row printed,
+            // the blocks of the e2e's stage bands held where the arm holds them.
+            let mut first_worst = vec![0.0f64; bands.visits.len()];
             let mut block_worst = (0.0f64, 0usize, 0usize);
             for call in 0..2 {
                 let written = (call + 1) * p;
                 println!(
-                    "  pass_is_steps call {call} (positions {}..{written}):",
+                    "  pass_is_steps [{act}] call {call} (positions {}..{written}):",
                     call * p
                 );
                 for (v, (a, b)) in pass.stores[call]
@@ -1327,11 +1523,20 @@ mod gate {
                         "    visit {v} (block {}): kv {kv:.2e} at row {row}, conv {conv:.2e}",
                         blocks[v]
                     );
-                    if v == 0 {
-                        first_worst = first_worst.max(kv).max(conv);
+                    let worst = if kv.is_nan() || conv.is_nan() {
+                        f64::NAN
+                    } else {
+                        kv.max(conv)
+                    };
+                    if let Some(w) = first_worst.get_mut(v)
+                        && (worst > *w || worst.is_nan())
+                    {
+                        *w = worst;
                     }
-                    if let Some(&band) = FORCED_STAGE_BANDS.get(blocks[v]) {
-                        let share = kv.max(conv) / band;
+                    if bands.blocks.is_some()
+                        && let Some(&band) = FORCED_STAGE_BANDS.get(blocks[v])
+                    {
+                        let share = worst / band;
                         if share > block_worst.0 || share.is_nan() {
                             block_worst = (share, v, call);
                         }
@@ -1346,73 +1551,100 @@ mod gate {
                 .map(|(a, b)| rel(&a[..vocab], &b[..vocab]))
                 .collect();
             println!(
-                "  pass_is_steps logits rows {scored:?} x 2 calls, rel-L2 from the steps: {}",
+                "  pass_is_steps [{act}] logits rows {scored:?} x 2 calls, rel-L2 from the steps: {}",
                 logit_rels
                     .iter()
                     .map(|x| format!("{x:.2e}"))
                     .collect::<Vec<_>>()
                     .join(" ")
             );
+            let first_name = if bands.visits.len() == 1 {
+                "pass_is_steps first visit"
+            } else {
+                "pass_is_steps first visits"
+            };
             ok.push(clause(
-                "pass_is_steps first visit",
-                first_worst <= FIRST_VISIT_BAND,
+                &arm_name(first_name, act),
+                first_worst.iter().zip(bands.visits).all(|(w, b)| w <= b),
                 &format!(
-                    "the first visit's worst key/value row and conv ring {first_worst:.3e} (band \
-                     {FIRST_VISIT_BAND:.0e}; the order: q8-32 wide GEMMs against the f32 gemv, the \
-                     prefill flash's key tiles, the route GEMM's 32-value grid)"
+                    "the first visits' worst key/value row and conv ring, visit by visit {} \
+                     (bands {}; the order: q8-32 wide GEMMs against the f32 gemv, the prefill \
+                     flash's key tiles, the route GEMM's 32-value grid, the routed rows' {act} \
+                     form)",
+                    sci_list(&first_worst),
+                    sci_list(bands.visits)
                 ),
             ));
-            ok.push(clause(
-                "pass_is_steps blocks",
-                block_worst.0 <= 1.0,
-                &format!(
-                    "every visit's stores of blocks 0 and 1 within {FORCED_STAGE_BANDS:?}: worst \
-                     share {:.2} at visit {} after call {} (later blocks printed)",
-                    block_worst.0, block_worst.1, block_worst.2
+            match bands.blocks {
+                Some(share) => ok.push(clause(
+                    &arm_name("pass_is_steps blocks", act),
+                    block_worst.0 <= share,
+                    &format!(
+                        "every visit's stores of blocks 0 and 1 within {FORCED_STAGE_BANDS:?} x \
+                         {share}: worst share {:.2} at visit {} after call {} (later blocks \
+                         printed)",
+                        block_worst.0, block_worst.1, block_worst.2
+                    ),
+                )),
+                None => println!(
+                    "  pass_is_steps [{act}] the stores past the first visits are printed, held \
+                     by no band: the pass's and the steps' decorrelate there"
                 ),
-            ));
+            }
             // The pass against itself one row a call: the same kernels, so the same bits.
-            let logits_same = pass.logits.len() == rows.logits.len()
-                && pass
+            if let Some(rows) = &rows {
+                let logits_same = pass.logits.len() == rows.logits.len()
+                    && pass
+                        .logits
+                        .iter()
+                        .zip(&rows.logits)
+                        .all(|(a, b)| bits_equal(a, b));
+                let stores_same: Vec<bool> = (0..2)
+                    .map(|c| same_stores(&pass.stores[c], &rows.stores[c], (c + 1) * p))
+                    .collect();
+                let worst_rows = (0..2)
+                    .flat_map(|c| {
+                        pass.stores[c]
+                            .iter()
+                            .zip(&rows.stores[c])
+                            .enumerate()
+                            .map(move |(v, (a, b))| (store_rel(a, b, (c + 1) * p), v, c))
+                    })
+                    .fold(((0.0f64, 0usize, 0.0f64), 0usize, 0usize), |w, x| {
+                        if x.0.0.max(x.0.2) > w.0.0.max(w.0.2) {
+                            x
+                        } else {
+                            w
+                        }
+                    });
+                let worst_logit = pass
                     .logits
                     .iter()
                     .zip(&rows.logits)
-                    .all(|(a, b)| bits_equal(a, b));
-            let stores_same: Vec<bool> = (0..2)
-                .map(|c| same_stores(&pass.stores[c], &rows.stores[c], (c + 1) * p))
-                .collect();
-            let worst_rows = (0..2)
-                .flat_map(|c| {
-                    pass.stores[c]
-                        .iter()
-                        .zip(&rows.stores[c])
-                        .enumerate()
-                        .map(move |(v, (a, b))| (store_rel(a, b, (c + 1) * p), v, c))
-                })
-                .fold(((0.0f64, 0usize, 0.0f64), 0usize, 0usize), |w, x| {
-                    if x.0.0.max(x.0.2) > w.0.0.max(w.0.2) {
-                        x
-                    } else {
-                        w
-                    }
-                });
-            let worst_logit = pass
-                .logits
-                .iter()
-                .zip(&rows.logits)
-                .map(|(a, b)| rel(a, b))
-                .fold(0.0f64, f64::max);
-            ok.push(clause(
-                "pass_is_single_rows",
-                logits_same && stores_same.iter().all(|&x| x),
-                &format!(
-                    "passes of 512 rows against passes of one row a call: logits rows same bits \
-                     {logits_same} (worst rel {worst_logit:.2e}), stores same bits {stores_same:?} \
-                     (worst kv {:.2e} at row {} / conv {:.2e}, visit {}, call {})",
-                    worst_rows.0.0, worst_rows.0.1, worst_rows.0.2, worst_rows.1, worst_rows.2
-                ),
-            ));
+                    .map(|(a, b)| rel(a, b))
+                    .fold(0.0f64, f64::max);
+                ok.push(clause(
+                    &arm_name("pass_is_single_rows", act),
+                    logits_same && stores_same.iter().all(|&x| x),
+                    &format!(
+                        "passes of 512 rows against passes of one row a call: logits rows same \
+                         bits {logits_same} (worst rel {worst_logit:.2e}), stores same bits \
+                         {stores_same:?} (worst kv {:.2e} at row {} / conv {:.2e}, visit {}, \
+                         call {})",
+                        worst_rows.0.0, worst_rows.0.1, worst_rows.0.2, worst_rows.1, worst_rows.2
+                    ),
+                ));
+            }
             Ok(ok)
+        }
+
+        /// `values` as `1.23e-4 5.00e-1 ...`.
+        fn sci_list(values: &[f64]) -> String {
+            values
+                .iter()
+                .map(|x| format!("{x:.3e}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         }
 
         /// Clause 11 `pass_is_the_oracle` (module doc): the forced pass's taps against the
@@ -1421,8 +1653,10 @@ mod gate {
             m: &mut GpuModel<Body>,
             s: &SetE,
             block: usize,
+            (act, bands): (Ink2PassAct, &Bands),
         ) -> Result<Vec<bool>, GateError> {
             let p = s.prompt.len();
+            m.set_pass_act(act)?;
             m.reset()?;
             let (ids, ws) = picks_at(s, 0, p);
             {
@@ -1443,7 +1677,8 @@ mod gate {
                 out
             };
             let row: usize = widths.iter().sum();
-            let (mut held, mut worst) = (0usize, (0.0f64, 0usize, ""));
+            let (mut held, mut worst) = (0usize, (0.0f64, 0.0f64, 0usize, ""));
+            let mut by_visit = vec![0.0f64; s.stages.len()];
             for (v, theirs) in s.stages.iter().enumerate() {
                 let mut at = v * row;
                 for (k, (w, t)) in widths.iter().zip(theirs).enumerate() {
@@ -1451,26 +1686,48 @@ mod gate {
                     at += w;
                     let Some(t) = t else { continue };
                     let x = rel(ours, t);
-                    let bands: &[f64] = if k == L_OUT {
+                    if x > by_visit[v] || x.is_nan() {
+                        by_visit[v] = x;
+                    }
+                    let e2e: &[f64] = if k == L_OUT {
                         &FORCED_BANDS
                     } else {
                         &FORCED_STAGE_BANDS
                     };
-                    if let Some(band) = bands.get(blocks[v]) {
+                    let limit = match bands.taps {
+                        TapsHeld::Shares(share) => e2e.get(blocks[v]).map(|b| b * share),
+                        TapsHeld::Visits(n, band) => (v < n).then_some(band),
+                    };
+                    if let Some(limit) = limit {
                         held += 1;
-                        if x / band > worst.0 || x.is_nan() {
-                            worst = (x / band, v, TAP_STAGES[k]);
+                        if x / limit > worst.0 || x.is_nan() {
+                            worst = (x / limit, x, v, TAP_STAGES[k]);
                         }
                     }
                 }
             }
+            println!(
+                "  pass_is_the_oracle [{act}] taps at the last row, the worst rel-L2 of each \
+                 visit's stages: {}",
+                sci_list(&by_visit)
+            );
+            let how = match bands.taps {
+                TapsHeld::Shares(share) => {
+                    format!("gate_inkling2_e2e's bands by block x {share}")
+                }
+                TapsHeld::Visits(n, band) => format!(
+                    "the first {n} visits within {band:.2e} by rel-L2, the later visits printed; \
+                     worst rel-L2 {:.3e}",
+                    worst.1
+                ),
+            };
             let mut ok = vec![clause(
-                "pass_is_the_oracle taps",
+                &arm_name("pass_is_the_oracle taps", act),
                 worst.0 <= 1.0,
                 &format!(
                     "the forced pass's taps at the last row against the vendor's nodes: held={held} \
-                     worst_share={:.2} at {}-{} (gate_inkling2_e2e's bands by block)",
-                    worst.0, worst.2, worst.1
+                     worst_share={:.2} at {}-{} ({how})",
+                    worst.0, worst.3, worst.2
                 ),
             )];
             // The free pass's first greedy id on every fixture set against the vendor's.
@@ -1489,7 +1746,7 @@ mod gate {
             }
             let (expected, pin) = greedy_pin(&margins, SIGMA_FIXTURE);
             ok.push(clause(
-                "pass_is_the_oracle greedy",
+                &arm_name("pass_is_the_oracle greedy", act),
                 off <= pin,
                 &format!(
                     "the free pass's first greedy id against the vendor's (ours/theirs at the \
@@ -1500,6 +1757,47 @@ mod gate {
                 ),
             ));
             Ok(ok)
+        }
+
+        /// Clause 13 `pass_act_words`: one forced call of set `e` under each word of
+        /// `BLOOMERY_INK2_PASS_ACT` leaves its own stores — `full`, `gate-up` and `exact` pairwise
+        /// different (each word reaches the role it names) — and `exact` again after the others
+        /// leaves the first `exact`'s bits (the setter turns the FP4 rows off and on without a
+        /// trace).
+        fn pass_act_words(m: &mut GpuModel<Body>, s: &SetE) -> Result<bool, GateError> {
+            let p = s.prompt.len();
+            let (ids, ws) = picks_at(s, 0, p);
+            let mut call = |act: Ink2PassAct| -> Result<Vec<StoreHost>, GateError> {
+                m.set_pass_act(act)?;
+                m.reset()?;
+                {
+                    let (gpu, _, body) = m.body_parts(NAME)?;
+                    body.force_pass_picks(gpu, (&ids, &ws), p)?;
+                }
+                m.prompt_pass(&s.prompt)?;
+                m.body_parts(NAME)?.2.unforce_pass_picks();
+                stores(m)
+            };
+            let exact = call(Ink2PassAct::Exact)?;
+            let full = call(Ink2PassAct::Full)?;
+            let gate_up = call(Ink2PassAct::GateUp)?;
+            let again = call(Ink2PassAct::Exact)?;
+            let same = |a: &[StoreHost], b: &[StoreHost]| same_stores(a, b, p);
+            let (reversible, full_moves, gate_up_moves, words_differ) = (
+                same(&exact, &again),
+                !same(&exact, &full),
+                !same(&exact, &gate_up),
+                !same(&full, &gate_up),
+            );
+            Ok(clause(
+                "pass_act_words",
+                reversible && full_moves && gate_up_moves && words_differ,
+                &format!(
+                    "one forced call of {p} rows: exact again = exact bit for bit {reversible}; \
+                     full differs from exact {full_moves}; gate-up differs from exact \
+                     {gate_up_moves}; gate-up differs from full {words_differ}"
+                ),
+            ))
         }
 
         /// The development timing on the real tier: the pass's wall at each of [`DEV_P`] rows
@@ -1562,7 +1860,7 @@ mod gate {
                 Tier::Real => CTX_REAL,
             };
             let planned = Inputs::describe(&split)
-                .and_then(|i| i.pass_reserve(ctx as u64))
+                .and_then(|i| i.pass_reserve(ctx as u64, bloomery_gpu::NATIVE_FP4))
                 .map_err(|e| format!("{NAME}: the plan's pass reserve: {e}"))?;
             let n = hp.n_embd;
             let (q, kv, r) = (
@@ -1589,8 +1887,22 @@ mod gate {
             let mut ok = vec![reserve(&m, planned)?];
             match &set {
                 Some(s) => {
-                    ok.extend(pass_is_steps(&mut m, s, (hp.block, hp.n_vocab_unpadded))?);
-                    ok.extend(pass_is_the_oracle(&mut m, s, hp.block)?);
+                    let steps = steps_arm(&mut m, s)?;
+                    for (act, bands) in [
+                        (Ink2PassAct::Exact, &EXACT_BANDS),
+                        (Ink2PassAct::Full, &FULL_BANDS),
+                        (Ink2PassAct::GateUp, &GATE_UP_BANDS),
+                    ] {
+                        ok.extend(pass_is_steps(
+                            &mut m,
+                            s,
+                            (hp.block, hp.n_vocab_unpadded),
+                            (act, bands, &steps),
+                        )?);
+                        ok.extend(pass_is_the_oracle(&mut m, s, hp.block, (act, bands))?);
+                    }
+                    ok.push(pass_act_words(&mut m, s)?);
+                    m.set_pass_act(Ink2PassAct::Full)?;
                 }
                 None => dev_timing(&mut m)?,
             }

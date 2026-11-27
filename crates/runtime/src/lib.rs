@@ -30,12 +30,14 @@ pub mod combine;
 pub mod costs;
 pub mod dspark;
 pub mod hc_gated;
+mod history;
 pub mod layer;
 mod lookup;
 pub mod msa;
 pub mod mtp;
 pub mod prompt;
 pub mod qsa;
+mod recall;
 pub mod routedial;
 pub mod savemap;
 pub mod sched;
@@ -52,7 +54,9 @@ pub mod width;
 pub mod words;
 pub mod xsplit;
 
+pub use history::HistoryDraft;
 pub use lookup::Lookup;
+pub use recall::{Matched, Recall, RecallError};
 pub use speculative::{
     Argmax, Draft, Exhausted, Forced, NotAnId, NotBuilt, Pick, Picked, Picking, Program, RowLogits,
     Sample, SampleBest, Speculative, TapNeed, TapSink, Tapped, TappedPrompt, Width, Widths, Window,

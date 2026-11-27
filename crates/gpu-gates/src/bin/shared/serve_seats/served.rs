@@ -17,10 +17,10 @@
 //! [`CardDspark`], every seat's): a seat names its draft's layers, never a
 //! copy of these calls.
 //!
-//! The lookup arm holds the serve seats' one owner of the lookup draft,
-//! [`Lookups`]: a context and a width chooser a resident slot, the context
-//! one the V4.1 seat rebuilds from its body's token history when it falls
-//! behind.
+//! The lookup and recall arms hold the serve seats' one owner of the
+//! drafts of the token history, [`Lookups`]: a context and a width chooser a
+//! resident slot, the context one the V4.1 seat rebuilds from its body's
+//! token history when it falls behind.
 //!
 //! The rule that a DSpark draft serves one slot is [`draft_slots`], and the
 //! qwen3 seat's draft word is [`word`].
@@ -39,7 +39,7 @@ use runtime::width::{Choosing, Chosen, Mode as WidthMode};
 use runtime::{Advance, Committed, Draft as RtDraft, Speculative, Widths, Window};
 use serve::{DeviceProps, DraftProps, Drafted, EngineProps, PlacementProps};
 
-use super::drafted::{History, LOOKUP_ROWS, Lookups, Taking, drafted, lookup_props};
+use super::drafted::{History, Lookups, Taking, drafted};
 use crate::draft::Draft;
 
 /// The class `/props` files the draft's resident bytes under.
@@ -368,8 +368,9 @@ impl<B: ChainBody + 'static> ServedSpark<B> {
     }
 }
 
-/// The draft a seat serves: none, the DSpark draft or the lookup, each
-/// verified by the session's pass behind the width chooser.
+/// The draft a seat serves: none, the DSpark draft or a draft of the token
+/// history (the lookup or the recall draft), each verified by the session's
+/// pass behind the width chooser.
 pub struct ServedDraft<B: ChainBody + 'static> {
     dspark: Option<ServedSpark<B>>,
     lookup: Option<Lookups<Session<B>>>,
@@ -400,9 +401,9 @@ where
     }
 
     /// The lookup draft on each of `slots` resident slots of `s`
-    /// ([`Lookups::open`]), each behind a width chooser of `mode`, each served
-    /// slot's verify pass captured now (`log` told of each); `history` the
-    /// body's token history, where it keeps one.
+    /// ([`Lookups::lookup`]), each behind a width chooser of `mode`, each
+    /// served slot's verify pass captured now (`log` told of each); `history`
+    /// the body's token history, where it keeps one.
     pub fn lookup(
         s: &mut Session<B>,
         slots: usize,
@@ -413,10 +414,18 @@ where
     where
         B: Rows + Rollback,
     {
-        Ok(ServedDraft {
+        Ok(Self::of_history(Lookups::lookup(
+            s, slots, mode, log, history,
+        )?))
+    }
+
+    /// The seat's draft of `history`'s table (a history draft, opened by the
+    /// lookup's constructor here or the recall's in `recalled`).
+    pub(super) fn of_history(history: Lookups<Session<B>>) -> Self {
+        ServedDraft {
             dspark: None,
-            lookup: Some(Lookups::open(s, slots, mode, log, history)?),
-        })
+            lookup: Some(history),
+        }
     }
 
     /// `draft` on `s`, behind the width chooser of `mode`, its verify pass of
@@ -444,7 +453,7 @@ where
     pub fn rows(&self) -> usize {
         match (&self.dspark, &self.lookup) {
             (Some(d), _) => d.rows(),
-            (None, Some(_)) => LOOKUP_ROWS,
+            (None, Some(l)) => l.rows(),
             (None, None) => 1,
         }
     }
@@ -589,8 +598,8 @@ where
     /// row, the class `draft` (a row of its own when the target has no layer
     /// there). The card's index missing leaves the device out.
     pub fn props(&self, p: EngineProps) -> EngineProps {
-        if self.lookup.is_some() {
-            return lookup_props(p);
+        if let Some(l) = &self.lookup {
+            return l.props(p);
         }
         match &self.dspark {
             Some(d) => d.props(p),

@@ -59,10 +59,16 @@
 //!   fewer on than off. The two runs agree as the unstreamed walk and the
 //!   streamed one can (the card and the host sum a token's experts in
 //!   another split): the prompt's last logits row within
-//!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN) of the off run's
+//!   [`ARMS_MAX_DLOGIT`](bloomery_gpu_gates::ARMS_MAX_DLOGIT) of the off run's
 //!   everywhere, and the greedy ids equal or, where they first part, the on
-//!   run's top-1 margin below it (a near tie, V4.1's `gate_ds41_callstream`
-//!   `s3` rule). A prompt of one id fewer than `Body38::STREAM_FLOOR`,
+//!   run's top-1 margin below
+//!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN) (a near tie,
+//!   V4.1's `gate_ds41_callstream` `s3` rule). Those two bands are wide enough
+//!   that one expert's wrong copy stays inside them, so right after the call
+//!   (before any step) every expert the pick left live off the seed holds in
+//!   its slot, part by part, the bytes a static load uploads for it (the
+//!   `transform` check, taken after the call and not after a history). A
+//!   prompt of one id fewer than `Body38::STREAM_FLOOR`,
 //!   streaming on, opens no call (no pick record, no end). Mutants, one a
 //!   rule: the call's end returns each layer to
 //!   the set it started with (`stream_end` with `kept` false: the live sets
@@ -71,7 +77,10 @@
 //!   card route enqueued before the pick (it reads the call's start words
 //!   while the union reads the moved map, so an admitted expert's columns
 //!   run nowhere and the logits part); the short prompt's guard removed (its
-//!   call opens and ends, admitting nothing).
+//!   call opens and ends, admitting nothing); a call pick's copy job naming
+//!   the neighbour expert (`SwapMachine::copy_into`'s `Job::id` of the pick's
+//!   first layer `^ 1`: the slot holds another expert's bytes under the
+//!   ledger's id, which the byte check names).
 //! - `history`: a prompt call before a decode history does not keep its
 //!   placement — the decode has been routing experts of its own, so the
 //!   call's end puts every layer back at the live set it started from and
@@ -114,7 +123,7 @@
 //!   owes return copies at two copies, so a pick may part from the twin's:
 //!   where every pick is the twin's the logits are the twin's bit for bit,
 //!   where one parts the prompt's last row and the first step's stay within
-//!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN); either way the
+//!   [`ARMS_MAX_DLOGIT`](bloomery_gpu_gates::ARMS_MAX_DLOGIT); either way the
 //!   call returns in its walk, admits, sends its admits back and leaves every
 //!   live set where the history left it.
 //! - `units` (the split walk, `Body38::set_split_walk`'s `Every`, against
@@ -132,11 +141,17 @@
 //!   shares the stream); on every layer the stream ran the
 //!   second unit's front and download between the first unit's download
 //!   and its shadow. Off, the split walk's logits and greedy ids are one
-//!   unit's bit for bit; streamed, they agree as `stream`'s rule allows.
-//!   Mutants: a pick per unit (the pick count); no share of the stream
-//!   (the second unit's left-out slots); the stream read at the first unit
-//!   only (the call's end refuses a layer read by one of its two units, by
-//!   name); the walk in today's order (the order).
+//!   unit's bit for bit; streamed, they agree as `stream`'s rule allows. Both
+//!   arms of a streamed setting run the same picks, so a pick's wrong copy is
+//!   in both and the arms' agreement cannot see it: after each streamed arm's
+//!   call (before any step) every expert the pick left live off the seed holds
+//!   in its slot the bytes a static load uploads for it (`transform`, as
+//!   `stream` takes it).
+//!   Mutants: a pick per unit (the pick count); no
+//!   share of the stream (the second unit's left-out slots); the stream read
+//!   at the first unit only (the call's end refuses a layer read by one of its
+//!   two units, by name); the walk in today's order (the order); a call
+//!   pick's copy job naming the neighbour expert (`stream`'s last).
 //! - `history_split_on`: `history_split` with the split walk on for the
 //!   walk and its twin, both calls walked as two units, under its rule
 //!   (mutant: the return owed at every unit's back — the next unit's shadow
@@ -216,7 +231,8 @@ mod gate {
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{
-        Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, prose_ids, ref_model_path, verdict,
+        ARMS_MAX_DLOGIT, Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, prose_ids,
+        ref_model_path, verdict,
     };
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE};
     use gguf::Split;
@@ -563,9 +579,13 @@ mod gate {
         crate::residency_clauses::seeds(machine, b.hybrid().slots().layers())
     }
 
-    /// `transform`: each admitted expert's slot against its static bytes,
-    /// every part of it the source stages.
-    fn transform_clause(s: &Session<Body38>) -> Result<bool, GateError> {
+    /// What [`transform_read`] found: the experts checked and each part that
+    /// differs from a static load's.
+    type Held = (usize, Vec<String>);
+
+    /// `transform`'s read: each live expert off its layer's seed holds in its
+    /// slot, part by part, the bytes the source stages for it.
+    fn transform_read(s: &Session<Body38>) -> Result<Held, GateError> {
         let m = s.model();
         let b = m.body(NAME)?;
         let machine = b
@@ -576,15 +596,28 @@ mod gate {
             .residency_source()
             .ok_or("the load has no residency source")?;
         let layers = crate::residency_clauses::layer_seeds(machine, b.hybrid().slots().layers())?;
-        let (checked, bad) =
-            crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers)?;
+        crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers)
+    }
+
+    /// `transform`: each admitted expert's slot against its static bytes,
+    /// every part of it the source stages.
+    fn transform_clause(s: &Session<Body38>) -> Result<bool, GateError> {
+        let (checked, bad) = transform_read(s)?;
         Ok(crate::residency_clauses::transform_verdict(checked, &bad))
+    }
+
+    /// The verdict on a [`Held`] read after `what`, with at least one expert
+    /// checked: a call that kept nothing off the seed checks nothing and is
+    /// red.
+    fn held_verdict(what: &str, held: &Held) -> bool {
+        crate::residency_clauses::transform_verdict_after(what, held.0, &held.1, true)
     }
 
     /// What one run of the streaming clause saw: the greedy ids, the prompt
     /// call's host slots, the first decode step's, the layers whose live set
-    /// is not the seed after the call, whether a call is left open, and the
-    /// call's end.
+    /// is not the seed after the call, whether a call is left open, the
+    /// call's end and, under a streaming mode, what the slots held right after
+    /// the call.
     struct StreamRun {
         tokens: Vec<u32>,
         /// The prompt call's last logits row, and each greedy id's top-1
@@ -601,6 +634,9 @@ mod gate {
         excluded: u64,
         xlayers: Vec<(usize, XLayer)>,
         xend: Option<XReport>,
+        /// The slots right after an `admit` call, before any step (none
+        /// under another mode).
+        held: Option<Held>,
     }
 
     /// The layers whose live set is not their seed.
@@ -672,6 +708,9 @@ mod gate {
             .hybrid()
             .swap()
             .is_some_and(|m| m.call_open());
+        let held = (mode == XMode::Admit)
+            .then(|| transform_read(s))
+            .transpose()?;
         let mut tokens = vec![next];
         let mut first_slots = 0;
         for i in 0..STREAM_STEPS {
@@ -700,6 +739,7 @@ mod gate {
             excluded,
             xlayers,
             xend,
+            held,
         })
     }
 
@@ -723,9 +763,9 @@ mod gate {
 
     /// How a streamed run `on` agrees with the unstreamed `off` (the card and
     /// the host sum a token's experts in another split): the prompt's last
-    /// logits row's max |diff|, within [`GREEDY_MARGIN`]; where the greedy
+    /// logits row's max |diff|, within [`ARMS_MAX_DLOGIT`]; where the greedy
     /// ids first part, if anywhere; and whether they are equal or part at a
-    /// near tie (`on`'s top-1 margin there below it).
+    /// near tie (`on`'s top-1 margin there below [`GREEDY_MARGIN`]).
     fn agree(on: &Greedy<'_>, off: &Greedy<'_>) -> (f32, bool, Option<usize>, bool) {
         let dlogit = on
             .logits
@@ -733,7 +773,7 @@ mod gate {
             .zip(off.logits)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
-        let logits_ok = on.logits.len() == off.logits.len() && dlogit < GREEDY_MARGIN;
+        let logits_ok = on.logits.len() == off.logits.len() && dlogit < ARMS_MAX_DLOGIT;
         let parted = on.tokens.iter().zip(off.tokens).position(|(a, b)| a != b);
         let ids_ok = on.tokens.len() == off.tokens.len()
             && parted.is_none_or(|i| on.margins.get(i).is_some_and(|&m| m < GREEDY_MARGIN));
@@ -798,8 +838,8 @@ mod gate {
                 .all(|(x, y)| x.to_bits() == y.to_bits());
         let repro_ok = key(&a) == key(&b) && same_bits && a.tokens == b.tokens;
         // PIN(2026-10-12): the logits term is printed, not judged. The bound it
-        // read, GREEDY_MARGIN, is the top-1 gap at a parted id, not a bound on
-        // the max over the vocabulary of |split − off|. That max moved when the
+        // read, then GREEDY_MARGIN, is the top-1 gap at a parted id, not a bound
+        // on the max over the vocabulary of |split − off|. That max moved when the
         // arena's half lost a slot to the checkpoint reserve a deeper default
         // context takes (the ctx rule), which moves the split's unit
         // boundaries. The ids term holds the contract (equal, or parted only
@@ -811,7 +851,7 @@ mod gate {
              streamed (half {half}), each within its tail and the half {records_ok}; the serve's \
              excluded host slots {} / {} / {} (off / split / split again) against the records' \
              streamed columns {} / {} {count_ok}; the prompt's logits max|diff| against off \
-             {dlogit} (under {GREEDY_MARGIN}: {logits_ok}; printed, not judged), {} greedy ids \
+             {dlogit} (under {ARMS_MAX_DLOGIT}: {logits_ok}; printed, not judged), {} greedy ids \
              equal or parted at a \
              near tie {ids_ok}{}; the two split runs' records, logits bits and ids the same \
              {repro_ok}: {}",
@@ -845,6 +885,10 @@ mod gate {
         let map_ok = on.moved > 0 && off.moved == 0 && admitted > 0 && !on.open && !off.open;
         let slots_ok = on.first_slots < off.first_slots;
         let (dlogit, logits_ok, parted, ids_ok) = agree(&on.greedy(), &off.greedy());
+        // The two bands pass one expert's wrong copy: the slots right after the
+        // call are read against the static bytes.
+        let held = on.held.as_ref().ok_or("the admit call took no slot read")?;
+        let held_ok = held_verdict("the stream call", held);
         // A prompt too short for the floor opens no call.
         let short_ids = prose_ids("qwen4exp", Body38::STREAM_FLOOR as usize - 1)?;
         s.clear()?;
@@ -862,12 +906,12 @@ mod gate {
             short_end.is_some(),
             verdict(short_ok)
         );
-        let ok = map_ok && slots_ok && logits_ok && ids_ok && short_ok;
+        let ok = map_ok && slots_ok && logits_ok && ids_ok && short_ok && held_ok;
         println!(
             "stream: a {STREAM_PROMPT}-id prompt call, off / on: layers moved from the seed {} / \
              {} ({admitted} experts admitted, a call left open {} / {}), the prompt's host slots \
              {} / {}, the first step's host slots {} / {}, the prompt's logits max|diff| {dlogit} \
-             (under {GREEDY_MARGIN}: {logits_ok}), {} greedy ids equal or parted at a near tie \
+             (under {ARMS_MAX_DLOGIT}: {logits_ok}), {} greedy ids equal or parted at a near tie \
              {ids_ok}{}: {}",
             off.moved,
             on.moved,
@@ -1119,7 +1163,7 @@ mod gate {
     /// (`xsplit::ReturnCost::Exposed`), so its picks may part from the
     /// twin's; where every pick is the twin's, the logits are the twin's bit
     /// for bit, and where one parts, the prompt's last logits row and the
-    /// first step's stay within [`GREEDY_MARGIN`] of the twin's (a streamed
+    /// first step's stay within [`ARMS_MAX_DLOGIT`] of the twin's (a streamed
     /// or admitted expert sums its columns in another split). Either way the
     /// call returns in its walk, admits, sends its admits back and leaves
     /// every layer's live set where the history left it.
@@ -1140,7 +1184,7 @@ mod gate {
         let values_ok = if same_picks {
             bits
         } else {
-            dprompt < GREEDY_MARGIN && dstep < GREEDY_MARGIN
+            dprompt < ARMS_MAX_DLOGIT && dstep < ARMS_MAX_DLOGIT
         };
         let ok = !walk.end.kept
             && !twin.end.kept
@@ -1157,7 +1201,7 @@ mod gate {
              the walk / at its end: {} / {} experts admitted, restored {} / {}, kept {} / {}, the \
              walk's return time {} / {} us, every layer's live set back {} / {}; the picks the \
              twin's {same_picks}, the prompt's last logits and the first step's max|diff| \
-             {dprompt} / {dstep} (bit for bit {bits}; under {GREEDY_MARGIN} where a pick parts) \
+             {dprompt} / {dstep} (bit for bit {bits}; under {ARMS_MAX_DLOGIT} where a pick parts) \
              {values_ok}: {}",
             walk.end.admitted,
             twin.end.admitted,
@@ -1182,7 +1226,7 @@ mod gate {
     /// unit still has to serve), admits, sends its admits back and leaves
     /// every live set where the history left it; where every pick is the
     /// twin's the logits are the twin's bit for bit, else within
-    /// [`GREEDY_MARGIN`]; both calls walked two units (mutant: the return
+    /// [`ARMS_MAX_DLOGIT`]; both calls walked two units (mutant: the return
     /// owed at every unit's back — the next unit's shadow asks for a layer
     /// its sibling has not served, refused by name).
     fn history_split_on_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
@@ -1214,7 +1258,7 @@ mod gate {
         let values_ok = if same_picks {
             bits
         } else {
-            dprompt < GREEDY_MARGIN && dstep < GREEDY_MARGIN
+            dprompt < ARMS_MAX_DLOGIT && dstep < ARMS_MAX_DLOGIT
         };
         // The step after the call is a ubatch of none: the units read are
         // the call's.
@@ -1236,7 +1280,7 @@ mod gate {
              admitted, restored {} / {}, kept {} / {}, the walk's return time {} / {} us, every \
              layer's live set back {} / {}; the picks the twin's {same_picks}, the prompt's last \
              logits and the first step's max|diff| {dprompt} / {dstep} (bit for bit {bits}; \
-             under {GREEDY_MARGIN} where a pick parts) {values_ok}: {}",
+             under {ARMS_MAX_DLOGIT} where a pick parts) {values_ok}: {}",
             walk.end.admitted,
             twin.end.admitted,
             walk.end.restored,
@@ -1278,6 +1322,9 @@ mod gate {
         /// The layers whose first unit's stream gap — from its download to
         /// its shadow — does not hold the second unit's front and download.
         out_of_order: Vec<usize>,
+        /// The slots right after a streaming call, before any step (none
+        /// with the streaming off).
+        held: Option<Held>,
     }
 
     impl UnitsRun {
@@ -1324,6 +1371,9 @@ mod gate {
         let disarmed = arm(s, false);
         let mut run = r?;
         disarmed?;
+        run.held = (mode != XMode::Off)
+            .then(|| transform_read(s))
+            .transpose()?;
         let mut next = run.tokens[0];
         for _ in 0..STREAM_STEPS {
             let out = s.step(next, Want::Logits)?;
@@ -1433,6 +1483,7 @@ mod gate {
             xlayers,
             rows,
             out_of_order,
+            held: None,
         })
     }
 
@@ -1515,7 +1566,22 @@ mod gate {
             } else {
                 same_bits(&on.logits, &off.logits) && on.tokens == off.tokens
             };
-            let clause_ok = picks_ok && slots_ok && share_ok && order_ok && values_ok;
+            // Both arms run the same picks: a wrong copy is in both, and their
+            // agreement cannot see it.
+            let held_ok = match (&off.held, &on.held) {
+                (Some(by_one), Some(by_walk)) => {
+                    let one =
+                        held_verdict(&format!("the {} call by one unit", mode.word()), by_one);
+                    let walk = held_verdict(
+                        &format!("the {} call by the split walk", mode.word()),
+                        by_walk,
+                    );
+                    one && walk
+                }
+                (None, None) if !streams => true,
+                _ => return Err("a streaming `units` arm took no slot read".into()),
+            };
+            let clause_ok = picks_ok && slots_ok && share_ok && order_ok && values_ok && held_ok;
             println!(
                 "units ({}): a {}-id prompt call by the split walk / one unit: {} / {} units, \
                  picks at {} / {} card layers, one a layer, the group's {picks_ok}; every \
@@ -1811,7 +1877,7 @@ mod gate {
         println!(
             "kvfloor: with no page left, the machine withdrew {k:?} slots a layer over {} \
              layers, {} B in the reports against {gone} B derived {freed_ok}; the prompt's logits \
-             max|diff| against the first run {dlogit} (under {GREEDY_MARGIN}: {logits_ok}; \
+             max|diff| against the first run {dlogit} (under {ARMS_MAX_DLOGIT}: {logits_ok}; \
              printed, not judged), {} greedy ids equal or parted at a near tie {ids_ok}{}: {}",
             tight.withdrawn.len(),
             tight.withdrawn_bytes,

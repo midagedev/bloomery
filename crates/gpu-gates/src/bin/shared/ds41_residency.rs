@@ -366,8 +366,14 @@ fn tier_entries(s: &Session<Body>) -> Result<Vec<(usize, u32, Slot)>, GateError>
     Ok(out)
 }
 
-/// `transform`: each admitted expert's slot against its static bytes.
-fn transform_clause(s: &Session<Body>) -> Result<bool, GateError> {
+/// What [`transform_read`] found: the experts checked and each part that differs
+/// from a static load's.
+pub type Held = (usize, Vec<String>);
+
+/// `transform`'s read: each live expert off its layer's seed holds in its slot,
+/// part by part, the bytes the source stages for it. A load whose host reads the
+/// source (no r8 sidecar) has no flip that unpacks, and is refused by name.
+pub fn transform_read(s: &Session<Body>) -> Result<Held, GateError> {
     let m = s.model();
     let b = m.body(NAME)?;
     let machine = b
@@ -378,6 +384,36 @@ fn transform_clause(s: &Session<Body>) -> Result<bool, GateError> {
         .residency_source()
         .ok_or("the load has no residency source")?;
     if !source.unpacks() {
+        return Err(
+            "transform: the host reads the source, so no flip unpacks; the check needs \
+                    the r8 sidecar (BLOOMERY_R8=on, just r8-sidecar)"
+                .into(),
+        );
+    }
+    let layers = crate::residency_clauses::layer_seeds(machine, b.hybrid().slots().layers())?;
+    crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers)
+}
+
+/// The verdict on a [`Held`] read `after` the call whose state it read: at
+/// least one expert checked where the file's routing skew is asserted (the
+/// fixture tier's router has none).
+pub fn transform_judge(after: &str, held: &Held) -> Result<bool, GateError> {
+    Ok(crate::residency_clauses::transform_verdict_after(
+        after,
+        held.0,
+        &held.1,
+        skew()?,
+    ))
+}
+
+/// `transform`: each admitted expert's slot against its static bytes.
+fn transform_clause(s: &Session<Body>) -> Result<bool, GateError> {
+    let m = s.model();
+    let source = m
+        .body(NAME)?
+        .residency_source()
+        .ok_or("the load has no residency source")?;
+    if !source.unpacks() {
         println!(
             "transform: the host reads the source, so no flip unpacks; the clause needs the \
              r8 sidecar (BLOOMERY_R8=on, just r8-sidecar): {}",
@@ -385,14 +421,7 @@ fn transform_clause(s: &Session<Body>) -> Result<bool, GateError> {
         );
         return Ok(false);
     }
-    let layers = crate::residency_clauses::layer_seeds(machine, b.hybrid().slots().layers())?;
-    let (checked, bad) =
-        crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers)?;
-    Ok(crate::residency_clauses::transform_verdict_with(
-        checked,
-        &bad,
-        skew()?,
-    ))
+    transform_judge("", &transform_read(s)?)
 }
 
 /// `resident`: the churn pool and the host experts in, the pinned out.

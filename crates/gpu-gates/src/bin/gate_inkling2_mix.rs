@@ -460,7 +460,7 @@ mod gate {
         gate_card::init()?;
         let machine = gate_card::plan_gate(inputs.model.layers);
         let plan = inputs
-            .plan(&machine, CTX as u64, &plan_levers)
+            .plan(&machine, CTX as u64, &plan_levers, bloomery_gpu::NATIVE_FP4)
             .map_err(|e| format!("{NAME}: the plan: {e}"))?;
         let mut ok = placement(&inputs, &plan, None)?;
         if !ok {
@@ -523,7 +523,7 @@ mod gate {
             let (rows, made) = (body.pass_rows(), body.pass_made_bytes() as u64);
             let want = place::pass_rows(CTX);
             let reserve = inputs
-                .pass_reserve(CTX as u64)
+                .pass_reserve(CTX as u64, bloomery_gpu::NATIVE_FP4)
                 .map_err(|e| format!("{NAME}: the pass reserve: {e}"))?;
             let pass = rows == want && made <= reserve;
             println!(

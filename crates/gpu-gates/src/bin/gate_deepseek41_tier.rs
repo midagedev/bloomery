@@ -40,7 +40,10 @@
 //!   step, in order. The call's stage and tier experts run the grouped GEMM
 //!   and the steps' the gemv, the same exact integer block sums folded in
 //!   more than one f32 order, so the logits sit within the logits band of
-//!   the steps', not on their bits. No reference load.
+//!   the steps', not on their bits; and the same call's tokens and logits are
+//!   the reference load's call of the same [`BATCH_P`] ids bit for bit, as
+//!   `--batch2`'s are (the band passes a converter reading another half of a
+//!   plane: the steps' gemv never runs it).
 //! - `--batch2` (B7, a group): [`BATCH_P2`] positions, two batches run as one
 //!   group of [`BATCH_GROUP`], then the greedy steps, against the
 //!   reference's prompt call of the same ids: tokens and logits bit for bit.
@@ -61,7 +64,8 @@
 //!   tier layer before a prompt call is the call's error, by its layer and
 //!   site, and poisons the model; a reset lifts it and the call is then,
 //!   walked as B7's is, within the logits band of the same prompt fed one
-//!   decode step per position. No reference load.
+//!   decode step per position and bit for bit the reference load's call of
+//!   the same ids.
 //! - `--blost` (B3): the tier's stream held behind a host flag before a
 //!   prompt call: within the go deadline and its grace the call fails naming
 //!   the lost card, the host tier is poisoned as a lost card, the next call
@@ -678,7 +682,11 @@ mod gate {
     #[derive(Default)]
     struct Want {
         union: Option<Run>,
+        /// `--batch`'s call: [`BATCH_P`] ids as one batch, then the greedy steps.
+        batch: Option<Run>,
         batch2: Option<Run>,
+        /// `--bfault`'s call: [`BATCH_FAULT_P`] ids as one batch, then the greedy steps.
+        bfault: Option<Run>,
     }
 
     /// What one prompt call sent the tier: its hits per layer from the
@@ -1166,7 +1174,7 @@ mod gate {
             Vec::new()
         };
         let mut want = Want::default();
-        if args.union || args.fault || args.batch2 {
+        if args.union || args.fault || args.batch || args.batch2 || args.bfault {
             let t0 = Instant::now();
             let mut m = open(split()?, &plan, None, &meta)?;
             println!(
@@ -1176,9 +1184,17 @@ mod gate {
             if args.union || args.fault {
                 want.union = Some(union_run(&mut m, &prompt)?);
             }
-            if args.batch2 {
+            if args.batch || args.batch2 || args.bfault {
                 body::prepare_prefill(&mut m)?;
+            }
+            if args.batch {
+                want.batch = Some(batch_run(&mut m, &long[..BATCH_P])?.0);
+            }
+            if args.batch2 {
                 want.batch2 = Some(batch_run(&mut m, &long)?.0);
+            }
+            if args.bfault {
+                want.bfault = Some(batch_run(&mut m, &long[..BATCH_FAULT_P])?.0);
             }
             drop(m);
         }
@@ -1236,11 +1252,22 @@ mod gate {
             }
         }
         if args.batch {
-            let want = steps_run(&mut m, &long[..BATCH_P])?;
+            let steps = steps_run(&mut m, &long[..BATCH_P])?;
             let (got, sent) = batch_run(&mut m, &long[..BATCH_P])?;
             pass &= in_band(
                 "B7 (one batch against the steps, then greedy steps)",
-                &want,
+                &steps,
+                &got,
+            );
+            // The band passes a converter that reads another half of a plane: the steps run the gemv, which
+            // never converts it. The reference's call runs the same grouped GEMM over the same bytes.
+            let reference = want
+                .batch
+                .as_ref()
+                .ok_or("--batch took no reference call")?;
+            pass &= same(
+                "B7 (one batch against the reference's call, then greedy steps)",
+                reference,
                 &got,
             );
             pass &= sent_every("B7", sent.as_ref(), &tier_layers);
@@ -1275,7 +1302,11 @@ mod gate {
             let first = *tier_layers
                 .first()
                 .ok_or("the tiered plan has no tier layer")?;
-            pass &= batch_fault_case(&mut m, &long[..BATCH_FAULT_P], first)?;
+            let reference = want
+                .bfault
+                .as_ref()
+                .ok_or("--bfault took no reference call")?;
+            pass &= batch_fault_case(&mut m, &long[..BATCH_FAULT_P], first, reference)?;
         }
         if args.blost {
             pass &= batch_lost_case(&mut m, &long[..BATCH_FAULT_P], "B3")?;
@@ -2585,11 +2616,13 @@ mod gate {
         Ok(Fault::at(u32::try_from(layer)?, FaultSite::QuantColumn))
     }
 
-    /// B2: a fault on the tier card's word at `layer` before a prompt call.
+    /// B2: a fault on the tier card's word at `layer` before a prompt call; the call after the reset is within the band
+    /// of the steps' and bit for bit `reference`'s, the reference load's call of `ids`.
     fn batch_fault_case(
         m: &mut Deepseek41Model,
         ids: &[u32],
         layer: usize,
+        reference: &Run,
     ) -> Result<bool, GateError> {
         let want = steps_run(m, ids)?;
         m.set_mode(StepMode::Graph);
@@ -2616,6 +2649,11 @@ mod gate {
         ok &= in_band(
             "B2 (after the reset, the prompt call against the steps)",
             &want,
+            &got,
+        );
+        ok &= same(
+            "B2 (after the reset, the prompt call against the reference's call)",
+            reference,
             &got,
         );
         Ok(ok)

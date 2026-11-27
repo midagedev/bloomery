@@ -71,20 +71,22 @@
 //!   stands does, and one asked for more than the conv ring's reach (`PASS_ROWS`) returns an error
 //!   naming `inkling2::Body::rollback` and the conv ring and stands where it did. The rollbacks'
 //!   rows are `gate_inkling2_e2e`'s `rollback_is_a_fresh_run`.
-//! - `draft_on_is_the_plain_ids`: a second server under `BLOOMERY_DRAFT=lookup` answers the plain
-//!   server's ids to the gate's prompts (the four oracle and chat prompts, the prose one), each
-//!   from an empty cache, and prints the width chooser's `mtp width` record. `BLOOMERY_DRAFT=dspark`
+//! - `draft_on_is_the_plain_ids`: a second server under `BLOOMERY_DRAFT=lookup`, and a third under
+//!   `recall`, answer the plain server's ids to the gate's prompts (the four oracle and chat
+//!   prompts, the prose one), each from an empty cache, and print the width chooser's `mtp width`
+//!   record, and the recall word's plan names the recall draft in its `draft rule` record. `BLOOMERY_DRAFT=dspark`
 //!   with no draft folder named is refused by name before any plan (the variable, and
 //!   `BLOOMERY_DSPARK_MODEL`), and the word unset with none plans the plain path, its `draft rule`
 //!   record naming `off` and the missing folder. In the real tier, where the environment names the
 //!   official checkpoint folder (`BLOOMERY_INK2_OFFICIAL`, which states the draft): a server under
 //!   `BLOOMERY_DRAFT=dspark` with that folder as `BLOOMERY_DSPARK_MODEL` answers the plain ids
 //!   too, its `load draft=dspark` record printed; on the folder, the unset word plans the folder's
-//!   draft and `off` the plain path (the `draft rule` record), and a plain server, a lookup server
-//!   and an unset one, which loads the folder's draft, answer the same ids. Each DSpark server's
+//!   draft and `off` the plain path (the `draft rule` record), and a plain server, a lookup server,
+//!   a recall server and an unset one, which loads the folder's draft, answer the same ids. Each DSpark server's
 //!   `mtp width` records count a verified window and one that took back every row past row 0, so
-//!   a verify and its rollback ran; a lookup server's are printed (the fixture's answers repeat no
-//!   id, so its lookup verifies nothing: not proven there). A draft changes which rows a pass
+//!   a verify and its rollback ran; a lookup or recall server's are printed (the fixture's answers
+//!   repeat no id, so its drafts verify nothing: not proven there, and the recall draft's proposals
+//!   are proven on the qwen3 seat's `gate_qwen3_dspark`). A draft changes which rows a pass
 //!   runs, never a token: every kept token is the target's argmax, and a commit's rollback lands
 //!   inside the conv ring's reach or is refused by name. The gate refuses to start with
 //!   `BLOOMERY_DSPARK_MODEL` set, which would turn the plan and serve clauses' servers drafted.
@@ -926,6 +928,31 @@ mod gate {
             None => false,
         };
         check(&mut ok, "draft_on_is_the_plain_ids lookup", lookup);
+        // The recall draft, on the gate's file: a window of the body's whole pass of rows.
+        let ServedOnce { answers, log } = server_under(
+            dir,
+            file,
+            &[(draft, Some("recall"))],
+            "serve-recall",
+            &prompts,
+        )?;
+        let recall = match answers {
+            Some(answers) => same_ids("recall", &plain, &answers, log.as_ref(), false)?,
+            None => false,
+        };
+        check(&mut ok, "draft_on_is_the_plain_ids recall", recall);
+        // The word's plan: the `draft rule` record names the draft this seat serves for it.
+        let recall_rule = rule_is(
+            dir,
+            ("draft-recall-plan", file),
+            &[(draft, Some("recall"))],
+            ("recall", "BLOOMERY_DRAFT=recall"),
+        )?;
+        check(
+            &mut ok,
+            "draft_on_is_the_plain_ids recall rule",
+            recall_rule,
+        );
         // `dspark` with no draft folder: refused by name before any plan, naming the lever.
         let (status, planned, text) = SEAT.plan_under(
             (dir, "draft-dspark-nofolder"),
@@ -1046,6 +1073,24 @@ mod gate {
         let ServedOnce { answers, log } = server_under(
             dir,
             &folder,
+            &[(draft, Some("recall")), (DSPARK_MODEL, None)],
+            "folder-recall",
+            &prompts,
+        )?;
+        let recall = match answers {
+            Some(answers) => same_ids(
+                "folder recall",
+                &plain_folder,
+                &answers,
+                log.as_ref(),
+                false,
+            )?,
+            None => false,
+        };
+        check(&mut ok, "draft_on_is_the_plain_ids folder recall", recall);
+        let ServedOnce { answers, log } = server_under(
+            dir,
+            &folder,
             &[(draft, None), (DSPARK_MODEL, None)],
             "folder-unset",
             &prompts,
@@ -1109,7 +1154,7 @@ mod gate {
              ids, renders the chat template, parses a forced call and reads none at none, answers \
              the body's ids, keeps a prefix down to the body's floor, takes a rollback within the conv \
              ring's reach and refuses a deeper one by name, answers the plain run's ids under \
-             the lookup and the DSpark drafts, and names what the draft word resolved to"
+             the lookup, the recall and the DSpark drafts, and names what the draft word resolved to"
         );
         Ok(())
     }

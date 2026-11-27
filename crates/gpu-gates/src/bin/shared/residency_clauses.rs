@@ -228,9 +228,27 @@ pub fn transform_verdict(checked: usize, bad: &[String]) -> bool {
 /// file whose routing has no skew admits none (the fixture's), and the parts that differ from a
 /// static load are the clause there.
 pub fn transform_verdict_with(checked: usize, bad: &[String], admitted_required: bool) -> bool {
+    transform_verdict_after("", checked, bad, admitted_required)
+}
+
+/// [`transform_verdict_with`] for a check made `after` the call or run whose
+/// state the slots were read in, named in the line (empty: the line names none,
+/// the check after a whole history). A gate that checks after more than one
+/// call tells the lines apart by it.
+pub fn transform_verdict_after(
+    after: &str,
+    checked: usize,
+    bad: &[String],
+    admitted_required: bool,
+) -> bool {
     let ok = (checked > 0 || !admitted_required) && bad.is_empty();
+    let after = if after.is_empty() {
+        String::new()
+    } else {
+        format!(" after {after}")
+    };
     println!(
-        "transform: {checked} admitted experts, {} parts differ from a static load{}: {}",
+        "transform{after}: {checked} admitted experts, {} parts differ from a static load{}: {}",
         bad.len(),
         bad.first()
             .map(|f| format!(" (first {f})"))

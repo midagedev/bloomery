@@ -756,6 +756,7 @@ fn accessors_read_their_rows() {
             INK2_DENSE,
             INK2_PASSES,
             METAL_MX8,
+            INK2_PASS_ACT,
             INK2_LOOPCD,
             INK2_LOOPCD_REF,
             ROUTE_RESIDENT_BONUS,
@@ -783,6 +784,30 @@ fn ink2_dense_takes_bf16_or_q8_0_and_refuses_the_rest() {
         let text = e.to_string();
         assert!(
             text.contains(INK2_DENSE) && text.contains("one of bf16, q8_0"),
+            "{text}"
+        );
+    }
+}
+
+/// `BLOOMERY_INK2_PASS_ACT` is `full` unset, takes `gate-up` and `exact`, and refuses any other
+/// word by name with the words the row takes.
+#[test]
+fn ink2_pass_act_takes_its_three_words_and_refuses_the_rest() {
+    let act = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.ink2_pass_act());
+    assert_eq!(act(&[]).unwrap(), Ink2PassAct::Full);
+    for w in Ink2PassAct::ALL {
+        assert_eq!(act(&[(INK2_PASS_ACT, w.as_str())]).unwrap(), w);
+    }
+    assert!(Ink2PassAct::Full.gate_up() && Ink2PassAct::Full.down());
+    assert!(Ink2PassAct::GateUp.gate_up() && !Ink2PassAct::GateUp.down());
+    assert!(!Ink2PassAct::Exact.gate_up() && !Ink2PassAct::Exact.down());
+    for bad in ["gate_up", "Full", "w4a8", "1", ""] {
+        let Err(e) = act(&[(INK2_PASS_ACT, bad)]) else {
+            panic!("{bad:?} is not a word of the row and must be refused");
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains(INK2_PASS_ACT) && text.contains("one of full, gate-up, exact"),
             "{text}"
         );
     }
@@ -3555,10 +3580,16 @@ fn a_set_words_least_fewest_holds_its_own_p() {
 /// unset is `None`, and a word outside `allowed` is refused by name.
 #[test]
 fn draft_word_is_typed_and_checked_against_the_seat() {
-    use crate::DraftWord::{Dspark, Lookup, Mtp, Off};
-    let all = [Lookup, Dspark, Mtp, Off];
+    use crate::DraftWord::{Dspark, Lookup, Mtp, Off, Recall};
+    let all = [Lookup, Recall, Dspark, Mtp, Off];
+    assert_eq!(
+        all,
+        crate::DraftWord::ALL,
+        "every word the row takes, in its order"
+    );
     for (text, want) in [
         ("lookup", Lookup),
+        ("recall", Recall),
         ("dspark", Dspark),
         ("mtp", Mtp),
         ("off", Off),

@@ -110,7 +110,7 @@ use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
-use bloomery_levers::{DraftWord, HostCfg, Levers};
+use bloomery_levers::{DraftWord, HostCfg, Ink2PassAct, Levers};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::inkling2::hparams::{Hparams, PASSES_OVERRIDE};
@@ -167,6 +167,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::INK2_PASSES,
     bloomery_levers::INK2_LOOPCD,
     bloomery_levers::INK2_LOOPCD_REF,
+    bloomery_levers::INK2_PASS_ACT,
     bloomery_levers::HOST_POPULATE,
     bloomery_levers::HOST_LOCK,
     bloomery_levers::CARD_DONTNEED,
@@ -186,18 +187,24 @@ const _: () = assert!(VERIFY_ROWS == <Body as Rows>::MAX_ROWS);
 
 /// The draft words this seat serves. `dspark` needs the DSpark draft's reader (`dspark-hf`).
 #[cfg(feature = "dspark-hf")]
-const DRAFT_WORDS: [DraftWord; 3] = [DraftWord::Lookup, DraftWord::Dspark, DraftWord::Off];
+const DRAFT_WORDS: [DraftWord; 4] = [
+    DraftWord::Lookup,
+    DraftWord::Recall,
+    DraftWord::Dspark,
+    DraftWord::Off,
+];
 #[cfg(not(feature = "dspark-hf"))]
-const DRAFT_WORDS: [DraftWord; 2] = [DraftWord::Lookup, DraftWord::Off];
+const DRAFT_WORDS: [DraftWord; 3] = [DraftWord::Lookup, DraftWord::Recall, DraftWord::Off];
 
 /// The draft words this seat serves, as a refusal names them.
 #[cfg(feature = "dspark-hf")]
-const DRAFT_WORDS_DOC: &str = "the lookup draft (lookup) and the DSpark draft of the official checkpoint folder (dspark), off or unset";
+const DRAFT_WORDS_DOC: &str = "the lookup draft (lookup), the recall draft (recall) and the DSpark draft of the official checkpoint folder (dspark), off or unset";
 #[cfg(not(feature = "dspark-hf"))]
-const DRAFT_WORDS_DOC: &str = "the lookup draft (lookup), off or unset";
+const DRAFT_WORDS_DOC: &str = "the lookup draft (lookup), the recall draft (recall), off or unset";
 
 /// `BLOOMERY_DRAFT` with `BLOOMERY_MTP_WIDTH`'s mode: unset and `off` serve the plain path,
-/// `lookup` and `dspark` a draft behind the width chooser; any other word is refused by name.
+/// `lookup`, `recall` and `dspark` a draft behind the width chooser; any other word is refused by
+/// name.
 fn draft_asked(levers: &Levers) -> Result<(Option<DraftWord>, WidthMode), GateError> {
     let width = WidthMode::of(levers.mtp_width())?;
     let word = levers.draft_word(&DRAFT_WORDS).map_err(|e| {
@@ -219,7 +226,7 @@ fn whole_card_plan<'a>(
     ctx: u64,
     levers: &PlanLevers,
 ) -> Result<Plan<'a>, PlaceError> {
-    let plan = inputs.plan(machine, ctx, levers)?;
+    let plan = inputs.plan(machine, ctx, levers, bloomery_gpu::NATIVE_FP4)?;
     let broken = plan.violations();
     if !broken.is_empty() {
         return Err(PlaceError::Broken(broken));
@@ -248,7 +255,7 @@ fn hosted_plan<'a>(
     ctx: u64,
     levers: &PlanLevers,
 ) -> Result<Plan<'a>, PlaceError> {
-    let plan = inputs.plan(machine, ctx, levers)?;
+    let plan = inputs.plan(machine, ctx, levers, bloomery_gpu::NATIVE_FP4)?;
     let broken = plan.violations();
     if !broken.is_empty() {
         return Err(PlaceError::Broken(broken));
@@ -479,7 +486,7 @@ const FOLDER_LIMIT: u64 = 1 << 20;
 /// decided before the plan.
 #[derive(Clone)]
 struct OpenDraft {
-    /// The draft word: `lookup`, or `dspark` with its folder.
+    /// The draft word: `lookup` or `recall`, or `dspark` with its folder.
     word: DraftWord,
     /// The width chooser's mode.
     width: WidthMode,
@@ -490,7 +497,7 @@ struct OpenDraft {
     /// What the plan sets aside for a DSpark draft beside its context planes, and the bytes a
     /// position of context adds to it, computed from the opened draft's own file and shape in
     /// either form ([`draft_open::Draft::reserve_fixed`], [`draft_open::Draft::reserve_per_pos`]);
-    /// 0 for the lookup.
+    /// 0 for the lookup and the recall draft.
     reserve_fixed: u64,
     reserve_per_pos: u64,
     /// The folder target's dense setting and pass count, read again for the draft's anchor.
@@ -512,6 +519,8 @@ struct OpenSeat {
     /// LoopCD-Hidden's strength and reference pass, where the strength is set and not 0
     /// (`GpuModel::set_loopcd`, applied before the step is captured).
     loopcd: Option<(f32, u32)>,
+    /// The rows the prompt pass's routed GEMMs read (`BLOOMERY_INK2_PASS_ACT`).
+    pass_act: Ink2PassAct,
     /// The placed load's inputs, for a file whose experts the card leg does not run.
     placed: Option<PlacedOpen>,
 }
@@ -543,13 +552,19 @@ impl Inkling2 {
             }
             Some(p) => {
                 let (split, _) = file.into_whole();
-                let plan = p.inputs.plan(&p.machine, a.ctx as u64, &p.levers)?;
+                let plan = p.inputs.plan(
+                    &p.machine,
+                    a.ctx as u64,
+                    &p.levers,
+                    bloomery_gpu::NATIVE_FP4,
+                )?;
                 GpuModel::<Body>::open_placed(split, &plan, &p.inputs, 0, p.host)?
             }
         };
         if let Some((omega, reference)) = a.loopcd {
             m.set_loopcd(omega, reference)?;
         }
+        m.set_pass_act(a.pass_act)?;
         // The draft's taps before the first capture: a capture made before them would not write
         // them.
         let taps = match &a.draft {
@@ -580,6 +595,9 @@ impl Inkling2 {
             None => ServedDraft::off(),
             Some(d) if d.word == DraftWord::Lookup => {
                 ServedDraft::lookup(&mut s, 1, d.width, &mut Quiet, None)?
+            }
+            Some(d) if d.word == DraftWord::Recall => {
+                ServedDraft::recall(&mut s, 1, d.width, &mut Quiet, None)?
             }
             Some(d) => open_dspark(&mut s, (&a.path, &a.card, a.device, a.ctx), d)?,
         };
@@ -871,6 +889,7 @@ impl DraftRule {
     fn eprint(&self) {
         let drafts = self.draft.as_ref().map_or("off", |d| match d.word {
             DraftWord::Lookup => "lookup",
+            DraftWord::Recall => "recall",
             _ => "dspark",
         });
         Record::new(&record::DRAFT_RULE)
@@ -881,7 +900,7 @@ impl DraftRule {
 }
 
 /// The draft the seat serves, as `BLOOMERY_DRAFT`, the width chooser's mode and the files
-/// decide before any plan. `lookup` needs no file; `dspark` reads its folder or GGUF file
+/// decide before any plan. `lookup` and `recall` need no file; `dspark` reads its folder or GGUF file
 /// ([`dspark_source_of`]) and holds the draft's taps against the target's visits
 /// ([`visits_of`]); a draft word asks for a whole-card load, each miss refused by name. Unset
 /// takes the DSpark draft as `dspark` would ([`UNSET_SERVES_DSPARK`]), and each miss — no
@@ -933,10 +952,10 @@ fn draft_of(
         )
         .into());
     }
-    if word == Some(DraftWord::Lookup) {
+    if let Some(history @ (DraftWord::Lookup | DraftWord::Recall)) = word {
         return Ok(DraftRule {
             draft: Some(OpenDraft {
-                word: DraftWord::Lookup,
+                word: history,
                 width,
                 source: None,
                 taps: Vec::new(),
@@ -1322,6 +1341,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         loopcd: levers
             .ink2_loopcd()
             .map(|omega| (omega, levers.ink2_loopcd_ref())),
+        pass_act: levers.ink2_pass_act(),
         placed: host_experts.then(|| PlacedOpen {
             inputs,
             machine: machine.clone(),

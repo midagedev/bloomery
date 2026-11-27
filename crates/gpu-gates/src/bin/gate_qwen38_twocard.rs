@@ -58,11 +58,16 @@
 //!   residency-off tier run, `gate_qwen38_residency`'s stream rule (the machine moves experts
 //!   between the card and the host, whose sums run in another order): the
 //!   prompt's last logits row within
-//!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN) of the off run's,
-//!   the greedy ids equal or parted first at the on run's near tie;
+//!   [`ARMS_MAX_DLOGIT`](bloomery_gpu_gates::ARMS_MAX_DLOGIT) of the off run's,
+//!   the greedy ids equal or parted first at the on run's near tie
+//!   ([`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN)); after the
+//!   histories, every expert the flips left live off its layer's seed holds in
+//!   its slot the bytes the source stages for it, a static load's (`transform`,
+//!   which the rows' bands pass a wrong copy of);
 //!   then the [`PROMPT_U`]-id prompt call with host streaming on against
 //!   the residency-off tier run's by the same stream rule (the call's picks
-//!   move host experts onto the stage card only); after it the tier's set
+//!   move host experts onto the stage card only), and after it the same
+//!   `transform` check; after it the tier's set
 //!   is the live slot map's tier rows (`tier`), and no tier expert's file
 //!   bytes are in the load's host set (`host`, by [`HostSet::holds`]). The
 //!   union bit rule cannot hold here: the union's machine would move tier
@@ -126,6 +131,14 @@ mod q38_arch;
 mod q38_history;
 
 #[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
+    reason = "the residency clauses serve several gates; each takes the helpers it reads"
+)]
+#[path = "shared/residency_clauses.rs"]
+mod residency_clauses;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::path::Path;
     use std::time::Instant;
@@ -146,8 +159,8 @@ mod gate {
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
-        Fnv1a64, GREEDY_MARGIN, GateError, bits_equal, checks_failed, prose_ids, ref_model_path,
-        verdict,
+        ARMS_MAX_DLOGIT, Fnv1a64, GREEDY_MARGIN, GateError, bits_equal, checks_failed, prose_ids,
+        ref_model_path, verdict,
     };
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
     use gguf::Split;
@@ -166,6 +179,7 @@ mod gate {
     use crate::q38_history::{
         self, PROMPT, Run, TIER_LAYER_NODES, same, step, tier_graphs_and_chains, tier_layers,
     };
+    use crate::residency_clauses::{layer_seeds, transform_check, transform_verdict_after};
 
     const NAME: &str = "gate_qwen38_twocard";
     /// The stores' positions, `gate_qwen38_residency`'s.
@@ -520,6 +534,33 @@ mod gate {
         Ok(ok && pre)
     }
 
+    /// `transform` on the tier load `s` as the call or history `after` left it: every live expert off its layer's seed
+    /// holds in its slot, part by part, the bytes the source stages for it. A skewed file's flips and picks admit
+    /// experts, so `admitted_required` asks for one read; a fixture's generated router admits none.
+    fn transform_after(
+        s: &Session<Body38>,
+        after: &str,
+        admitted_required: bool,
+    ) -> Result<bool, GateError> {
+        let m = s.model();
+        let body = m.body(NAME)?;
+        let machine = body
+            .hybrid()
+            .swap()
+            .ok_or("the tier load runs no residency machine")?;
+        let source = body
+            .residency_source()
+            .ok_or("the tier load has no residency source")?;
+        let layers = layer_seeds(machine, body.hybrid().slots().layers())?;
+        let (checked, bad) = transform_check(m.gpu(), machine, source, &layers)?;
+        Ok(transform_verdict_after(
+            after,
+            checked,
+            &bad,
+            admitted_required,
+        ))
+    }
+
     /// `--residency`'s clauses (module doc) over the tier load `s` under the
     /// machine, `off` the residency-off tier run, `split` the file and
     /// `plan` the tier load's plan.
@@ -552,10 +593,17 @@ mod gate {
             verdict(det && flips)
         );
         let mut ok = det && flips;
+        // The rows below pass a wrong copy within their band: the slots the second history left are read against the
+        // source before the prompt call clears them.
+        ok &= transform_after(
+            s,
+            "the history",
+            skewed && first.landed > 0 && again.landed > 0,
+        )?;
         if let Some(off) = off {
             // gate_qwen38_residency's stream rule: the prompt's last logits
-            // row within GREEDY_MARGIN of the off run's, the greedy ids equal
-            // or parted first at the on run's near tie.
+            // row within ARMS_MAX_DLOGIT of the off run's, the greedy ids equal
+            // or parted first at the on run's near tie (GREEDY_MARGIN).
             let last = PROMPT - 1;
             let row_diff = |i: usize| {
                 off.logits[i]
@@ -572,7 +620,7 @@ mod gate {
                 .position(|(a, b)| a != b);
             let near = parted.is_none_or(|i| margin(&first.logits[i]) < GREEDY_MARGIN);
             let near_ok = near
-                && dlogit < GREEDY_MARGIN
+                && dlogit < ARMS_MAX_DLOGIT
                 && off.tokens.len() == first.tokens.len()
                 && off.logits.len() == first.logits.len();
             let (worst, worst_diff) = (0..off.logits.len().min(first.logits.len()))
@@ -580,7 +628,7 @@ mod gate {
                 .fold((0, 0.0f32), |a, b| if b.1 > a.1 { b } else { a });
             println!(
                 "residency: against the residency-off tier run, the prompt's last logits row \
-                 max|diff| {dlogit} (under {GREEDY_MARGIN}), the ids parted at {parted:?}{} (a \
+                 max|diff| {dlogit} (under {ARMS_MAX_DLOGIT}), the ids parted at {parted:?}{} (a \
                  near tie {near}): {}; every row's largest max|diff| {worst_diff} at row {worst} \
                  (not a clause)",
                 parted
@@ -593,6 +641,7 @@ mod gate {
         if let Some(off) = off_prompt {
             let on = prompt_run(s, prompt_ids, true)?;
             ok &= stream_rule(&format!("a {PROMPT_U}-id prompt call streaming"), off, &on);
+            ok &= transform_after(s, "the prompt call streaming", skewed)?;
         }
         let body = s.model().body(NAME)?;
         let hybrid = body.hybrid();
@@ -976,8 +1025,8 @@ mod gate {
 
     /// `gate_qwen38_residency`'s stream rule between the residency-off tier
     /// run `off` and `on`, each a prompt call's row then its steps': the
-    /// prompt's row within [`GREEDY_MARGIN`] of the off run's, the greedy
-    /// ids equal or parted first at the on run's near tie.
+    /// prompt's row within [`ARMS_MAX_DLOGIT`] of the off run's, the greedy
+    /// ids equal or parted first at the on run's near tie ([`GREEDY_MARGIN`]).
     fn stream_rule(what: &str, off: &Run, on: &Run) -> bool {
         let dlogit = match (off.logits.first(), on.logits.first()) {
             (Some(a), Some(b)) if a.len() == b.len() => a
@@ -991,12 +1040,12 @@ mod gate {
         let near =
             parted.is_none_or(|i| on.logits.get(i).is_some_and(|r| margin(r) < GREEDY_MARGIN));
         let ok = near
-            && dlogit < GREEDY_MARGIN
+            && dlogit < ARMS_MAX_DLOGIT
             && off.tokens.len() == on.tokens.len()
             && off.logits.len() == on.logits.len();
         println!(
             "residency: {what} against the residency-off tier run: the prompt's last logits row \
-             max|diff| {dlogit} (under {GREEDY_MARGIN}), the ids parted at {parted:?} (a near tie \
+             max|diff| {dlogit} (under {ARMS_MAX_DLOGIT}), the ids parted at {parted:?} (a near tie \
              {near}), flips landed {}: {}",
             on.landed,
             verdict(ok)

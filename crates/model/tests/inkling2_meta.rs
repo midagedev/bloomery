@@ -333,7 +333,7 @@ fn place_lines(split: &Split) -> Vec<String> {
     ];
     let machine = workstation::plan_gate(inputs.model.layers);
     let plan = inputs
-        .plan(&machine, 4096, &PlanLevers::default())
+        .plan(&machine, 4096, &PlanLevers::default(), true)
         .expect("the gate machine plans the file");
     let stage = &plan.cards[0];
     out.push(format!(
@@ -425,7 +425,7 @@ fn inkling2_small_reads_and_its_experts_are_the_hosts() {
     let inputs = place::Inputs::read(&split).expect("the Small's header reads");
     let machine = workstation::plan_gate(inputs.model.layers);
     let plan = inputs
-        .plan(&machine, 4096, &PlanLevers::default())
+        .plan(&machine, 4096, &PlanLevers::default(), true)
         .expect("the gate machine plans the Small");
     assert_eq!(plan.n_l.len(), 48, "one count a layer");
     assert!(

@@ -18,22 +18,32 @@ use crate::{FaultSink, Gpu, GpuError};
 
 const WHAT: &str = "ring_gemm::RingGemm";
 
-/// One form's rows: q8 blocks of 32 or the grouped GEMM's q8_1 blocks of 128, by the stack's type.
+/// One form's rows: q8 blocks of 32 or the grouped GEMM's q8_1 blocks of 128, by the stack's type;
+/// the 32-block form holds the native FP4 planes beside its q8 blocks where an NVFP4 stack reads
+/// the role.
 pub(crate) enum Rows {
     Blocks32(Box<GemmAct32>),
     Q128(Box<GemmAct>),
 }
 
 impl Rows {
-    /// `cols` rows of `k` values in the 32-block form when `blocks32`, else the 128-block one.
+    /// `cols` rows of `k` values in the 32-block form when `blocks32`, else the 128-block one;
+    /// with the native FP4 planes beside the 32-block form's q8 blocks when `nvfp4` (an NVFP4
+    /// stack reads the role, so its route GEMMs take the native FP4 product over them). A build
+    /// without the product, or a `k` no multiple of 64, leaves the q8 blocks alone.
     pub(crate) fn new(
         stream: &CudaStream,
         cols: usize,
         k: usize,
-        blocks32: bool,
+        (blocks32, nvfp4): (bool, bool),
     ) -> Result<Rows, GpuError> {
         Ok(if blocks32 {
-            Rows::Blocks32(Box::new(GemmAct32::new(stream, cols, k)?))
+            let act = if nvfp4 {
+                GemmAct32::new_routed(stream, cols, k)?
+            } else {
+                GemmAct32::new(stream, cols, k)?
+            };
+            Rows::Blocks32(Box::new(act))
         } else {
             Rows::Q128(Box::new(GemmAct::new(stream, cols, k)?))
         })
@@ -59,6 +69,14 @@ impl Rows {
         match self {
             Rows::Q128(a) => (Some(&mut **a), None),
             Rows::Blocks32(a) => (None, Some(&mut **a)),
+        }
+    }
+
+    /// The native FP4 planes of the 32-block form on or off ([`GemmAct32::set_native`]); the
+    /// 128-block form has none.
+    pub(crate) fn set_native(&mut self, on: bool) {
+        if let Rows::Blocks32(a) = self {
+            a.set_native(on);
         }
     }
 
@@ -105,11 +123,13 @@ impl RingGemm {
     ) -> Result<RingGemm, GpuError> {
         let stream = gpu.stream();
         let slots = cap * n_used;
+        // The ring pass's route GEMMs read the q8 blocks alone: `RingForms` names no native
+        // FP4 form.
         let ring = RingGemm {
-            x: Rows::new(stream, cap, n, forms.gate_up32)?,
+            x: Rows::new(stream, cap, n, (forms.gate_up32, false))?,
             g: DeviceBuffer::zeroed(stream, slots * ff)?,
             u: DeviceBuffer::zeroed(stream, slots * ff)?,
-            h: Rows::new(stream, slots, ff, forms.down32)?,
+            h: Rows::new(stream, slots, ff, (forms.down32, false))?,
             route: GemmRoute::new(stream, slots, half_slots)?,
             cap,
             slots,

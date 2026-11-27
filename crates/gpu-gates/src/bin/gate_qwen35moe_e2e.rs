@@ -4377,7 +4377,14 @@ mod gate {
         stale: [Vec<usize>; 2],
         /// Each prompt call's placement and streaming records.
         calls: [Call; 2],
+        /// The card's slots against the static bytes after the whole history
+        /// (none on a load with no machine).
+        slots: Option<Slots>,
     }
+
+    /// What [`e_slots`] read: the experts checked and each part that differs
+    /// from a static load's.
+    type Slots = (usize, Vec<String>);
 
     /// One prompt call of (e)'s history: every layer's live ids before it
     /// and after it (none on a load with no machine), the flips its
@@ -4394,6 +4401,9 @@ mod gate {
         end: Option<CallReport>,
         /// The layers the call streamed under `split`, each with its walk.
         xlayers: Vec<(usize, XLayer)>,
+        /// The card's slots against the static bytes right after the call,
+        /// where it kept its pick.
+        slots: Option<Slots>,
     }
 
     /// The step set's prompt ids (D1K): (e)'s two prompts' ids.
@@ -4503,6 +4513,44 @@ mod gate {
         Ok(id)
     }
 
+    /// `transform`'s read on (e)'s residency load: each live expert off its
+    /// layer's seed holds in its slot, part by part, the bytes the source
+    /// stages for it.
+    fn e_slots(s: &Session<Body35>) -> Result<Slots, GateError> {
+        let m = s.model();
+        let p = m
+            .body(NAME)?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?;
+        let machine = p
+            .hybrid()
+            .swap()
+            .ok_or("the load runs no residency machine")?;
+        let source = p
+            .residency_source()
+            .ok_or("the load has no residency source")?;
+        let layers = residency_clauses::layer_seeds(machine, p.hybrid().slots().layers())?;
+        residency_clauses::transform_check(m.gpu(), machine, source, &layers)
+    }
+
+    /// The verdict on a slot read `after` the call or history it was taken
+    /// in; a run that took none is red by name, and one that checked no expert
+    /// is red ([`residency_clauses::transform_verdict_after`]).
+    fn e_slots_verdict(after: &str, slots: Option<&Slots>) -> bool {
+        match slots {
+            Some((checked, bad)) => {
+                residency_clauses::transform_verdict_after(after, *checked, bad, true)
+            }
+            None => {
+                println!(
+                    "transform after {after}: the run took no slot read: {}",
+                    verdict(false)
+                );
+                false
+            }
+        }
+    }
+
     /// One run of (e)'s history on `s` from a clear (the residency back to
     /// its seed): each step feeds the id `forced` holds for the call before
     /// it, or its own greedy id when `forced` is `None`.
@@ -4527,6 +4575,13 @@ mod gate {
                 0 => 0,
                 _ => e_take(s)?.iter().map(|(_, r)| r.landed).sum(),
             };
+            // A call that kept its pick left the admitted experts live: their
+            // slots are read before a step can move one.
+            let slots = end
+                .as_ref()
+                .is_some_and(|e| e.kept)
+                .then(|| e_slots(s))
+                .transpose()?;
             seen.calls[i] = Call {
                 before,
                 after: e_live(s)?,
@@ -4534,6 +4589,7 @@ mod gate {
                 picks,
                 end,
                 xlayers,
+                slots,
             };
             Ok::<(), GateError>(())
         };
@@ -4552,6 +4608,15 @@ mod gate {
         prompt(s, &mut seen, 1, &ids[E_P1..])?;
         steps(s, &mut seen, E_STEPS2)?;
         e_take(s)?;
+        let machine = s
+            .model()
+            .body(NAME)?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .hybrid()
+            .swap()
+            .is_some();
+        seen.slots = machine.then(|| e_slots(s)).transpose()?;
         Ok(seen)
     }
 
@@ -4595,7 +4660,13 @@ mod gate {
     ///   the attention K/V rows over the history and re-injected at every
     ///   boundary a flip lands ([`FLIPS_BAND`]'s note) —, and the ids equal
     ///   or, where they first part, the residency
-    ///   run's top-1 margin below [`GREEDY_MARGIN`] (a near tie). Mutant: the maps
+    ///   run's top-1 margin below [`GREEDY_MARGIN`] (a near tie); and every
+    ///   expert the flips left live off the seed holds in its slot, part by
+    ///   part, the bytes a static load uploads for it, read after the history
+    ///   (`residency_clauses::transform_check`). Mutants: a flip's copy job
+    ///   naming the neighbour expert (`SwapMachine::copy_into`'s `Job::id`
+    ///   `^ 1` on some boundary jobs: the slot holds another expert's bytes
+    ///   under the ledger's id); the maps
     ///   kept as the load built them (`PlacedSide::refresh_maps` returning at
     ///   once): the first prompt's maps still name the spare experts the
     ///   machine emptied at its start and the second's the experts the flips
@@ -4607,11 +4678,15 @@ mod gate {
     ///   set back to its seed.
     /// - `admit`: the history once more on the residency load with the
     ///   prompt calls' streaming `admit` ([`e_admit`]), the lever off again
-    ///   after it.
+    ///   after it. The slots the first call's pick left, read right after it,
+    ///   and those the history ends on hold the static bytes of the experts
+    ///   they are live with (mutant: a call pick's copy job naming the
+    ///   neighbour expert, `Job::id` of the first layer `^ 1`).
     /// - `split`: the history once more with the prompt calls' streaming
     ///   `split` at [`SPLIT_COSTS`] with the union check on
     ///   (`Placed::set_ring_check`) ([`e_split`]), the lever off again after
-    ///   it.
+    ///   it; its slots are read as `admit`'s are (the ring's experts are the
+    ///   union check's).
     ///
     /// The clause opens the file `ref_model_path` names and is a
     /// self-consistency clause.
@@ -4643,7 +4718,8 @@ mod gate {
         // `flips`
         let band = e_band(&first, &off_seen, FLIPS_BAND)?;
         let maps_ok = first.stale.iter().chain(&off_seen.stale).all(Vec::is_empty);
-        let flips = first.landed > 0 && maps_ok && band.ok();
+        let slots_ok = e_slots_verdict("the history", first.slots.as_ref());
+        let flips = first.landed > 0 && maps_ok && band.ok() && slots_ok;
         println!(
             "flips: {} flips landed before the second prompt (above 0); wide maps off the card \
              copy's rows after the prompts: residency {:?} off {:?} (none); {}: {}",
@@ -4905,6 +4981,11 @@ mod gate {
         let kept = first.end.as_ref().is_some_and(|e| e.kept);
         let returned = second.end.as_ref().is_some_and(|e| !e.kept);
         let band = e_band(streamed, off, FLIPS_BAND)?;
+        // The band passes a wrong copy of one expert: the slots the first
+        // call's pick left, and those the history ends on, are read against
+        // the static bytes.
+        let first_slots = e_slots_verdict("the first call", first.slots.as_ref());
+        let end_slots = e_slots_verdict("the history", streamed.slots.as_ref());
         let ok = layers_ok
             && kept
             && returned
@@ -4912,7 +4993,9 @@ mod gate {
             && resized.is_empty()
             && swapped_back == second.landed
             && streamed.stale[0].is_empty()
-            && band.ok();
+            && band.ok()
+            && first_slots
+            && end_slots;
         let line = format!(
             "its end kept {kept}, layers whose live set is not its start set with the pick's \
              admits swapped in {kept_sets:?} (none), wide maps off the card copy's rows after it \

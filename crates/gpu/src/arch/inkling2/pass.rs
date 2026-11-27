@@ -32,7 +32,8 @@
 //! epilogue, the controllers' rows forms, the router's rows, the output gate), and the prompt
 //! kernels' elsewhere: the wide projections read q8 blocks of 32 where the step's gemv reads the
 //! f32 row, the prefill flash sums its keys in its own tiles, and the route GEMMs read q8 blocks
-//! of 32 where the step's leg reads q8_1 at one scale a 128 values.
+//! of 32 where the step's leg reads q8_1 at one scale a 128 values — an NVFP4 stack's read the
+//! native FP4 planes beside those blocks ([`Rows`]), on a build that has the native product.
 //!
 //! The buffers are [`place::pass_bytes`] at the load's rows, the plan's reserve; the load refuses
 //! by name a pass that takes more. A placed load's side buffers ([`PlacedPass`]) sit beside them,
@@ -87,6 +88,7 @@ use crate::site::{self, SiteTy, WideActs, WideKernels};
 use crate::tensor::{Window, WindowMut, copy_row};
 use crate::weights::Weights;
 use crate::{DeviceBufferRaw, Gpu, GpuError};
+use bloomery_levers::Ink2PassAct;
 use chain::linear::Ring;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -252,10 +254,10 @@ impl Bufs {
             wide_n: WideActs::new(stream, WideActs::wants_of(inner).without_f32(), rows, n)?,
             wide_q: WideActs::new(stream, WideActs::wants_of(outer).without_f32(), rows, q)?,
             dense: GemmRoute::new(stream, rows, 1)?,
-            x_rows: Rows::new(stream, rows, n, s.forms.gate_up32)?,
+            x_rows: Rows::new(stream, rows, n, (s.forms.gate_up32, s.gate_up_nvfp4))?,
             g: z(slots * s.ff)?,
             u: z(slots * s.ff)?,
-            h_rows: Rows::new(stream, slots, s.ff, s.forms.down32)?,
+            h_rows: Rows::new(stream, slots, s.ff, (s.forms.down32, s.down_nvfp4))?,
             route: GemmRoute::new(stream, slots, s.n_expert)?,
         })
     }
@@ -340,8 +342,10 @@ pub(super) struct Pass {
 
 impl Pass {
     /// The pass of shape `s` at `rows` rows over `layers`' sites, its routed rows in the form the
-    /// stacks' route GEMMs read ([`PassShape::forms`]). Load-time only. Refused by name: buffers
-    /// past the formula's bytes.
+    /// stacks' route GEMMs read ([`PassShape::forms`]), the native FP4 planes beside the 32-value
+    /// form of a role whose stacks are NVFP4 ([`PassShape::gate_up_nvfp4`],
+    /// [`PassShape::down_nvfp4`]). Load-time only. Refused by name: buffers past the formula's
+    /// bytes.
     pub(super) fn new(
         gpu: &Gpu,
         (s, rows): (&PassShape, usize),
@@ -358,7 +362,7 @@ impl Pass {
         let outer: Vec<SiteTy> = layers.iter().map(|l| l.o.ty).collect();
         let b = Bufs::new(gpu.stream(), s, rows, (&inner, &outer))?;
         let made = b.bytes();
-        let formula = place::pass_bytes(s, rows);
+        let formula = place::pass_bytes(s, rows, crate::NATIVE_FP4);
         if u64::try_from(made).map_or(true, |m| m > formula) {
             return Err(GpuError::shape(
                 WHAT,
@@ -384,6 +388,14 @@ impl Pass {
     /// Device bytes the pass's buffers take.
     pub(super) fn bytes(&self) -> usize {
         self.made
+    }
+
+    /// The rows the routed GEMMs read from the next pass on: where a role's stacks are NVFP4 and
+    /// the build has the native product, `act` names whether the role reads the FP4 planes or the
+    /// q8 blocks beside them ([`GemmAct32::set_native`]). A pass starts at `full`.
+    pub(super) fn set_act(&mut self, act: Ink2PassAct) {
+        self.b.x_rows.set_native(act.gate_up());
+        self.b.h_rows.set_native(act.down());
     }
 }
 
@@ -1736,7 +1748,8 @@ impl<'a> RowWalk<'a> {
 
     /// The feed-forward block's shadow over the rows: the routed rows on the grouped route GEMM
     /// over the card's stacks (every expert resident, so a pick's id is its place) — the table,
-    /// the rows in q8 blocks of 32, gate·up, SiTU, down — and the card sum of each row's slots.
+    /// the rows in q8 blocks of 32 (the native FP4 planes beside them for an NVFP4 stack),
+    /// gate·up, SiTU, down — and the card sum of each row's slots.
     fn ffn_shadow(&mut self, slot: usize, layer: &Layer) -> Result<(), GpuError> {
         if self.verify.is_some() {
             return self.shadow_rows(slot, layer);
@@ -1858,8 +1871,9 @@ impl<'a> RowWalk<'a> {
 
     /// A hosted layer's card share over the rows, under the host's serve: the route table built
     /// through the stored layer `l`'s slot-map row (the host's slots get no tile), the rows in q8
-    /// blocks of 32, gate·up, SiTU, down, and the card sum of the slots the places put on the card,
-    /// in slot order, into `ffn_out`. The layer holds experts on the card.
+    /// blocks of 32 (the native FP4 planes beside them for an NVFP4 stack), gate·up, SiTU, down,
+    /// and the card sum of the slots the places put on the card, in slot order, into `ffn_out`.
+    /// The layer holds experts on the card.
     fn hosted_shadow(
         &mut self,
         slot: usize,

@@ -3535,7 +3535,8 @@ gate-gpu-ds41-unpack:
 # no host byte released). Then, streaming on: s2 (a call that streams, then the same call on the placement it left admits
 # nothing and gives the same argmax and logits), s1 (a 1,536-id call and 8 steps free and with the copy stream held 1 s:
 # the same picks per group and layer, tokens and logits), s3 (4 prose and 4 code windows of 512 ids, streaming off and
-# on: where they first differ, on's top-1 margin below 1.5). Both cards, alone in a batch.
+# on: where they first differ, on's top-1 margin below 1.5). Both cards, alone in a batch; `--place a` runs every
+# clause on the stage card alone, with no tier batch.
 # Group solo, reason r2 (both cards: plan (b′) on the A6000 and the 3090 at once): a fixture-tier run keeps it, so it stays `solo`.
 [group('solo')]
 [group('v41-load')]

@@ -36,19 +36,23 @@
 //! - `xstream_split_near_off`: the `split` run's greedy ids are the `off` run's, or part from them where the `split`
 //!   run's top-1 margin is under `GREEDY_MARGIN` (a near tie); the prompt's last logits row's greatest distance from the
 //!   `off` run's is printed, not judged: `GREEDY_MARGIN` is the top-1 gap at a parted id, not a bound on that distance
-//!   over the vocabulary, and no band of it has been measured for this family;
+//!   over the vocabulary, and no band of it has been measured for this family; and the card's slots the `split` call's
+//!   pick left hold, part by part, the bytes the source stages for each expert off its layer's seed, the bytes a static
+//!   load uploads (the shared `transform` check, read before the greedy steps; an expert the ring streams is no slot's,
+//!   so it is not read), at least one where the call reports an admitted expert;
 //! - `xstream_admit_opens_call`: under `admit` a prompt of [`STREAM_P`] ids opens a call (its end report is there) and
 //!   streams no expert, its ids agree with the `off` run's as above, and a prompt of one id fewer than
-//!   [`STREAM_FLOOR`] opens none (no pick, no end);
+//!   [`STREAM_FLOOR`] opens none (no pick, no end), and the card's slots the `admit` call's pick left hold the source's
+//!   bytes as `xstream_split_near_off` reads them;
 //! - `xstream_split_beside_tier` (arm `bp`): `split` starts the stream beside the expert tier card, and a `split` run
 //!   streams experts on some layer the tier holds experts of (or the run proves nothing and fails by name); the call's
 //!   end counts the layers' sum and the host's left-out slots agree with the records as `xstream_split_streams` reads
 //!   them; every unit's back joined
 //!   each streamed layer by the records' streamed count and no back joined a layer no record names
 //!   (`Body::take_stream_joined`); a second `split` run's records, joins, prompt logits (bit for bit) and greedy ids are
-//!   the first's; the `split` run's ids agree with the `off` run's as `xstream_split_near_off` reads them; and `admit`,
-//!   the unset lever's mode there, opens a call over the same prompt that streams and joins nothing, its ids agreeing
-//!   with the `off` run's.
+//!   the first's; the `split` run's ids agree with the `off` run's as `xstream_split_near_off` reads them, and its slots
+//!   hold the source's bytes as there; and `admit`, the unset lever's mode there, opens a call over the same prompt that
+//!   streams and joins nothing, its ids agreeing with the `off` run's and its slots holding the source's bytes.
 //!
 //! Cards: each arm asks the view for what it needs before any load. Arm `a` needs room for the residency's machine, a
 //! pinned expert, a spare and a moving slot on the plan's smallest layer of card experts ([`residency_of`], the plan's own
@@ -56,7 +60,8 @@
 //! (`tier::defer_for_room`, `no-card-room`), in either tier, and loads nothing.
 //!
 //! The taps are not armed. FAIL-first (box): the one-patch mutants under the round's mutant folder name the clause each
-//! reddens.
+//! reddens; a call pick's copy that names the neighbour expert (`SwapMachine::copy_into`'s `Job::id` `^ 1` on a waited
+//! copy) reddens the slots' bytes.
 
 #[cfg(feature = "mistrallarge4")]
 fn main() -> std::process::ExitCode {
@@ -70,6 +75,14 @@ fn main() -> std::process::ExitCode {
 )]
 #[path = "shared/e2e.rs"]
 mod e2e;
+
+#[cfg(feature = "mistrallarge4")]
+#[allow(
+    dead_code,
+    reason = "the residency clauses serve several gates; each takes the helpers it reads"
+)]
+#[path = "shared/residency_clauses.rs"]
+mod residency_clauses;
 
 #[cfg(feature = "mistrallarge4")]
 mod gate {
@@ -94,8 +107,12 @@ mod gate {
     use model::placement::{Machine, Plan, PlanLevers, workstation};
 
     use crate::e2e::walk;
+    use crate::residency_clauses::{layer_seeds, transform_check, transform_verdict_after};
 
     type Model = GpuModel<Body>;
+
+    /// The card's slots read against the source: the experts checked and each differing part's first byte.
+    type Held = (usize, Vec<String>);
 
     const NAME: &str = "gate_mistrallarge4_xstream";
 
@@ -179,6 +196,30 @@ mod gate {
         end: Option<CallReport>,
         /// The call's ring joins: per unit back, its walk, layer and streamed experts.
         joined: Vec<(usize, usize, usize)>,
+        /// The card's slots as the prompt call's pick left them, read before the greedy steps; `None` for the `off` run.
+        held: Option<Held>,
+    }
+
+    /// The card's slots against the source's staged bytes ([`transform_check`]): every live expert off its layer's seed
+    /// holds, part by part, the bytes a static load uploads for it. A load that runs no machine or holds no source is a
+    /// named error, so no run passes with nothing read.
+    fn slots_held(m: &Model) -> Result<Held, GateError> {
+        let body = m.body(NAME)?;
+        let machine = body.hybrid().swap().ok_or("the load runs no machine")?;
+        let source = body.residency_source().ok_or("the load holds no source")?;
+        let layers = layer_seeds(machine, body.hybrid().slots().layers())?;
+        transform_check(m.gpu(), machine, source, &layers)
+    }
+
+    /// `run`'s slot read as a verdict line named for the call (`what`): a slot differing from the source's bytes fails, and
+    /// a call whose end reports an admitted expert must have an expert read, so the check did not compare nothing.
+    fn held_verdict(what: &str, run: &Run) -> Result<bool, GateError> {
+        let (checked, bad) = run
+            .held
+            .as_ref()
+            .ok_or("the call took no slot read (an `off` run)")?;
+        let admitted = run.end.map_or(0, |r| r.admitted);
+        Ok(transform_verdict_after(what, *checked, bad, admitted > 0))
     }
 
     /// The host slots the batch services left out of their union since `m` loaded.
@@ -341,6 +382,11 @@ mod gate {
         let logits = m.logits()?;
         let excluded = left_out(m)? - before;
         let left = left_rows(take_prompt_stats(m)?)?;
+        let held = if mode == XMode::Off {
+            None
+        } else {
+            Some(slots_held(m)?)
+        };
         let (picks, end, xlayers, xend, joined) = {
             let body = m.body_parts(NAME)?.2;
             let (picks, end) = body.take_stream_records();
@@ -366,6 +412,7 @@ mod gate {
             picks,
             end,
             joined,
+            held,
         })
     }
 
@@ -676,7 +723,9 @@ mod gate {
                 .unwrap_or_default(),
             verdict(ids_ok)
         );
+        // The ids and the printed distance pass a pick's wrong copy: the slots are read against the source.
         pass &= ids_ok;
+        pass &= held_verdict("the split call", &a)?;
 
         tier::sc(ADMIT_OPENS_CALL)?;
         let admit = run_once(&mut m, &ids, XMode::Admit)?;
@@ -704,6 +753,7 @@ mod gate {
             verdict(short_ok)
         );
         pass &= opens && adm_ids_ok && short_ok;
+        pass &= held_verdict("the admit call", &admit)?;
         Ok(pass)
     }
 
@@ -882,12 +932,16 @@ mod gate {
                 .unwrap_or_default(),
             verdict(opens && admit_ids)
         );
+        let split_held = held_verdict("the split call (beside the tier)", &a)?;
+        let admit_held = held_verdict("the admit call (beside the tier)", &admit)?;
         Ok(!on_tier.is_empty()
             && records_ok
             && joins_ok
             && repro_ok
             && ids_ok
             && opens
-            && admit_ids)
+            && admit_ids
+            && split_held
+            && admit_held)
     }
 }

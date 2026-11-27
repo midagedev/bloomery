@@ -233,7 +233,8 @@
 //!   several slots' rows as one pass (`Body3::serves_one_pass`), and a
 //!   printed plan does not name turns. The lookup draft's rounds are one pass
 //!   too on a qwen35 family file (`pass_of`) and are their own clause
-//!   (`lookup_slots_verify_together`). FAIL-first: the word `turns`, red
+//!   (`lookup_slots_verify_together`), the recall draft's are turns
+//!   (`recall_slots_take_turns`). FAIL-first: the word `turns`, red
 //!   on that arm. A server
 //!   of `--parallel 2` under `BLOOMERY_STEP_STATS=1` prints a `slots round`
 //!   record a round of several slots — two greedy streamed requests of the
@@ -518,7 +519,12 @@
 //! - `lookup_slots_verify_together` and `lookup_slots_together_alone`, on a
 //!   qwen35 family file: a lookup server of `--parallel 2` runs a round of
 //!   both slots as one pass and keeps each request's alone ids
-//!   ([`lookup_slots_verify_together`]).
+//!   ([`history_slots`]).
+//! - `recall_slots_take_turns` and `recall_slots_together_alone`, on the same
+//!   file: a recall server of `--parallel 2` runs a round of both slots a slot
+//!   at a time (its window is the body's whole pass of rows, so two do not
+//!   fit one) and keeps each request's alone ids, each slot's context its own
+//!   ([`history_slots`]).
 //! - `mtp_ids_match_the_plain_path`: on a file whose header carries the in-file
 //!   next-token layer (the Qwen3.6 file with a routed layer, the Qwen3.8-27B with a dense
 //!   one), greedy output under `BLOOMERY_DRAFT=mtp` equals the same prompt under
@@ -4640,34 +4646,77 @@ mod gate {
         }
     }
 
-    /// `lookup_slots_verify_together`: a qwen35 family file's lookup load of
+    /// A history draft's server of two slots and the clauses it answers
+    /// ([`history_slots`]): the draft's word, the clauses' names and whether
+    /// the body runs the two slots' windows as one pass.
+    struct HistoryArm {
+        /// `BLOOMERY_DRAFT`'s word.
+        word: &'static str,
+        /// The clause that the together requests keep their alone ids.
+        alone: &'static str,
+        /// The clause that names the round's shape.
+        shape: &'static str,
+        /// The file-bound clause that the requests were drafted.
+        draft: &'static str,
+        /// A round of both slots is one pass; else a slot at a time.
+        one_pass: bool,
+    }
+
+    /// The lookup's window is two rows, which a qwen35 family body verifies
+    /// beside another slot's in one pass.
+    const LOOKUP_SLOTS: HistoryArm = HistoryArm {
+        word: "lookup",
+        alone: "lookup_slots_together_alone",
+        shape: "lookup_slots_verify_together",
+        draft: "lookup_slots_draft",
+        one_pass: true,
+    };
+
+    /// The recall draft's window is the body's whole pass of rows: two slots'
+    /// windows do not fit one pass, so the slots take turns.
+    const RECALL_SLOTS: HistoryArm = HistoryArm {
+        word: "recall",
+        alone: "recall_slots_together_alone",
+        shape: "recall_slots_take_turns",
+        draft: "recall_slots_draft",
+        one_pass: false,
+    };
+
+    /// `lookup_slots_verify_together`, `recall_slots_take_turns` and their
+    /// siblings: a qwen35 family file's history-draft load of
     /// `--parallel 2` at `--ctx 4096`, which the card holds whole
-    /// (`BLOOMERY_DRAFT=lookup`, `BLOOMERY_STEP_STATS=1`), runs a round of
-    /// both slots as one pass (`Pass::of_body`: `Body35` settles each slot's
-    /// partial keep at the commit, `SlotRows::keep_slot`, so the body
-    /// verifies both slots' windows together and the open decides one pass):
-    /// two greedy streamed requests of prompts that repeat (the prose twice,
-    /// its first half three times), each first run alone and then together,
-    /// keep their alone ids (`lookup_slots_together_alone`), and the together
-    /// window holds a `slots round` of both slots (`cmd=pass`, `rows=2`) in
-    /// `passes=1` and none in more; `lookup_slots_draft` (file-bound: a
-    /// fixture's random-weight target repeats no n-gram) has the together
-    /// requests drafting (`timings.draft_n` above 0). The requests are greedy without
-    /// `ignore_eos`, which would make them draw and so step. FAIL-first: on a
-    /// body that settles no partial keep (`SlotRows::SETTLES_PARTIAL_KEEP`
-    /// false) the lookup load takes turns, `passes=2`; with the seat's lookup
-    /// word served as no draft, the rounds are plain steps and nothing is
-    /// drafted.
-    fn lookup_slots_verify_together(
+    /// (`BLOOMERY_DRAFT` the arm's word, `BLOOMERY_STEP_STATS=1`), runs a
+    /// round of both slots as the arm's shape says (`Pass::of_body`: `Body35`
+    /// settles each slot's partial keep at the commit, `SlotRows::keep_slot`,
+    /// so the body verifies two slots' lookup windows together and the open
+    /// decides one pass; a window of the body's whole pass of rows does not
+    /// fit twice and the slots take turns): two greedy streamed requests of
+    /// prompts that repeat (the prose twice, its first half three times),
+    /// each first run alone and then together, keep their alone ids (the
+    /// arm's `alone` clause), and the together window holds a `slots round`
+    /// of both slots (`cmd=pass`, `rows=2`) in `passes=1` where the arm runs
+    /// one pass and in more where it takes turns, and none of the other
+    /// shape; the arm's `draft` clause (file-bound: a fixture's
+    /// random-weight target repeats no n-gram) has the together requests
+    /// drafting (`timings.draft_n` above 0). The requests are greedy without
+    /// `ignore_eos`, which would make them draw and so step. FAIL-first: on
+    /// a body that settles no partial keep (`SlotRows::SETTLES_PARTIAL_KEEP`
+    /// false) the lookup load takes turns, `passes=2`; with the seat's
+    /// draft word served as no draft, the rounds are plain steps and nothing
+    /// is drafted; a recall context shared by the slots, or not stood at its
+    /// slot's position, moves the together ids off the alone ids.
+    fn history_slots(
         model: &Path,
         dir: &Path,
+        arm: &HistoryArm,
         ok: &mut bool,
     ) -> Result<(), GateError> {
-        let d = dir.join("lookup-rounds");
+        let word = arm.word;
+        let d = dir.join(format!("{word}-rounds"));
         std::fs::create_dir_all(&d)?;
         let err_log = d.join("server.err");
         let mut cmd = stats_cmd()?;
-        cmd.env("BLOOMERY_DRAFT", "lookup");
+        cmd.env("BLOOMERY_DRAFT", word);
         let m = model.to_str().ok_or("the model path is not UTF-8")?;
         let args = [
             "--model",
@@ -4684,7 +4733,7 @@ mod gate {
         let mut s = Served::spawn_cmd(cmd, &args, &d)?;
         let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
         let url = |p: &str| format!("http://{addr}{p}");
-        // Prompts that repeat, so the lookup proposes: the prose twice, and
+        // Prompts that repeat, so the draft proposes: the prose twice, and
         // its first half three times.
         let prose = tokenized(&url, PROSE)?;
         let half = &prose[..prose.len() / 2];
@@ -4704,10 +4753,10 @@ mod gate {
         for i in &ids {
             let (h, rx) = greedy(i)?;
             h.join()
-                .map_err(|_| "lookup rounds: an alone request's thread panicked")?;
+                .map_err(|_| format!("{word} rounds: an alone request's thread panicked"))?;
             alone.push(
                 rx.recv()
-                    .map_err(|_| "lookup rounds: an alone request gave no answer")??
+                    .map_err(|_| format!("{word} rounds: an alone request gave no answer"))??
                     .tokens,
             );
         }
@@ -4716,17 +4765,17 @@ mod gate {
         let (mut together, mut drafted) = (Vec::new(), 0);
         for (h, rx) in runs {
             h.join()
-                .map_err(|_| "lookup rounds: a together request's thread panicked")?;
+                .map_err(|_| format!("{word} rounds: a together request's thread panicked"))?;
             let ans = rx
                 .recv()
-                .map_err(|_| "lookup rounds: a together request gave no answer")??;
+                .map_err(|_| format!("{word} rounds: a together request gave no answer"))??;
             drafted += ans.drafted;
             together.push(ans.tokens);
         }
-        println!("lookup rounds: alone {alone:?}, together {together:?}, drafted {drafted}");
+        println!("{word} rounds: alone {alone:?}, together {together:?}, drafted {drafted}");
         check(
             ok,
-            "lookup_slots_together_alone",
+            arm.alone,
             alone.iter().all(|a| !a.is_empty()) && alone == together,
         );
         let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
@@ -4756,17 +4805,18 @@ mod gate {
             })
             .collect();
         println!(
-            "lookup rounds: {one} of {} records a drafted round of both slots in one pass, {two} \
+            "{word} rounds: {one} of {} records a drafted round of both slots in one pass, {two} \
              in more; (cmd, rows, passes) {shapes:?}",
             window.len()
         );
-        check(ok, "lookup_slots_verify_together", one > 0 && two == 0);
-        // The lookup proposes only where the text repeats an n-gram of its own: a fixture's
+        let (want, other) = if arm.one_pass { (one, two) } else { (two, one) };
+        check(ok, arm.shape, want > 0 && other == 0);
+        // The draft proposes only where the text repeats an n-gram of its own: a fixture's
         // random-weight target writes none, so the file answers it.
-        if tier::run_clause("lookup_slots_draft", Tag::FileBound)? {
-            check(ok, "lookup_slots_draft", drafted > 0);
+        if tier::run_clause(arm.draft, Tag::FileBound)? {
+            check(ok, arm.draft, drafted > 0);
         }
-        println!("lookup rounds server stopped: {}", s.stop()?);
+        println!("{word} rounds server stopped: {}", s.stop()?);
         Ok(())
     }
 
@@ -5070,9 +5120,13 @@ mod gate {
             }
             mtp_ids_match_the_plain_path(model, &dir, &mut ok)?;
             if seat == qwen_seat::Family::Qwen3moe {
-                println!("n/a lookup_slots_* (a qwen3moe file refuses the lookup draft by name)");
+                println!(
+                    "n/a lookup_slots_*, recall_slots_* (a qwen3moe file refuses the lookup and \
+                     recall drafts by name)"
+                );
             } else {
-                lookup_slots_verify_together(model, &dir, &mut ok)?;
+                history_slots(model, &dir, &LOOKUP_SLOTS, &mut ok)?;
+                history_slots(model, &dir, &RECALL_SLOTS, &mut ok)?;
             }
             if a.images {
                 images(model, &dir, &mut ok)?;
