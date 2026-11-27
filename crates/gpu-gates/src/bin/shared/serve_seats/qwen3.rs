@@ -269,7 +269,7 @@ use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{CacheNote, DraftProps, Drafted, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
-use super::drafted::{LOOKUP_ROWS, Lookups, SlotDrafts};
+use super::drafted::{LOOKUP_ROWS, Lookups, RECALL_ROWS, SlotDrafts};
 use super::served::{self, ServedDraft};
 use super::{folder, qwen3_folder};
 use crate::draft::Draft;
@@ -584,6 +584,16 @@ trait Body3: SlotRows<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static 
     /// session's pass of several rows. Refused by the default: only a body
     /// whose session verifies rows (a qwen35moe body's) takes one.
     fn open_lookup(
+        _s: &mut app::Session<Self>,
+        _slots: usize,
+        _mode: WidthMode,
+    ) -> Result<Option<ServedDraft<Self>>, GateError> {
+        Ok(None)
+    }
+    /// The recall draft beside this body's model, as [`Body3::open_lookup`]
+    /// opens the lookup. Refused by the default: only a body whose session
+    /// verifies [`RECALL_ROWS`] rows takes one.
+    fn open_recall(
         _s: &mut app::Session<Self>,
         _slots: usize,
         _mode: WidthMode,
@@ -1004,6 +1014,25 @@ impl Body3 for Body35 {
         Ok(Some(ServedDraft::lookup(s, slots, mode, &mut log, None)?))
     }
 
+    /// The recall draft beside the whole-card verifying target: one context a
+    /// resident slot, each behind the width chooser of `mode`, verified by
+    /// the session's whole pass of [`RECALL_ROWS`] rows. The body keeps no
+    /// token history, as for the lookup.
+    fn open_recall(
+        s: &mut app::Session<Body35>,
+        slots: usize,
+        mode: WidthMode,
+    ) -> Result<Option<ServedDraft<Body35>>, GateError> {
+        const {
+            assert!(
+                RECALL_ROWS == <app::Session<Body35> as runtime::Verify>::MAX_ROWS,
+                "the recall draft's pass is the body's whole pass of rows"
+            );
+        }
+        let mut log = Quiet;
+        Ok(Some(ServedDraft::recall(s, slots, mode, &mut log, None)?))
+    }
+
     fn placed(m: &Qwen35moeModel) -> Result<bool, GateError> {
         Ok(m.body(NAME)?.placed().is_some())
     }
@@ -1238,6 +1267,12 @@ impl<B: Body3> Q3<B> {
             Draft::Lookup => B::open_lookup(&mut s, slots, width)?.ok_or_else(|| {
                 format!(
                     "BLOOMERY_DRAFT=lookup: a {} body takes no lookup draft",
+                    B::ARCH
+                )
+            })?,
+            Draft::Recall => B::open_recall(&mut s, slots, width)?.ok_or_else(|| {
+                format!(
+                    "BLOOMERY_DRAFT=recall: a {} body takes no recall draft",
                     B::ARCH
                 )
             })?,
@@ -1919,6 +1954,7 @@ fn pass_of<B: Body3>(slots: usize, tiered: bool, draft: Draft) -> Pass {
     let window = match draft {
         Draft::Off => None,
         Draft::Lookup => Some(LOOKUP_ROWS),
+        Draft::Recall => Some(RECALL_ROWS),
         Draft::Dspark => Some(DSPARK_ROWS),
     };
     Pass::of_body::<B>(slots, B::serves_one_pass(tiered), window)
@@ -2024,7 +2060,7 @@ fn auto_slots(
     let mtp = match word {
         Word::Mtp => true,
         Word::Off => record_rows > 0,
-        Word::Lookup | Word::Dspark => false,
+        Word::Lookup | Word::Recall | Word::Dspark => false,
     };
     if mtp {
         return Ok(auto.one("the in-file MTP draft serves one sequence"));
@@ -2506,7 +2542,7 @@ struct DraftFacts {
 fn verdict_drafts(word: Word, f: DraftFacts) -> Drafts {
     let text_one = !f.media && f.slots == 1 && f.in_file;
     match word {
-        Word::Dspark | Word::Lookup => Drafts::Served,
+        Word::Dspark | Word::Lookup | Word::Recall => Drafts::Served,
         Word::Mtp if text_one => Drafts::InFile,
         Word::Off if text_one && f.unset && f.place_a => Drafts::InFile,
         Word::Mtp | Word::Off => Drafts::None,
@@ -2515,8 +2551,8 @@ fn verdict_drafts(word: Word, f: DraftFacts) -> Drafts {
 
 /// `BLOOMERY_DRAFT` as this seat reads it. Unset and `off` are
 /// [`Word::Off`] here; the seat decides afterwards whether a qwen35moe file's
-/// in-file layer drafts. `lookup` and `dspark` stay the served drafts
-/// ([`crate::draft::Draft`]). (`Draft::from_levers` is the V4.1 binaries'
+/// in-file layer drafts. `lookup`, `recall` and `dspark` stay the served
+/// drafts ([`crate::draft::Draft`]). (`Draft::from_levers` is the V4.1 binaries'
 /// parse, which refuses `off` and registers the V4.1 draft record; this one
 /// needs neither.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2526,6 +2562,8 @@ enum Word {
     Off,
     /// The n-gram draft.
     Lookup,
+    /// The draft of the longest earlier match of the context's tail.
+    Recall,
     /// The DSpark draft.
     Dspark,
     /// The file's own next-token layer.
@@ -2536,7 +2574,7 @@ enum Word {
 fn draft_asked(levers: &Levers) -> Result<Option<DraftWord>, GateError> {
     levers.draft_word(&DraftWord::ALL).map_err(|e| {
         format!(
-            "BLOOMERY_DRAFT is lookup, dspark, mtp, off or unset, not {:?}",
+            "BLOOMERY_DRAFT is lookup, recall, dspark, mtp, off or unset, not {:?}",
             e.word.as_str()
         )
         .into()
@@ -2548,20 +2586,22 @@ fn word(levers: &Levers) -> Result<Word, GateError> {
     Ok(match draft_asked(levers)? {
         None | Some(DraftWord::Off) => Word::Off,
         Some(DraftWord::Lookup) => Word::Lookup,
+        Some(DraftWord::Recall) => Word::Recall,
         Some(DraftWord::Dspark) => Word::Dspark,
         Some(DraftWord::Mtp) => Word::Mtp,
     })
 }
 
 /// [`Word`] from `BLOOMERY_DRAFT` for the `arch` file at `path`, `name` its
-/// architecture. `lookup` is refused by name on a qwen3moe file
-/// ([`lookup_refusal`]). `dspark` is the draft a qwen35moe file serves.
+/// architecture. `lookup` and `recall` are refused by name on a qwen3moe file
+/// ([`history_refusal`]). `dspark` is the draft a qwen35moe file serves.
 /// `mtp` on a qwen3moe file is refused by name before any plan: that body
 /// has no in-file next-token layer and runs no verify pass.
 fn draft_of(arch: Family, name: &str, levers: &Levers, path: &Path) -> Result<Word, GateError> {
     let word = word(levers)?;
     match (word, arch) {
-        (Word::Lookup, Family::Qwen3moe) => Err(lookup_refusal(arch).into()),
+        (Word::Lookup, Family::Qwen3moe) => Err(history_refusal("lookup", arch).into()),
+        (Word::Recall, Family::Qwen3moe) => Err(history_refusal("recall", arch).into()),
         (Word::Dspark, Family::Qwen3moe | Family::Qwen35) => Err(format!(
             "BLOOMERY_DRAFT=dspark: the DSpark draft serves a qwen35moe file (Qwen3.6-35B-A3B \
              or MiniCPM-V 4.7-35B-A3B); {} is a {name} file",
@@ -2577,26 +2617,27 @@ fn draft_of(arch: Family, name: &str, levers: &Levers, path: &Path) -> Result<Wo
     }
 }
 
-/// `word` as the served draft the lookup and DSpark paths take. `mtp` and
+/// `word` as the served draft the lookup, recall and DSpark paths take. `mtp` and
 /// the plain word are [`Draft::Off`]: the in-file decision is [`decide_q35`]'s,
 /// and [`served::draft_slots`] decides a count only for DSpark.
 fn served_draft(word: Word) -> Draft {
     match word {
         Word::Lookup => Draft::Lookup,
+        Word::Recall => Draft::Recall,
         Word::Dspark => Draft::Dspark,
         Word::Off | Word::Mtp => Draft::Off,
     }
 }
 
-/// Whether the served draft runs on a load whose body is `placed`: the lookup and DSpark drafts
-/// verify on a whole-card load only, so a placed one is refused by name before it loads.
+/// Whether the served draft runs on a load whose body is `placed`: the lookup, recall and DSpark
+/// drafts verify on a whole-card load only, so a placed one is refused by name before it loads.
 fn serves_on(served: Draft, placed: bool) -> bool {
     served == Draft::Off || !placed
 }
 
-/// Why `BLOOMERY_DRAFT=lookup` is refused on a qwen3moe file: the lookup
-/// draft needs a load whose session verifies several rows, and the qwen3moe
-/// body runs no pass of several rows.
+/// Why `BLOOMERY_DRAFT=lookup` or `recall` (`word`) is refused on a qwen3moe
+/// file: a draft of the token history needs a load whose session verifies
+/// several rows, and the qwen3moe body runs no pass of several rows.
 ///
 /// PIN(2026-10-22): the qwen35moe and qwen35 arms of this refusal are gone —
 /// the seat now opens the whole-card verifying load (`GpuModel::<Body35>::open_verifying`)
@@ -2604,9 +2645,9 @@ fn serves_on(served: Draft, placed: bool) -> bool {
 /// sentence is the qwen3moe body's own reason alone. The gate that proves it
 /// (`gate_qwen3_dspark`) gained the clause that the lookup's ids are the plain
 /// run's and the clause that `/props` names the lookup as the served draft.
-fn lookup_refusal(arch: Family) -> String {
+fn history_refusal(word: &str, arch: Family) -> String {
     format!(
-        "BLOOMERY_DRAFT=lookup on a {} file: the lookup draft needs a load that verifies \
+        "BLOOMERY_DRAFT={word} on a {} file: the {word} draft needs a load that verifies \
          several rows, and the qwen3moe body runs no pass of several rows; serve the plain path",
         arch.name()
     )
@@ -2716,7 +2757,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         .then_some("no draft selected"),
     )?;
     // The width chooser's record is printed on every request that may draft.
-    let may_draft = matches!(word, Word::Lookup | Word::Dspark | Word::Mtp)
+    let may_draft = matches!(word, Word::Lookup | Word::Recall | Word::Dspark | Word::Mtp)
         || (levers.draft().is_none() && matches!(arch, Family::Qwen35moe | Family::Qwen35));
     if may_draft {
         super::drafted::serves_widths();
@@ -2891,6 +2932,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         return Err(match served {
             Draft::Dspark => whole_card_refusal("dspark", "DSpark", why),
             Draft::Lookup => whole_card_refusal("lookup", "lookup", why),
+            Draft::Recall => whole_card_refusal("recall", "recall", why),
             Draft::Off => unreachable!("the plain path is never placed away"),
         });
     }
@@ -2925,7 +2967,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     )?;
     let draft_dir = match word {
         Word::Dspark => Some(dspark_hf::dir_from_env()?),
-        Word::Off | Word::Lookup | Word::Mtp => None,
+        Word::Off | Word::Lookup | Word::Recall | Word::Mtp => None,
     };
     let pass = match arch {
         Family::Qwen3moe => pass_of::<Body>(slots, tiered, served),
@@ -3228,6 +3270,7 @@ mod tests {
             assert_eq!(at(Word::Off, none), Drafts::None, "{none:?}");
         }
         assert_eq!(at(Word::Lookup, base), Drafts::Served);
+        assert_eq!(at(Word::Recall, base), Drafts::Served);
         assert_eq!(
             at(
                 Word::Dspark,
@@ -3320,6 +3363,7 @@ mod tests {
             (Word::Off, Drafts::None),
             (Word::Dspark, Drafts::Served),
             (Word::Lookup, Drafts::Served),
+            (Word::Recall, Drafts::Served),
         ] {
             let kept = unset_draft_yield(kind, Ok(chose(1024, fitted())), never)
                 .map(|(c, y)| (c.slot_ctx, y.is_none()));
@@ -3349,6 +3393,10 @@ mod tests {
         assert_eq!(pass_of::<Body35>(2, false, Draft::Lookup), Pass::One);
         assert_eq!(pass_of::<Body35>(2, false, Draft::Off), Pass::One);
         assert_eq!(pass_of::<Body35>(1, false, Draft::Lookup), Pass::One);
+        // The recall draft's window is the body's whole pass: two slots' windows
+        // do not fit one, so a round of them takes its slots in turns.
+        assert_eq!(pass_of::<Body35>(2, false, Draft::Recall), Pass::Turns);
+        assert_eq!(pass_of::<Body35>(1, false, Draft::Recall), Pass::One);
     }
 
     /// The seat reads `--place` as the shared grammar and leaves a tier card

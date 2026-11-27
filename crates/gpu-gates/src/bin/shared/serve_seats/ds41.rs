@@ -618,6 +618,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let draft_file = match draft {
         Draft::Dspark => Some(dspark::draft_hparams()?),
         Draft::Off | Draft::Lookup => None,
+        Draft::Recall => return Err(Draft::RECALL_REFUSED.into()),
     };
     let path = ref_model_path()?;
     let reserve = match &draft_file {
@@ -794,6 +795,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let window = match draft {
         Draft::Off => None,
         Draft::Lookup => Some(LOOKUP_ROWS),
+        Draft::Recall => return Err(Draft::RECALL_REFUSED.into()),
         Draft::Dspark => Some(PAIR_ROWS),
     };
     let pass = Pass::of_body::<Body>(slots.get(), true, window);
@@ -1359,6 +1361,7 @@ impl V41 {
             (Draft::Dspark, None) => {
                 return Err("bloomery-serve-ds41: the DSpark draft did not load".into());
             }
+            (Draft::Recall, _) => return Err(Draft::RECALL_REFUSED.into()),
         };
         // The resident sequences, made after the captures: the live slot's
         // chains stay with it, each other slot capturing on its first use.

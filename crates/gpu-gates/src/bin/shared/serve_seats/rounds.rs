@@ -26,7 +26,7 @@ use runtime::width::{Mode as WidthMode, WidthError};
 use runtime::{Committed, Target, Widths, Window};
 use serve::Drafted;
 
-use super::drafted::{LOOKUP_ROWS, Lookups, SlotDrafts, reads_best};
+use super::drafted::{Lookups, SlotDrafts, reads_best};
 
 /// One round of several slots' steps, a seat's [`Seat::step_slots`]
 /// override, its one owner: the fallback loop ([`step_rows_in_turn`], which
@@ -355,13 +355,13 @@ where
     Ok(passes + pass_windows(s, rows, on, drafts, depth.min(B::WIDTH), allowed)?)
 }
 
-/// One round of several slots' lookup passes as passes of
+/// One round of several slots' history-draft passes as passes of
 /// `GpuModel::verify_slots`: every row a window of [`pass_windows`] over
-/// its slot's lookup context, proposing at most the lookup's one id
-/// ([`LOOKUP_ROWS`]), or none where the round's chooser holds it back (a
-/// width of 0, which the cost mode picks when the proposal does not pay).
-/// The lookup is never off, so no row runs alone. Returns the passes it
-/// ran.
+/// its slot's context, proposing at most the draft's width
+/// ([`Lookups::rows`] less the token at the position), or none where the
+/// round's chooser holds it back (a width of 0, which the cost mode picks
+/// when the proposal does not pay). The draft is never off, so no row runs
+/// alone. Returns the passes it ran.
 pub(crate) fn pass_rows_lookup<B>(
     s: &mut app::Session<B>,
     rows: &mut [SlotPassRow],
@@ -371,7 +371,7 @@ where
     B: SlotRows + Prompt + Keep + Rows + Rollback,
     B::Seq: 'static,
 {
-    let depth = LOOKUP_ROWS - 1;
+    let depth = lookups.rows() - 1;
     pass_windows(
         s,
         rows,

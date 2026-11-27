@@ -2635,7 +2635,7 @@ pub static DRAFT_RULE: Kind = Kind {
     name: "draft_rule",
     head: "draft rule",
     doc: "What a serve seat's BLOOMERY_DRAFT resolved to before the plan: the draft its greedy \
-          requests run (dspark, lookup, or off: none) and why (the lever's word, or unset with the \
+          requests run (dspark, lookup, recall, or off: none) and why (the lever's word, or unset with the \
           draft's folder and where it was found, or what left the plain path: off, no draft \
           folder, a build without the draft's reader, a load the draft's verify does not run on, \
           a card the draft's reserve leaves short).",

@@ -528,7 +528,7 @@ use serve::{
 };
 use tokenizer::Tokenizer;
 
-use super::drafted::{LOOKUP_ROWS, ParkedDraft, SlotDrafts, lookup_props};
+use super::drafted::{LOOKUP_ROWS, ParkedDraft, SlotDrafts};
 
 #[path = "../qwen38_place.rs"]
 mod q38place;
@@ -1087,7 +1087,8 @@ fn draft_asked(levers: &bloomery_levers::Levers) -> Result<Option<DraftWord>, Ga
     levers.draft_word(&DRAFT_WORDS).map_err(|e| {
         format!(
             "BLOOMERY_DRAFT={}: on a qwen4exp file mtp drafts the window, lookup the n-gram \
-             lookup and off runs the plain path; dspark is the V4.1 binaries'",
+             lookup and off runs the plain path; dspark is the V4.1 binaries' and recall the \
+             qwen3 and inkling2 seats' (a pass here verifies four rows)",
             e.word
         )
         .into()
@@ -1127,7 +1128,9 @@ fn draft38(
         Some(DraftWord::Mtp) => Ok((true, None)),
         Some(DraftWord::Lookup) => Ok((false, None)),
         Some(DraftWord::Off) => Ok((false, Some(Draft38Off::Set))),
-        Some(DraftWord::Dspark) => unreachable!("the draft word was checked"),
+        Some(DraftWord::Dspark | DraftWord::Recall) => {
+            unreachable!("the draft word was checked")
+        }
         None => {
             let at = Draft38At {
                 place_a: place.stage_a(),
@@ -4098,7 +4101,7 @@ impl Seat for Q38 {
     fn props(&self, mut p: EngineProps) -> EngineProps {
         p.autotune = Some(self.autotune.clone());
         if self.drafts.looks_up() {
-            return lookup_props(p);
+            return self.drafts.lookup_props(p);
         }
         if !self.drafts.drafts() {
             return p;

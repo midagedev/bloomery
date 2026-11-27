@@ -12,9 +12,9 @@
 //! clauses (`shared/ds41_residency.rs`) run first: its host-set refusal
 //! before the load, the rest on the load before the clauses below, with
 //! streaming off; `--only residency` stops after them. `--place a` loads plan
-//! (a) on the A6000 alone (the serving plan, no tier card) instead, for the
-//! residency's clauses only: it needs `--only residency`, and the clauses
-//! below run under plan (b′). There the residency's `static` clause ends
+//! (a) on the largest visible card alone (the serving plan, no tier card)
+//! instead, the one-card form: the clauses below run on that load as they do
+//! under plan (b′). There the residency's `static` clause ends
 //! after the teardown, on a load of its own, and then the serving default's
 //! arm ([`default_arm`]) loads once more, at the word the V4.1 seat runs with
 //! `BLOOMERY_RESIDENCY` unset on this plan. Each clause below
@@ -62,7 +62,12 @@
 //!   prefill gate's band however streaming behaves — `off` runs the
 //!   grouped GEMM, `on` the tile path — so the near-tie rule is what
 //!   covers that distance too, and a streaming defect shows as a
-//!   difference at a clear position.
+//!   difference at a clear position. That rule passes one admitted expert's
+//!   wrong copy, so right after each `on` call (before any step) every expert
+//!   the pick left live off the seed holds in its slot the bytes a static load
+//!   uploads for it (`transform`; mutant: a call pick's copy job naming the
+//!   neighbour expert, `SwapMachine::copy_into`'s `Job::id` of the first layer
+//!   `^ 1`).
 //! - `s4` (a group of two streams what it runs off: a streamed pass that
 //!   admits nothing is the plain pass): [`S4_P`] prose ids,
 //!   two batches, one group of two, so the next batch's route is enqueued
@@ -331,6 +336,9 @@ mod gate {
         row: Vec<u32>,
         picks: Vec<Pick>,
         end: Option<CallReport>,
+        /// The slots right after the prompt call, before any step, where the
+        /// call asked for them ([`call_held`]).
+        held: Option<residency::Held>,
     }
 
     impl Run {
@@ -342,6 +350,17 @@ mod gate {
     /// The prompt call of `ids` from where the session stands, then `steps` greedy
     /// steps; the call's picks and end.
     fn call(s: &mut Session<Body>, ids: &[u32], steps: usize) -> Result<Run, GateError> {
+        call_held(s, ids, steps, false)
+    }
+
+    /// [`call`], and with `held` the card's slots read against the static bytes
+    /// right after the prompt call, before any step can move one.
+    fn call_held(
+        s: &mut Session<Body>,
+        ids: &[u32],
+        steps: usize,
+        held: bool,
+    ) -> Result<Run, GateError> {
         let answered = s.prompt(ids, Want::Logits)?;
         let row = match &answered {
             Out::Logits { row, .. } => row.iter().map(|f| f.to_bits()).collect(),
@@ -351,6 +370,7 @@ mod gate {
         };
         let first = pos_of(answered)?;
         let (picks, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+        let held = held.then(|| residency::transform_read(s)).transpose()?;
         let mut out = Vec::with_capacity(steps + 1);
         out.push(first);
         let mut next = first.argmax;
@@ -370,6 +390,7 @@ mod gate {
                 .map(|(g, p)| (*g, p.layer, p.admitted, p.kept, p.bytes, p.counts))
                 .collect(),
             end,
+            held,
         })
     }
 
@@ -653,10 +674,14 @@ mod gate {
                 let off = call(s, &ids, S3_STEPS)?;
                 set_stream(s, true)?;
                 s.clear()?;
-                let on = call(s, &ids, S3_STEPS)?;
+                let on = call_held(s, &ids, S3_STEPS, true)?;
                 if on.admitted() == 0 {
                     idle += 1;
                 }
+                // The near-tie rule passes a wrong copy of one admitted expert: the
+                // slots right after the call are read against the static bytes.
+                let held = on.held.as_ref().ok_or("the on call took no slot read")?;
+                ok &= residency::transform_judge(&format!("the {name} window {w} on call"), held)?;
                 let first = off
                     .out
                     .iter()
@@ -821,7 +846,7 @@ mod gate {
 
     /// The placement the gate loads (`--place a|bp`, plan (b′) when not
     /// given) and whether the residency's clauses run alone (`--only
-    /// residency`); `--place a` without it is refused by name.
+    /// residency`).
     fn parse_args() -> Result<(Place, bool), GateError> {
         const USAGE: &str = "usage: gate_ds41_callstream [--place a|bp] [--only residency]";
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -834,13 +859,6 @@ mod gate {
                 ("--only", Some("residency")) => only = true,
                 _ => return Err(format!("{USAGE}, not {args:?}").into()),
             }
-        }
-        if place == Place::A && !only {
-            return Err(format!(
-                "--place a runs the residency's clauses alone; the streaming clauses run under \
-                 plan (b′): add --only residency ({USAGE})"
-            )
-            .into());
         }
         Ok((place, only))
     }

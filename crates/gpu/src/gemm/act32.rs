@@ -49,6 +49,9 @@ use gguf::GgmlType;
 pub struct GemmAct32 {
     #[cfg(bloomery_nvfp4_mma)]
     pub(super) native: Option<super::nvfp4mma::Act>,
+    /// The native FP4 form while [`GemmAct32::set_native`] holds it off.
+    #[cfg(bloomery_nvfp4_mma)]
+    parked: Option<super::nvfp4mma::Act>,
     pub(super) q: DeviceBuffer<u32>,
     pub(super) d: DeviceBuffer<f32>,
     pub(super) s: DeviceBuffer<i32>,
@@ -134,6 +137,8 @@ impl GemmAct32 {
         Ok(GemmAct32 {
             #[cfg(bloomery_nvfp4_mma)]
             native: None,
+            #[cfg(bloomery_nvfp4_mma)]
+            parked: None,
             q: DeviceBuffer::zeroed(stream, 16 * steps)?,
             d: DeviceBuffer::zeroed(stream, 2 * steps)?,
             s: DeviceBuffer::zeroed(stream, 2 * steps)?,
@@ -348,6 +353,23 @@ impl GemmAct32 {
         None
     }
 
+    /// Turns the native FP4 form of a [`GemmAct32::new_routed`] scratch on or off between
+    /// launches. Off, every reader and writer takes the scratch as one made by
+    /// [`GemmAct32::new`]: the Q8 planes beside the native form are the plain quantizer's, so
+    /// the off scratch is bit for bit that one. On, the form is back and the next quantizer
+    /// launch fills it. A scratch with no native form, and a build without the product, ignore
+    /// both.
+    pub(crate) fn set_native(&mut self, on: bool) {
+        #[cfg(bloomery_nvfp4_mma)]
+        if on {
+            self.native = self.native.take().or_else(|| self.parked.take());
+        } else {
+            self.parked = self.parked.take().or_else(|| self.native.take());
+        }
+        #[cfg(not(bloomery_nvfp4_mma))]
+        let _ = on;
+    }
+
     /// Whether the scratch holds the native FP4 form beside the 32-value one
     /// ([`GemmAct32::new_routed`] on a native FP4 build).
     #[must_use]
@@ -424,7 +446,13 @@ impl GemmAct32 {
                 .map(|f| f.words.num_bytes() + f.scales.num_bytes() + f.refused.num_bytes())
                 .sum::<usize>();
         #[cfg(bloomery_nvfp4_mma)]
-        let bytes = bytes + self.native.as_ref().map_or(0, super::nvfp4mma::Act::bytes);
+        let bytes = bytes
+            + self
+                .native
+                .iter()
+                .chain(self.parked.iter())
+                .map(super::nvfp4mma::Act::bytes)
+                .sum::<usize>();
         bytes
     }
 

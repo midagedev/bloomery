@@ -269,7 +269,12 @@ mod gate {
         gate_card::init()?;
         let machine = gate_card::plan_gate(inputs.model.layers);
         let plan = inputs
-            .plan(&machine, CTX as u64, &PlanLevers::default())
+            .plan(
+                &machine,
+                CTX as u64,
+                &PlanLevers::default(),
+                bloomery_gpu::NATIVE_FP4,
+            )
             .map_err(|e| format!("{NAME}: the plan: {e}"))?;
         let mut ok = placement(&inputs, &plan, None)?;
         if !ok {

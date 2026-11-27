@@ -47,6 +47,10 @@ pub mod flint;
 pub mod glm;
 #[cfg(feature = "deepseek41")]
 mod served;
+// The recall draft's constructor, which the seats of an eight-row body name
+// (`recalled`): a seat of a smaller body does not compile it.
+#[cfg(feature = "deepseek41")]
+mod recalled;
 // The qwen38 seat runs no V4.1 code, but the server surface it sits on —
 // `bind` and the `serve` and `sampler` crates — is scoped to `deepseek41`,
 // as its per-model binary's doc says.

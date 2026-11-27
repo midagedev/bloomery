@@ -29,6 +29,11 @@ pub enum Draft {
     Lookup,
     /// The DSpark draft (`shared/ds41_dspark.rs`).
     Dspark,
+    /// The draft of the longest earlier match of the context's tail, which
+    /// the qwen3 and Inkling 2 seats serve. A V4.1 pass verifies two rows,
+    /// so [`Draft::check_levers`] refuses its word by name and answers it
+    /// to no seat.
+    Recall,
 }
 
 impl Draft {
@@ -44,16 +49,23 @@ impl Draft {
 
     /// The draft word without record registration or model access.
     pub fn check_levers(levers: &Levers) -> Result<Draft, GateError> {
-        const WORDS: [DraftWord; 2] = [DraftWord::Lookup, DraftWord::Dspark];
-        match levers.draft_word(&WORDS) {
-            Ok(None) => Ok(Draft::Off),
-            Ok(Some(DraftWord::Lookup)) => Ok(Draft::Lookup),
-            Ok(Some(_)) => Ok(Draft::Dspark),
-            Err(e) => Err(format!(
-                "BLOOMERY_DRAFT is lookup, dspark or unset, not {:?}",
-                e.word.as_str()
-            )
-            .into()),
+        const WORDS: [DraftWord; 3] = [DraftWord::Lookup, DraftWord::Recall, DraftWord::Dspark];
+        let draft = match levers.draft_word(&WORDS) {
+            Ok(None) => Draft::Off,
+            Ok(Some(DraftWord::Lookup)) => Draft::Lookup,
+            Ok(Some(DraftWord::Recall)) => Draft::Recall,
+            Ok(Some(_)) => Draft::Dspark,
+            Err(e) => {
+                return Err(format!(
+                    "BLOOMERY_DRAFT is lookup, dspark or unset, not {:?}",
+                    e.word.as_str()
+                )
+                .into());
+            }
+        };
+        match draft {
+            Draft::Recall => Err(Draft::RECALL_REFUSED.into()),
+            served => Ok(served),
         }
     }
 
@@ -61,9 +73,15 @@ impl Draft {
         match self {
             Draft::Off => "unset",
             Draft::Lookup => "lookup",
+            Draft::Recall => "recall",
             Draft::Dspark => "dspark",
         }
     }
+
+    /// What a V4.1 binary says of the recall word ([`Draft::check_levers`]),
+    /// and of a recall draft that reached a seat past it.
+    pub const RECALL_REFUSED: &'static str = "BLOOMERY_DRAFT=recall: a V4.1 pass verifies two rows \
+         and the recall draft's window is eight; serve lookup, dspark or no draft";
 }
 
 /// The DSpark draft of `file` (read by [`dspark::draft_hparams`]) on its

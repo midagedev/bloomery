@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What a free draft would accept on a token stream, offline, if the target were the text itself.
 
-    tools/ref/draft-accept.py <ids> [<ids>...] [--tokens N] [--chunk C]
+    tools/ref/draft-accept.py <ids> [<ids>...] [--tokens N] [--chunk C] [--recall GRAMS:W[:NMIN]]
                               [--corpus <ids> [--corpus-skip K] [--corpus-tokens M] [--corpus-doc D]]
     tools/ref/draft-accept.py --self-test
 
@@ -31,6 +31,17 @@ Drafts:
                   follower lies past its document's end supplies nothing (the next shorter suffix is
                   tried). Only with --corpus. `sam-history` is the same rule with no corpus: what the
                   corpus adds is sam - sam-history.
+recall-longest  `runtime::Recall` (crates/runtime/src/recall.rs), the multi-token draft: of the tracked n-gram
+                  lengths GRAMS, the longest whose last-n tokens occurred earlier (n from the largest down to
+                  the smallest, the most recent occurrence), proposes the W tokens that followed that
+                  occurrence, the context extended with the proposal itself where the follower run reaches
+                  the context's end (a match at distance p repeats with period p). The match is then widened
+                  backward over the tokens that still agree, to RECALL_CAP, for its length `ell`. A proposal
+                  is made only where ell >= NMIN. `--recall GRAMS:W[:NMIN]` scores one setting after the tables,
+                  GRAMS a list (`3,6,12`, what `Recall::new(3)` tracks) or a range (`1-16`), NMIN the least
+                  `ell` that proposes (default: the smallest of GRAMS), and prints the pass walk: a pass at
+                  position i verifies the proposal and keeps 1 + r tokens, r the leading drafts equal to the
+                  stream; with no proposal it keeps 1. Its self-test cases are the ones `recall.rs` pins.
 The corpus is held out: it is read from --corpus starting at token K (--corpus-skip, so a stream's
 tail can serve its own head), at most M tokens (--corpus-tokens, default 1,000,000), cut into
 documents of D tokens (--corpus-doc; default: the whole read is one document). A corpus that holds
@@ -51,6 +62,7 @@ import tempfile
 NS = (3, 2, 1)
 SOURCES = ("history", "corpus")
 HIST_MAX = 64          # the longest history match the sam arm looks for, in tokens
+RECALL_CAP = 32        # the longest match length recall-longest reports, in tokens
 OVERLAP_GRAM = 16
 OVERLAP_MAX = 0.01     # a corpus holding more of a scored stream's 16-grams than this is not held out
 CAVEAT = ("target = the corpus text itself (human text), so this is the domain's predictability by "
@@ -170,6 +182,103 @@ def score_frequent(t, ns):
                         e[1] = y
                         e[2] = c
     return tal
+
+
+class Longest:
+    """score_longest's result: one entry per scored position (the token being proposed for), in order.
+    ell[i] is the match length of the proposal at i (0: no match at any tracked n), r[i] the leading
+    drafts equal to the stream, m[i] the drafts the stream could check (the proposal's width, cut where
+    the stream ends before the bonus token)."""
+    __slots__ = ("grams", "w", "fill", "ell", "r", "m")
+
+    def __init__(self, grams, w, fill):
+        self.grams, self.w, self.fill = grams, w, fill
+        self.ell, self.r, self.m = [], [], []
+
+    def tally(self, nmin, w=None):
+        """(positions, proposed, accepted drafts, histogram of r over the proposed) with the proposal
+        made only where ell >= nmin and cut to its first w tokens (w <= the scored width)."""
+        w = self.w if w is None else w
+        if w > self.w:
+            raise InputError(f"a proposal of {w} tokens from a scan of width {self.w}")
+        hist = [0] * (w + 1)
+        proposed = accepted = 0
+        for ell, r in zip(self.ell, self.r):
+            if ell >= nmin and ell > 0:
+                proposed += 1
+                accepted += min(r, w)
+                hist[min(r, w)] += 1
+        return len(self.ell), proposed, accepted, hist
+
+    def walk(self, nmin, w=None):
+        """The pass walk over the scored span: (passes, drafted passes, tokens, accepted drafts). A pass at
+        position i with a proposal keeps 1 + r tokens (r cut to w), one without keeps 1."""
+        w = self.w if w is None else w
+        if w > self.w:
+            raise InputError(f"a proposal of {w} tokens from a scan of width {self.w}")
+        i, n = 0, len(self.ell)
+        passes = drafted = tokens = hits = 0
+        while i < n:
+            passes += 1
+            if self.ell[i] >= nmin and self.ell[i] > 0:
+                r = min(self.r[i], w)
+                drafted += 1
+                hits += r
+            else:
+                r = 0
+            tokens += 1 + r
+            i += 1 + r
+        return passes, drafted, tokens, hits
+
+
+def score_longest(t, grams, w, scored_from=1, fill=True):
+    """recall-longest over one context: the proposal at every position i >= max(scored_from, 1) from the
+    context t[:i]. The index of each tracked n-gram length holds the follower of its most recent
+    occurrence, updated with the n-gram ending at i - 1 only after position i is proposed, so a proposal
+    never sees the token it is proposing. With fill the proposal is always w tokens: where the follower
+    run reaches the context's end the proposal repeats itself with the match's period; without it the
+    proposal stops at the end of the context (the match's distance)."""
+    if w < 1:
+        raise InputError("a recall proposal of no token")
+    if not grams or any(n < 1 for n in grams) or len(set(grams)) != len(grams):
+        raise InputError(f"tracked n-gram lengths are distinct and at least 1, not {list(grams)}")
+    down = sorted(grams, reverse=True)
+    idx = {n: {} for n in down}
+    out = Longest(tuple(sorted(grams)), w, fill)
+    T = len(t)
+    for i in range(1, T):
+        j, used = None, 0
+        for n in down:
+            if i >= n:
+                j = idx[n].get(tuple(t[i - n:i]))
+                if j is not None:
+                    used = n
+                    break
+        if i >= scored_from:
+            if j is None:
+                out.ell.append(0)
+                out.r.append(0)
+                out.m.append(0)
+            else:
+                ell = used
+                while ell < RECALL_CAP and j - ell - 1 >= 0 and t[j - ell - 1] == t[i - ell - 1]:
+                    ell += 1
+                width = w if fill else min(w, i - j)
+                d = []
+                for k in range(width):
+                    s = j + k
+                    d.append(t[s] if s < i else d[s - i])
+                m = min(width, T - 1 - i)
+                r = 0
+                while r < m and d[r] == t[i + r]:
+                    r += 1
+                out.ell.append(ell)
+                out.r.append(r)
+                out.m.append(m)
+        for n in down:
+            if i >= n:
+                idx[n][tuple(t[i - n:i])] = i
+    return out
 
 
 class Corpus:
@@ -431,6 +540,52 @@ def print_tables(results, n_tokens, chunk, corpus_line=None):
         print()
 
 
+def parse_recall(spec):
+    """(grams, w, nmin) of `GRAMS:W[:NMIN]`: GRAMS is `a,b,c` or `a-b` (every length from a to b)."""
+    parts = spec.split(":")
+    try:
+        if len(parts) not in (2, 3):
+            raise ValueError
+        g = parts[0]
+        grams = list(range(int(g.split("-")[0]), int(g.split("-")[1]) + 1)) if "-" in g else [int(x) for x in g.split(",")]
+        w = int(parts[1])
+        nmin = int(parts[2]) if len(parts) == 3 else min(grams)
+    except (ValueError, IndexError):
+        raise InputError(f"--recall takes GRAMS:W[:NMIN] (GRAMS `3,6,12` or `1-16`), not {spec!r}") from None
+    if w < 1 or not grams or min(grams) < 1 or nmin < 1:
+        raise InputError(f"--recall: tracked lengths, W and NMIN are at least 1, not {spec!r}")
+    return grams, w, nmin
+
+
+def recall_row(stream, chunk, grams, w, nmin):
+    """The recall-longest numbers over every context of the stream: positions, proposed, accepted
+    drafts, the histogram of r over the proposed, and the pass walk (passes, drafted, tokens)."""
+    pos = prop = acc = passes = drafted = tokens = 0
+    hist = [0] * (w + 1)
+    for ctx in contexts(stream, chunk):
+        if len(ctx) < 2:
+            continue
+        res = score_longest(ctx, grams, w)
+        p, q, a, h = res.tally(nmin)
+        pa, dr, tk, _ = res.walk(nmin)
+        pos, prop, acc = pos + p, prop + q, acc + a
+        passes, drafted, tokens = passes + pa, drafted + dr, tokens + tk
+        hist = [x + y for x, y in zip(hist, h)]
+    return pos, prop, acc, hist, passes, drafted, tokens
+
+
+def print_recall(results, grams, w, nmin, chunk):
+    print(f"### recall-longest GRAMS={','.join(map(str, grams))} W={w} NMIN={nmin} — {CAVEAT}\n")
+    print("| corpus | positions | proposed | proposed/positions | accepted drafts/proposed | r histogram "
+          "(r = 0..W over the proposed) | passes | drafted/passes | tokens/pass |")
+    print("|---|---:|---:|---:|---:|---|---:|---:|---:|")
+    for corpus, row in results:
+        pos, prop, acc, hist, passes, drafted, tokens = row
+        print(f"| {corpus} | {pos} | {prop} | {frac(prop, pos)} | {frac(acc, prop)} | "
+              f"{' / '.join(map(str, hist))} | {passes} | {frac(drafted, passes)} | {frac(tokens, passes)} |")
+    print()
+
+
 def read_span(path, skip, n):
     """Tokens [skip, skip + n) of an ids file (fewer if the file ends first; none is refused)."""
     out = []
@@ -469,6 +624,94 @@ def corpus_name(path):
     if base.startswith("corpus-") and base.endswith(".ids"):
         return base[len("corpus-"):-len(".ids")]
     return base
+
+
+def lcg_stream(n):
+    """The stream `crates/runtime/src/lookup.rs` and `recall.rs` score in their tests: a u32 LCG over eleven ids
+    with a five-token phrase spliced in."""
+    s, out = 1, []
+    while len(out) < n:
+        s = (s * 1_664_525 + 1_013_904_223) & 0xFFFFFFFF
+        x = s >> 16
+        if x % 7 == 0:
+            out += [40, 41, 42, 43, 44]
+        else:
+            out.append(x % 11)
+    return out[:n]
+
+
+def recall_self_test():
+    # A repeated 7-token pattern: position 7 has no proposal, every later one is right until the stream
+    # ends: 62 proposals, 58 of four right, then 3, 2, 1, 0 (the stream's last positions cut the check).
+    pat = [11, 12, 13, 14, 15, 16, 17]
+    r = score_longest(pat * 10, [1, 2, 3], 4)
+    assert r.tally(1) == (69, 62, 238, [1, 1, 1, 1, 58]), r.tally(1)
+    assert r.walk(1) == (20, 13, 69, 49), r.walk(1)
+    # A run of one id: the match's follower is the context's own end, so the proposal repeats itself
+    # (the context extended with the proposal); cut at the context's end it would hold one id only.
+    r = score_longest([5] * 6, [1], 3)
+    assert r.tally(1) == (5, 4, 6, [1, 1, 1, 1]) and r.walk(1) == (2, 1, 5, 3), (r.tally(1), r.walk(1))
+    r = score_longest([5] * 6, [1], 3, fill=False)
+    assert r.tally(1) == (5, 4, 3, [1, 3, 0, 0]), r.tally(1)
+    # The match length is the tracked n-gram widened backward over the ids that still agree: the 3-gram
+    # (1, 2, 3) of the stream's end sits after a 7 both times, so the match is 4 long; it proposes only
+    # where ell >= NMIN, and the stream's end cuts the check (m).
+    t = [7, 1, 2, 3, 4, 7, 1, 2, 3, 4]
+    r = score_longest(t, [3], 2, scored_from=9)
+    assert (r.ell, r.r, r.m) == ([4], [0], [0]), (r.ell, r.r, r.m)
+    t = [7, 1, 2, 3, 4, 7, 1, 2, 3, 4, 7, 1]
+    r = score_longest(t, [3], 2, scored_from=10)
+    assert (r.ell, r.r, r.m) == ([5, 6], [1, 0], [1, 0]), (r.ell, r.r, r.m)
+    assert r.tally(6)[1] == 1 and r.tally(7)[1] == 0 and r.tally(5)[1] == 2
+    # A match widens backward to RECALL_CAP ids and no further: a 70-id block repeated for its first 60.
+    t = list(range(200, 270)) + list(range(200, 261))
+    r = score_longest(t, [3], 2, scored_from=130)
+    assert r.ell == [32] and RECALL_CAP == 32, (r.ell, RECALL_CAP)
+    # The longest tracked n decides, not the most recent occurrence of a shorter one: the tail (8, 1, 2) was
+    # followed by 3, the 2-gram (1, 2) last by 5, and the stream goes on with 3.
+    t = [8, 1, 2, 3, 6, 1, 2, 5, 6, 8, 1, 2, 3, 6]
+    r = score_longest(t, [2, 3], 1, scored_from=12)
+    assert (r.ell, r.r, r.m) == ([3, 4], [1, 0], [1, 0]), (r.ell, r.r, r.m)
+    r = score_longest(t, [2], 1, scored_from=12)
+    assert (r.ell, r.r, r.m) == ([2, 4], [0, 0], [1, 0]), (r.ell, r.r, r.m)
+    # Refusals by name.
+    for bad in ([], [0], [2, 2], ):
+        try:
+            score_longest([1, 2, 3], bad, 2)
+        except InputError:
+            pass
+        else:
+            raise AssertionError(f"grams {bad} accepted")
+    try:
+        score_longest([1, 2, 3], [1], 0)
+    except InputError:
+        pass
+    else:
+        raise AssertionError("a proposal of no token was accepted")
+    # The same 4000-token stream recall.rs scores (`matches_draft_accept_py`): one setting a case.
+    t = lcg_stream(4000)
+    for grams, w, want_tally, want_walk in (
+        ([3, 6, 12], 4, (3999, 2798, 3394, [1377, 415, 351, 343, 312]), (2624, 1423, 3999, 1375)),
+        ([2, 4, 8], 8, (3999, 3850, 4116, [2232, 477, 359, 355, 338, 64, 6, 4, 15]), (2386, 2237, 3999, 1613)),
+        ([4, 8, 16], 2, (3999, 1942, 1873, [815, 381, 746]), (3125, 1068, 3999, 874)),
+    ):
+        r = score_longest(t, grams, w)
+        assert r.tally(grams[0]) == want_tally, (grams, w, r.tally(grams[0]))
+        assert r.walk(grams[0]) == want_walk, (grams, w, r.walk(grams[0]))
+    # the CLI's spec
+    assert parse_recall("3,6,12:4") == ([3, 6, 12], 4, 3) and parse_recall("1-4:8:2") == ([1, 2, 3, 4], 8, 2)
+    for bad in ("3,6", "x:4", "3:0", "3:4:0", "0:4", "3-:4"):
+        try:
+            parse_recall(bad)
+        except InputError:
+            pass
+        else:
+            raise AssertionError(f"--recall {bad!r} accepted")
+    # the row the CLI prints, against the scorer's own numbers; a chunk resets the context
+    row = recall_row(lcg_stream(4000), 0, [3, 6, 12], 4, 3)
+    assert row == (3999, 2798, 3394, [1377, 415, 351, 343, 312], 2624, 1423, 3999), row
+    row = recall_row(pat * 10, 14, [1, 2, 3], 4, 1)
+    assert row[0] == 5 * 13 and row[1] == 5 * 6, row
 
 
 def self_test():
@@ -564,6 +807,7 @@ def self_test():
     else:
         raise AssertionError("a corpus holding the scored text was accepted")
     held_out("t", t, Corpus([[rng.randrange(1000, 2000) for _ in range(400)]]))
+    recall_self_test()
     print("draft-accept: self-test ok")
 
 
@@ -573,6 +817,7 @@ def main(argv):
         return 0
     paths, n_tokens, chunk = [], 50000, 0
     cpath, cskip, ctokens, cdoc = None, 0, 1_000_000, 0
+    recall = None
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -602,6 +847,16 @@ def main(argv):
                 return 64
             cpath = argv[i + 1]
             i += 2
+        elif a == "--recall":
+            if i + 1 >= len(argv):
+                print(f"draft-accept: {a} takes GRAMS:W[:NMIN]", file=sys.stderr)
+                return 64
+            try:
+                recall = parse_recall(argv[i + 1])
+            except InputError as e:
+                print(f"draft-accept: {e}", file=sys.stderr)
+                return 64
+            i += 2
         elif a.startswith("-"):
             print(__doc__, file=sys.stderr)
             return 64
@@ -614,7 +869,7 @@ def main(argv):
     if cpath is None and (cskip or cdoc or ctokens != 1_000_000):
         print("draft-accept: --corpus-skip, --corpus-tokens and --corpus-doc need --corpus", file=sys.stderr)
         return 64
-    results = []
+    results, recalls = [], []
     try:
         corpus, line = None, None
         if cpath is not None:
@@ -624,10 +879,14 @@ def main(argv):
             if corpus is not None:
                 held_out(p, stream, corpus)
             results.append((corpus_name(p), run(stream, chunk, corpus)))
+            if recall is not None:
+                recalls.append((corpus_name(p), recall_row(stream, chunk, *recall)))
     except (InputError, OSError) as e:
         print(f"draft-accept: {e}", file=sys.stderr)
         return 1
     print_tables(results, n_tokens, chunk, line)
+    if recall is not None:
+        print_recall(recalls, *recall, chunk)
     return 0
 
 

@@ -47,8 +47,12 @@
 //! - `residency_near_off`: the `mid` history's greedy ids are the `off` history's, or part from them where the `mid` run's
 //!   top-1 margin is under `GREEDY_MARGIN` (a near tie); the prompt's last logits row's greatest distance from the `off` run's
 //!   is printed, not judged: the card and the host sum a token's experts in another split under another seed, and no band of
-//!   that distance has been measured for this family (no mutant of its own: a flip that copies wrong bytes reddens it in the
-//!   real tier, and the V4.1 and GLM gates' byte-level `transform` clause is the guard);
+//!   that distance has been measured for this family, so a flip that copies wrong bytes is not this clause's to see
+//!   (`residency_transform` is);
+//! - `residency_transform`: after the `mid` history, every expert the flips left live off its layer's seed holds in its slot,
+//!   part by part, the bytes the source stages for it, the bytes a static load uploads (the shared `transform` check; the
+//!   real tier requires an expert checked, the fixture's routing has no skew so none need be live) (mutant: a decode
+//!   flip's copy job naming the neighbour expert, `SwapMachine::copy_into`'s `Job::id` `^ 1` on some boundary jobs);
 //! - `residency_tier_stays` (arm `bp`): the expert tier card's slot map is the load's after the histories (mutant: the layout
 //!   leaving a tier expert out of its away list; real tier, where hot tier experts exist);
 //! - `residency_hit_record`: every window's `tier census` record counts the window's steps, its picks are the steps' times the
@@ -106,7 +110,10 @@ mod gate {
     use model::placement::{Machine, Plan, PlanLevers, workstation};
 
     use crate::e2e::walk;
-    use crate::residency_clauses::{c1_clause_with, c7_clause, passes_clause, seeds};
+    use crate::residency_clauses::{
+        c1_clause_with, c7_clause, layer_seeds, passes_clause, seeds, transform_check,
+        transform_verdict_after,
+    };
 
     type Model = GpuModel<Body>;
 
@@ -131,19 +138,21 @@ mod gate {
     /// The clauses of arm `a`, in the order they are declared, and of arm `bp` as a left arm names them: each is left by
     /// name where the cards in view lack what the arm needs.
     const UNSET_SERVES: &str = "residency_unset_serves";
-    const ARM_A_CLAUSES: [&str; 8] = [
+    const ARM_A_CLAUSES: [&str; 9] = [
         UNSET_SERVES,
         "residency_started",
         "residency_passes",
         "residency_near_off",
+        "residency_transform",
         "residency_hit_record",
         "residency_c1",
         "residency_c7",
         "residency_hit_depth",
     ];
-    const ARM_BP_CLAUSES: [&str; 6] = [
+    const ARM_BP_CLAUSES: [&str; 7] = [
         "residency_unset_serves (arm bp)",
         "residency_near_off (arm bp)",
+        "residency_transform (arm bp)",
         "residency_passes (arm bp)",
         "residency_hit_record (arm bp)",
         "residency_hit_depth (arm bp)",
@@ -281,6 +290,25 @@ mod gate {
             && on.logits.len() == off.logits.len()
             && parted.is_none_or(|i| on.margins.get(i).is_some_and(|&m| m < GREEDY_MARGIN));
         (dlogit, parted, ids_ok)
+    }
+
+    /// `residency_transform` on the `mid` load `m` as the history `after` left it: each live expert off its layer's seed
+    /// holds in its slot, part by part, the bytes the source stages for it. A fixture's routing has no skew, so the fixture
+    /// tier asks for no expert off the seed.
+    fn transform_after(m: &Model, after: &str, tier_now: Tier) -> Result<bool, GateError> {
+        let body = m.body(NAME)?;
+        let machine = body.hybrid().swap().ok_or("the mid load runs no machine")?;
+        let source = body
+            .residency_source()
+            .ok_or("the mid load holds no source")?;
+        let layers = layer_seeds(machine, body.hybrid().slots().layers())?;
+        let (checked, bad) = transform_check(m.gpu(), machine, source, &layers)?;
+        Ok(transform_verdict_after(
+            after,
+            checked,
+            &bad,
+            tier_now == Tier::Real,
+        ))
     }
 
     /// The ids of a history of `n` prompt ids: the real tier's prose (a missing corpus is a named error, with the command
@@ -714,6 +742,11 @@ mod gate {
         );
         pass &= ids_ok;
 
+        // The ids and the printed distance pass one expert's wrong copy: the slots the history left are read against the
+        // static bytes before the next history resets them.
+        tier::sc("residency_transform")?;
+        pass &= transform_after(&m, "the history", tier_now)?;
+
         tier::sc("residency_hit_record")?;
         pass &= hit_record("a_mid_d6", &first, routed.len(), true, share);
 
@@ -801,6 +834,11 @@ mod gate {
             verdict(ids_ok)
         );
         pass &= ids_ok;
+
+        if mid {
+            tier::sc("residency_transform")?;
+            pass &= transform_after(&m, "the history (arm bp)", tier_now)?;
+        }
 
         tier::sc("residency_passes")?;
         pass &= if mid {

@@ -1,0 +1,96 @@
+# recallwire: the recall draft (runtime::Recall, BLOOMERY_DRAFT=recall) on the seats whose body verifies eight rows
+# (Inkling 2 and the qwen3 seat's Body35), W 7 ids a pass; one card, three tables, each its own runner call.
+# Tables: (1) Inkling-2-Mini, thinking off; (2) Inkling-2-Mini, thinking on; (3) Qwen3.8-27B (Body35). A table's arms
+# are compared only with each other; the two models' rows are never compared (a model term is in every cross-model
+# difference), and the two Inkling tables have their own prompts and so their own D and N.
+# Decomposition (design.md in /root/agents/specs/recallwire/): a pass verifies 1 + k rows and yields 1 + r tokens, and
+# gain = AL / c-bar - 1, c-bar the chooser's mean c(1 + k) steps a pass. The host term (push 1 id + propose, 285-290 ns a
+# pass) is 5e-5 of the card's 5.6..6.9 ms step (inkling2-decode.card [derived]), so the wall is the card alone: max = sum,
+# no resource sits under another's shadow, and no flow lever (async, bulk, SIMD, SIMT) comes before the wiring.
+# AL and steps a pass are the tape's [derived]: ftape/notes.md 8-9 (real greedy tapes of Inkling-2-Mini, the rule's walk).
+# c(k) on the 5090 is the one term this run cannot take from a derivation: the A6000 27B column (q35ro, c(2,4,8) = 1.2089 /
+# 1.6201 / 2.4007) and Inkling's c(8) = 2.3..3.2 (verify 15.8..18.0 ms against a 5.6..6.9 ms step, derived from
+# inkling2-decode.card) are the only cost columns in the repo, and no c(2..7) of Inkling is measured. The width chooser
+# (BLOOMERY_MTP_WIDTH unset = cost) takes the width whose AL / c is best from the c it measures, and the arm's
+# `mtp width costs=` record prints the c(k) this run is for.
+# Tables [derived] (tapescore walk of the a1 tape, off view first 256..1024 tokens and think view first 512..1024):
+#   table 1  N = 512, recall vs off +67..+112 % at c(8) 3.2..2.3 (first 256 / 1024 tokens: +57..+127), lookup vs off
+#            +32..+46 %, so recall over lookup +27..+45 %; AL 3.1..3.4, c-bar 1.6
+#   table 2  N = 1024, recall vs off +78..+111 %, lookup vs off +23..+36 % (the first 512 tokens of a thinking pass are
+#            +40..+52 %, the first 256 about +6 %: the window is 1024 so the copy phase is inside it)
+#   table 3  N = 512, no tape of this model: the Inkling a1 tape at the A6000 27B column gives +102 % (W <= 7; W <= 3 +85 %),
+#            and half of the tape's accepted-length excess gives about +25 %: the model term is what the table prices
+# The A6000 columns stand in for the 5090's c(k) in tables 1 and 2 and are the column in table 3 (a different card than
+# the 5090 this runs on, the second unknown; the run closes it).
+kind: ab
+question: does serving the recall draft (BLOOMERY_DRAFT=recall, one slot, the width chooser's pick) raise decode tok/s on an
+  edit prompt over the same binary with the draft off, and by how much more than the lookup draft, on Inkling-2-Mini
+  (thinking off, thinking on) and on Qwen3.8-27B?
+term: decode tok/s (tg, N - 1 decode steps) of the recall arm over the draft-off arm, same binary, paired by round @ n = N
+  greedy WITHOUT ignore_eos (a request with ignore_eos takes plain steps under every draft, so all arms would be one program:
+  serve_seats/ds41.rs doc, and measured on both real files with /root/agents/specs/recallwire/look.py: draft_n 206..224 of 256 tokens
+  without it, none with it; the runner's request needs its EOS mode, /root/agents/specs/recallwire/runner-eos.patch), one slot, bloomery-serve
+  at the serving defaults except BLOOMERY_DRAFT, RTX 5090; table 1 Inkling-2-Mini
+  UD-Q4_K_XL thinking off, D = 3757, N = 512; table 2 the same file thinking on, D = 3757, N = 1024; table 3 Qwen3.8-27B
+  Q4_K_M, D = 3179, N = 512
+unit: %
+predict: 57..127
+rounds: 4
+sd: 0.6 % AGENTS.md Know the ruler (same-binary runs scatter with SD 0.6 %)
+condition: `predict` is table 1's band; table 2's is +78..+111 and table 3's +25..+102 (each is its own call and the
+  table's lines in this header give the derivation). One lease a table, one binary, four arms in one runner call: off,
+  lookup, recall and an A/A (the off arm again from a second tree that holds a byte copy of the binary: both trees carry
+  the binary and its dep-info after the build, the A/A tree made by the lead's one rsync below, sha256 equal). 16 servers
+  a table (4 arms x 4 rounds, one fresh server each), so a table's wall is 16 loads plus 16 short requests; the runner's
+  [dry] line prints its predicted wall, and the load seconds of each file are the term this round has not measured.
+  The ids files are made, with the tokenizer of each model, from the ftape a1 edit prompt (a rename request over
+  crates/runtime/src/lookup.rs and its SEARCH/REPLACE answer format), in /root/agents/specs/recallwire/ids/ (one file a
+  prompt and a model, each one id a line, D = its line count):
+  ink2-off.ids 3757 ids md5 011d6ec4205b91bcaccfacc073386bf9 (thinking off: the server's apply-template ids with
+  enable_thinking false); ink2-think.ids 3757 ids md5 993dbb383c2ebc1ffd1834bf7ed7103c (enable_thinking true); both were
+  decoded and re-tokenized by bloomery-tokenize (cargo build --release -p bloomery-tokenizer --bin bloomery-tokenize,
+  md5 49e59a9c7a65dc9e68ab0ac7f682da6d) and came back equal id for id:
+  bloomery-tokenize -m /models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf --decode -f ink2-off.ids > ink2-off.text;
+  bloomery-tokenize -m ... -f ink2-off.text --ids. q38-27b.ids 3179 ids md5 721ba3023ba2adf7d872bdf312200fac: the same a1
+  user message through the model's ChatML template with thinking off (mk_q38_text.py ids/ftape-a1.prompt.json >
+  ids/q38-27b.text, 10692 bytes), bloomery-tokenize -m /models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf -f ids/q38-27b.text
+  --ids --no-bos, the ids one a line (tr -d '[],' | tr ' ' '\n'); the decode of those ids equals the text byte for byte.
+  Only the GGUF headers were read. The binary is the recall tree's bloomery-serve built with the depth-serve recipe's own
+  line (cargo oxide build --arch $BLOOMERY_ARCH -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,
+  flint,kimik3,hy4,ernie55,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve, in the tree
+  ~/repo/bloomery-recallwire), run once before the first call because the A/A tree is made from its output: rsync -a
+  --exclude target --exclude .git ~/repo/bloomery-recallwire/ ~/repo/bloomery-recallwire-aa/ && mkdir -p
+  ~/repo/bloomery-recallwire-aa/target/release && cp -a ~/repo/bloomery-recallwire/target/release/bloomery-serve
+  ~/repo/bloomery-recallwire/target/release/bloomery-serve.d ~/repo/bloomery-recallwire-aa/target/release/ && cmp the two
+  binaries. (A lead's tree of another name replaces the two names in the commands.) Table 1:
+  BLOOMERY_MODEL=inkling2 BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='DEPTH_SERVE_IDS=/root/agents/specs/recallwire/ids/ink2-off.ids
+  DEPTH_SERVE_N=512 LCPP_WARM_EOS=stop BLOOMERY_LEASE_CARD=docs/cards/recall-edit.card' just depth-serve
+  env=BLOOMERY_DRAFT=off:bloomery-recallwire:3757 env=BLOOMERY_DRAFT=lookup:bloomery-recallwire:3757
+  env=BLOOMERY_DRAFT=recall:bloomery-recallwire:3757 env=BLOOMERY_DRAFT=off:bloomery-recallwire-aa:3757.
+  (LCPP_WARM_EOS=stop is the knob of /root/agents/specs/recallwire/runner-eos.patch, a patch of tools/ref/lcpp-warm.sh the lead applies first;
+  without it the request carries ignore_eos and the tables price nothing.) Table 2: the same with DEPTH_SERVE_IDS=/root/agents/specs/recallwire/ids/ink2-think.ids and DEPTH_SERVE_N=1024.
+  Table 3: BLOOMERY_MODEL=qwen38d, DEPTH_SERVE_IDS=/root/agents/specs/recallwire/ids/q38-27b.ids, DEPTH_SERVE_N=512 and D
+  3179 in each arm.
+  Valid only if the runner's request omits ignore_eos and the recall arm's row shows draft_n above 0 (the runner's SRV_DRAFT_N and
+  SRV_DRAFT_ACC columns; a recall or lookup arm with draft_n 0 ran plain steps and prices nothing); a response may then end at its
+  EOS before N tokens, the same length in every arm because the ids are equal, and the tape bands above are the first-256/512/1024
+  token windows of the answer.
+  Inside the window of every table: the recall arm's log holds `mtp width` records with `costs=` and `kept=` (the
+  chooser's c(k) and the ids kept a pass) and its /props reports draft kind recall n_max 7, the lookup arm's kind lookup
+  n_max 1; each arm's response tokens equal the off arm's (the runner prints each arm's request; gate-inkling2-serve and
+  gate-qwen3-serve carry the equality clause); no compute process on the 5090 but ours and ComfyUI stopped by the user,
+  not by us; the A/A pair lands within 1 % of 1.
+decide-in: recall pays on edits as predicted: read the `costs=` row, which width the chooser held and the kept ids a
+  pass, then run one more table on a prose prompt (corpus-prose, D 512) off against recall to price the no-match case, and
+  propose recall for the unset default only where prose is within the ruler of off; recall over lookup is the number the
+  lookup draft is to be compared with (the sitting's gain of the opt-in word, per model)
+decide-below: under the table's lo (+57 % Inkling thinking off, +78 % thinking on, +25 % Qwen): read AL and steps a pass
+  from the records first: if AL is the tape's and the gain is lower, c(k) is the wrong term, so take c(2..8) of that model
+  from the verify rows (gate_inkling2_e2e `verify_walls_ms`) in the same sitting and bound W by the cost column (the
+  chooser already does; then the ladder, not the width, is the lever); if AL itself is low, the engine's greedy sequence
+  parted from the tape (read the first token that differs) or the edit is less of a copy than the tape's, and recall
+  stays opt-in with the copy share (kept ids a pass) as the next number; if it is under +10 % on the Qwen table the
+  seat's rule has no use there
+decide-above: over the table's hi (+127 %, +111 %, +102 %): the prompt is a purer copy than the tape's or the cost
+  column is lower than the one derived; repeat on a prompt whose request rewrites its first lines before it copies and
+  read the kept ids a pass before any claim; a gain over the lookup draft that large moves the default question up

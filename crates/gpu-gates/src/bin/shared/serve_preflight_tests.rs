@@ -506,6 +506,49 @@ fn preflight_ds41_draft() {
     );
 }
 
+/// The seats whose pass verifies two rows or none refuse the recall draft's word by name, each
+/// in its own words, before the fetch; the seats that serve it (qwen3, inkling2) are held to take
+/// it where the boundary table below lists them.
+#[test]
+fn preflight_ds41_recall() {
+    checked_refusal(
+        "ds41_recall",
+        &["--model", "ds41", "--hf", "o/r"],
+        &[("BLOOMERY_DRAFT", "recall")],
+        "BLOOMERY_DRAFT=recall: a V4.1 pass verifies two rows",
+    );
+}
+
+#[test]
+fn preflight_qwen38_recall() {
+    checked_refusal(
+        "qwen38_recall",
+        &["--model", "qwen38", "--hf", "o/r"],
+        &[("BLOOMERY_DRAFT", "recall")],
+        "BLOOMERY_DRAFT=recall",
+    );
+}
+
+#[test]
+fn preflight_glm_recall() {
+    checked_refusal(
+        "glm_recall",
+        &["--model", "glm", "--hf", "o/r"],
+        &[("BLOOMERY_DRAFT", "recall")],
+        "BLOOMERY_DRAFT=recall",
+    );
+}
+
+#[test]
+fn preflight_raon1_recall() {
+    checked_refusal(
+        "raon1_recall",
+        &["--model", "raon1", "--hf", "o/r"],
+        &[("BLOOMERY_DRAFT", "recall")],
+        "BLOOMERY_DRAFT=recall",
+    );
+}
+
 #[test]
 fn preflight_ds41_width() {
     checked_refusal(
@@ -815,6 +858,18 @@ fn hw_preflight_normal_inputs_reach_the_fetch() {
             "qwen3",
             &["--ctx-size", "8192", "--parallel", "1"][..],
             &[("BLOOMERY_DRAFT", "mtp")][..],
+        ),
+        (
+            "qwen3",
+            &["--ctx-size", "8192", "--parallel", "1"][..],
+            &[("BLOOMERY_DRAFT", "recall")][..],
+        ),
+        // The recall draft keeps a context a slot and its rounds take turns: several slots are
+        // no preflight refusal, as under `dspark`.
+        (
+            "qwen3",
+            &["--ctx-size", "8192", "--parallel", "2"][..],
+            &[("BLOOMERY_DRAFT", "recall")][..],
         ),
         (
             "raon1",

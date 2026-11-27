@@ -117,10 +117,20 @@ use std::path::{Path, PathBuf};
 /// sub-block scale defect landing near 1e-3 on a shape with no hash pin.
 pub const KERNEL_BAND: f32 = 1e-5;
 
-/// The V4.1 greedy rule of the long gate's free arm: at the first generated
-/// id that differs from ik's, our top-1 margin must be below this — a near
-/// tie [derived, <https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>: ≈ 3 σ_rel].
+/// The greedy rule's near-tie threshold, in logits: where two arms' greedy
+/// ids first part, the top-1 gap of one arm's logits row at that id must be
+/// below this. It classifies a parting id and is never a distance between two
+/// arms' logits rows ([`ARMS_MAX_DLOGIT`]). The value is the V4.1 long gate's
+/// free arm's and is not derived per pair of arms.
 pub const GREEDY_MARGIN: f32 = 1.5;
+
+/// The greatest |Δlogit| over a vocabulary row that two arms of one gate may
+/// stand apart where they legitimately sum a token's experts in another split
+/// (the card and the host; a streamed and an unstreamed call). Its value is
+/// [`GREEDY_MARGIN`]'s, kept where a clause reads it as a distance. It is not
+/// derived per pair of arms and is wide enough that one expert's wrong copy can
+/// stay inside it: a byte clause (`transform`) is what catches that copy.
+pub const ARMS_MAX_DLOGIT: f32 = 1.5;
 
 pub type GateError = Box<dyn std::error::Error>;
 

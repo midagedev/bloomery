@@ -34,8 +34,8 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     AUTOTUNE, ELASTIC, INK2_DENSE, INK2_LOOPCD, INK2_LOOPCD_MAX, INK2_LOOPCD_PLACES,
-    INK2_LOOPCD_REF, INK2_PASSES, INK2_PASSES_MAX, METAL_MX8, PREPARE_Q8, REPLAY_POISON,
-    ROUTE_CENSUS, ROUTE_MASK, ROUTE_RESIDENT_BONUS, ROUTE_RESIDENT_BONUS_MAX,
+    INK2_LOOPCD_REF, INK2_PASS_ACT, INK2_PASSES, INK2_PASSES_MAX, METAL_MX8, PREPARE_Q8,
+    REPLAY_POISON, ROUTE_CENSUS, ROUTE_MASK, ROUTE_RESIDENT_BONUS, ROUTE_RESIDENT_BONUS_MAX,
     ROUTE_RESIDENT_BONUS_PLACES, ROUTE_TOPK, ROUTE_TOPK_MAX, SCHEMAJUMP, SPLIT_WALK, XSTREAM,
 };
 pub use registry::{
@@ -676,10 +676,65 @@ impl Phase {
     }
 }
 
+/// The words of `BLOOMERY_INK2_PASS_ACT`'s row: which of the Inkling 2 prompt pass's routed-expert
+/// GEMMs read FP4 rows where their stacks are NVFP4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ink2PassAct {
+    /// The gate·up and the down GEMMs.
+    Full,
+    /// The gate·up GEMM alone.
+    GateUp,
+    /// Neither: 8-bit rows throughout.
+    Exact,
+}
+
+impl Ink2PassAct {
+    /// Every word the row takes.
+    pub const ALL: [Ink2PassAct; 3] = [Ink2PassAct::Full, Ink2PassAct::GateUp, Ink2PassAct::Exact];
+
+    /// The word as the row spells it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Ink2PassAct::Full => "full",
+            Ink2PassAct::GateUp => "gate-up",
+            Ink2PassAct::Exact => "exact",
+        }
+    }
+
+    /// Whether the gate·up GEMM reads FP4 rows.
+    #[must_use]
+    pub fn gate_up(self) -> bool {
+        self != Ink2PassAct::Exact
+    }
+
+    /// Whether the down GEMM reads FP4 rows.
+    #[must_use]
+    pub fn down(self) -> bool {
+        self == Ink2PassAct::Full
+    }
+
+    fn of(word: &str) -> Ink2PassAct {
+        match word {
+            "full" => Ink2PassAct::Full,
+            "gate-up" => Ink2PassAct::GateUp,
+            "exact" => Ink2PassAct::Exact,
+            other => panic!("{INK2_PASS_ACT} holds {other:?}, a word its row does not take"),
+        }
+    }
+}
+
+impl std::fmt::Display for Ink2PassAct {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The words of `BLOOMERY_DRAFT`'s row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DraftWord {
     Lookup,
+    Recall,
     Dspark,
     Mtp,
     Off,
@@ -687,8 +742,9 @@ pub enum DraftWord {
 
 impl DraftWord {
     /// Every word the row takes.
-    pub const ALL: [DraftWord; 4] = [
+    pub const ALL: [DraftWord; 5] = [
         DraftWord::Lookup,
+        DraftWord::Recall,
         DraftWord::Dspark,
         DraftWord::Mtp,
         DraftWord::Off,
@@ -699,6 +755,7 @@ impl DraftWord {
     pub fn as_str(self) -> &'static str {
         match self {
             DraftWord::Lookup => "lookup",
+            DraftWord::Recall => "recall",
             DraftWord::Dspark => "dspark",
             DraftWord::Mtp => "mtp",
             DraftWord::Off => "off",
@@ -708,6 +765,7 @@ impl DraftWord {
     fn of(word: &str) -> DraftWord {
         match word {
             "lookup" => DraftWord::Lookup,
+            "recall" => DraftWord::Recall,
             "dspark" => DraftWord::Dspark,
             "mtp" => DraftWord::Mtp,
             "off" => DraftWord::Off,
@@ -1427,8 +1485,8 @@ impl Levers {
         self.flag(PIN_MAIN)
     }
 
-    /// `BLOOMERY_DRAFT`: the served draft, `lookup`, `dspark` or `mtp`; `None`
-    /// unset (the plain path).
+    /// `BLOOMERY_DRAFT`: the served draft, `lookup`, `recall`, `dspark` or `mtp`;
+    /// `None` unset (the plain path).
     #[must_use]
     pub fn draft(&self) -> Option<&'static str> {
         self.word(DRAFT)
@@ -1748,6 +1806,13 @@ impl Levers {
     pub fn ink2_passes(&self) -> Option<usize> {
         self.count(INK2_PASSES)
             .map(|n| Levers::usize_of(INK2_PASSES, n))
+    }
+
+    /// `BLOOMERY_INK2_PASS_ACT`: the rows the Inkling 2 prompt pass's routed-expert GEMMs read,
+    /// `full` unset.
+    #[must_use]
+    pub fn ink2_pass_act(&self) -> Ink2PassAct {
+        Ink2PassAct::of(Levers::defaulted(INK2_PASS_ACT, self.word(INK2_PASS_ACT)))
     }
 
     /// `BLOOMERY_INK2_LOOPCD`: LoopCD-Hidden's strength for Inkling 2, ω, the row's value in

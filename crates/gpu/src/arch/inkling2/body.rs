@@ -78,7 +78,7 @@ use crate::tensor::{PartedBuffer, Window, WindowMut, copy_row};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use bloomery_levers::{
-    ChurnHosting, HostCfg, INK2_LOOPCD, INK2_LOOPCD_MAX, INK2_LOOPCD_REF, INK2_PASSES,
+    ChurnHosting, HostCfg, INK2_LOOPCD, INK2_LOOPCD_MAX, INK2_LOOPCD_REF, INK2_PASSES, Ink2PassAct,
 };
 use chain::linear::Ring;
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -596,6 +596,19 @@ impl GpuModel<Body> {
         Ok(())
     }
 
+    /// The rows the prompt pass's routed GEMMs read from the next prompt call on
+    /// (`BLOOMERY_INK2_PASS_ACT`): FP4 planes for both roles (`full`, how a load starts), for the
+    /// gate·up alone, or q8 blocks for both (`exact`), on the layers whose experts are NVFP4. A
+    /// decode step and a verify read none of them. A load with no prompt pass has nothing to set
+    /// and takes any word.
+    pub fn set_pass_act(&mut self, act: Ink2PassAct) -> Result<(), GpuError> {
+        const WHAT_S: &str = "inkling2::set_pass_act";
+        if let Some(pass) = self.body_parts(WHAT_S)?.2.pass.as_mut() {
+            pass.set_act(act);
+        }
+        Ok(())
+    }
+
     /// The whole model of `file` (a GGUF split, or a checkpoint folder's header and part source)
     /// resident on `gpu`, plus the output head: the dense sites and the f32 tables as the file holds
     /// them, a BF16 attention projection, token embedding and head in their stored words
@@ -612,7 +625,11 @@ impl GpuModel<Body> {
         let (file, origin) = file.into().into_whole();
         let n_layers = block_count(&file, OPEN)?;
         let hp = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
-        let reserve = place::pass_bytes(&pass::shape_of(&hp, &file)?, place::pass_rows(ctx));
+        let reserve = place::pass_bytes(
+            &pass::shape_of(&hp, &file)?,
+            place::pass_rows(ctx),
+            crate::NATIVE_FP4,
+        );
         let (free, total) = gpu.mem_info()?;
         let bytes: u64 = file.iter_tensors().map(|(_, t)| t.nbytes).sum();
         if usize::try_from(bytes + reserve).map_or(true, |b| b > free) {
@@ -704,7 +721,7 @@ impl GpuModel<Body> {
                     (Some(halves), Some((open, card))),
                 )?;
                 let reserve = inputs
-                    .pass_reserve(plan.ctx_max)
+                    .pass_reserve(plan.ctx_max, crate::NATIVE_FP4)
                     .map_err(|e| GpuError::plan(PLAN, e))?;
                 let shape = pass::shape_of(hp, file)?;
                 body.attach_pass(gpu, (&shape, place::pass_rows(ctx)), reserve)?;
@@ -1235,8 +1252,8 @@ impl Body {
             .ok_or(GpuError::state(WHAT_A, "a placed load"))?;
         let side = &placed.host.side;
         let counts = side.hosted_set().into_iter().map(|l| side.n_card(l));
-        let need =
-            place::pass_bytes(shape, rows) + PlacedPass::bytes_at(shape, rows, counts) as u64;
+        let need = place::pass_bytes(shape, rows, crate::NATIVE_FP4)
+            + PlacedPass::bytes_at(shape, rows, counts) as u64;
         if (gpu.alloc_room()? as u64) < need {
             return Ok(());
         }

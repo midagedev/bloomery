@@ -66,6 +66,7 @@ pub const PREPARE_Q8: &str = "BLOOMERY_PREPARE_Q8";
 pub const AUTOTUNE: &str = "BLOOMERY_AUTOTUNE";
 pub const INK2_DENSE: &str = "BLOOMERY_INK2_DENSE";
 pub const INK2_PASSES: &str = "BLOOMERY_INK2_PASSES";
+pub const INK2_PASS_ACT: &str = "BLOOMERY_INK2_PASS_ACT";
 pub const REPLAY_POISON: &str = "BLOOMERY_REPLAY_POISON";
 pub const ROUTE_RESIDENT_BONUS: &str = "BLOOMERY_ROUTE_RESIDENT_BONUS";
 pub const ROUTE_TOPK: &str = "BLOOMERY_ROUTE_TOPK";
@@ -660,7 +661,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: DRAFT,
         class: Class::M,
-        kind: Kind::Words(&["lookup", "dspark", "mtp", "off"]),
+        kind: Kind::Words(&["lookup", "recall", "dspark", "mtp", "off"]),
         default: Unset::Means(
             "the plain path, one token a step; `generate_qwen3moe` on a qwen4exp file and \
              `bloomery-serve-qwen38` under `--place a`: `mtp` when the MTP draft file is there \
@@ -760,7 +761,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               from the plain run's at a near tie; the \
               plain run planned on the budget less the draft's bytes (`BLOOMERY_CARD_BUDGET`) \
               holds the same experts and its ids are the drafted run's. `off` and unset are \
-              the plain path. Every other binary and \
+              the plain path. `recall` serves the recall draft behind the same width chooser: the \
+              ids that followed the longest earlier match of the context's tail, as many as the \
+              body's verify takes rows less one (7 on an 8-row body), one context a slot, a \
+              round of several slots running one slot's pass at a time; the qwen3 seat of \
+              `bloomery-serve` on the same whole-card verifying load `lookup` takes, and the \
+              Inkling 2 seat's whole-card load, serve it, and the \
+              greedy ids are the plain run's. Every other binary and \
               family refuses each word by name, `off` included (the qwen3 and raon1 seats' apart).",
         site: Site::Parsed {
             left: &[],
@@ -1628,6 +1635,40 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: INK2_PASS_ACT,
+        class: Class::A,
+        kind: Kind::Words(&["full", "gate-up", "exact"]),
+        default: Unset::Is("full"),
+        doc: "Inkling 2: the form the prompt pass hands its routed-expert GEMMs on the layers \
+              whose experts are NVFP4, on a build with the native FP4 product. `full` (the \
+              default, the faster path) quantizes the rows to FP4 (E2M1 codes, one UE4M3 scale \
+              a 16 values) before the gate·up and the down GEMMs, which run on the card's FP4 \
+              tensor-core product: W4A4. `gate-up` does that for the gate·up GEMM and keeps the \
+              down GEMM's rows in 8 bits, W4A8, so it gives back part of the speed for a smaller \
+              change to the outputs. `exact` keeps every routed GEMM on 8-bit rows, W4A8, the \
+              pass as it ran before the FP4 rows. An accuracy lever, opt-in: the default is the \
+              faster path, `full`, whose prompt-pass outputs differ from `exact`'s by FP4's \
+              per-block rounding. The cost: one layer's route block against the 8-bit step \
+              leg reads rel-L2 1.1 % under `exact`, 14.8 % under `gate-up` and 17.4 % under \
+              `full` (gate-inkling2-pp, the fixture's experts, seeded rows: bands that catch a \
+              bug, not a quality figure). The speed: `full` is the fastest and `exact` the \
+              slowest, `gate-up` between them (its place is derived, not measured). Only the \
+              prompt pass reads it; a decode step, a verify's rows \
+              and a layer whose experts are not NVFP4 run the same under every word. Changeable \
+              between calls of one loaded model through `GpuModel::<Body>::set_pass_act`, the \
+              environment value the initial one. Nothing changes where the build has no native \
+              FP4 product.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Runtime {
+                setter: Setter {
+                    file: "crates/gpu/src/arch/inkling2/body.rs",
+                    item: "set_pass_act",
+                },
+            },
         },
     },
     LeverSpec {

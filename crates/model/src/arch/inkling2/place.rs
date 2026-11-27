@@ -89,15 +89,17 @@ impl Inputs {
     /// [`Program::Inkling2Body`], each stack by its own type, so a fused gate·up stack plans whole)
     /// through the expert rule, the dense tensors where their roles say, the visits' stores on the
     /// cards that run their layers, and the prompt pass's buffers kept beside them on every card
-    /// ([`Inputs::pass_reserve`]).
+    /// ([`Inputs::pass_reserve`] at `native_fp4`, whether the build carries the native FP4
+    /// products).
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
         ctx_max: u64,
         levers: &PlanLevers,
+        native_fp4: bool,
     ) -> Result<Plan<'a>, PlacementError> {
         let rule = routed_rule(Program::Inkling2Body);
-        let reserve = self.pass_reserve(ctx_max)?;
+        let reserve = self.pass_reserve(ctx_max, native_fp4)?;
         plan_routed_reserving(
             &self.model,
             machine,
@@ -109,10 +111,11 @@ impl Inputs {
         )
     }
 
-    /// The card bytes of the prompt pass a load at `ctx_max` positions makes: [`pass_bytes`] of
-    /// the file's [`pass_shape`] at [`pass_rows`]. A site tensor missing or of a type no site
-    /// entry runs is refused by name.
-    pub fn pass_reserve(&self, ctx_max: u64) -> Result<u64, PlacementError> {
+    /// The card bytes of the prompt pass a load at `ctx_max` positions makes on a build that
+    /// carries the native FP4 products or not (`native_fp4`): [`pass_bytes`] of the file's
+    /// [`pass_shape`] at [`pass_rows`]. A site tensor missing or of a type no site entry runs is
+    /// refused by name.
+    pub fn pass_reserve(&self, ctx_max: u64, native_fp4: bool) -> Result<u64, PlacementError> {
         let shape = pass_shape(&self.hp, |name| {
             self.model
                 .tensors
@@ -121,7 +124,7 @@ impl Inputs {
                 .map(|t| t.ty)
         })?;
         let ctx = usize::try_from(ctx_max).unwrap_or(usize::MAX);
-        Ok(pass_bytes(&shape, pass_rows(ctx)))
+        Ok(pass_bytes(&shape, pass_rows(ctx), native_fp4))
     }
 }
 
@@ -199,6 +202,12 @@ pub struct PassShape {
     /// The forms the route GEMMs read the routed rows in, over every layer's stacks: a role's
     /// 32-value form where every layer's type reads it, else the grouped GEMM's.
     pub forms: RingForms,
+    /// Whether a layer's stack of the role is NVFP4 (the gate and up:
+    /// `ffn_gate_up_exps`, the down: `ffn_down_exps`): the 32-value form then holds the native
+    /// FP4 planes beside its q8 blocks, and the pass's route GEMMs take the native FP4 product
+    /// over them on a build that has it.
+    pub gate_up_nvfp4: bool,
+    pub down_nvfp4: bool,
 }
 
 /// The shape of `hp`'s prompt pass, its site types read by name through `ty_of` (the plan's
@@ -227,6 +236,7 @@ pub fn pass_shape(
         }
     };
     let mut forms = RingForms::BLOCKS32;
+    let (mut gate_up_nvfp4, mut down_nvfp4) = (false, false);
     for l in 0..hp.n_layer {
         let blk = |s: &str| format!("blk.{l}.{s}");
         let mut sites = vec![
@@ -246,14 +256,16 @@ pub fn pass_shape(
         }
         add(&mut outer, ty(blk("attn_output.weight"))?);
         let (fused, down) = (names::ffn_gate_up_exps(l), blk("ffn_down_exps.weight"));
-        let f =
-            RingForms::of(ty(fused.clone())?, ty(down)?).ok_or_else(|| PlacementError::Tensor {
-                name: fused,
-                detail: "is of a type no route GEMM reads: the prompt pass's experts run there"
-                    .to_string(),
-            })?;
+        let (gate_up_ty, down_ty) = (ty(fused.clone())?, ty(down)?);
+        let f = RingForms::of(gate_up_ty, down_ty).ok_or_else(|| PlacementError::Tensor {
+            name: fused,
+            detail: "is of a type no route GEMM reads: the prompt pass's experts run there"
+                .to_string(),
+        })?;
         forms.gate_up32 &= f.gate_up32;
         forms.down32 &= f.down32;
+        gate_up_nvfp4 |= gate_up_ty == GgmlType::NVFP4;
+        down_nvfp4 |= down_ty == GgmlType::NVFP4;
     }
     Ok(PassShape {
         n: hp.n_embd,
@@ -271,7 +283,21 @@ pub fn pass_shape(
         inner,
         outer,
         forms,
+        gate_up_nvfp4,
+        down_nvfp4,
     })
+}
+
+/// Bytes of one native FP4 column of `k` values beside a 32-value column ([`pass_bytes`]'s
+/// expert term, the planes `GemmAct32::new_routed` holds on a build with the native FP4
+/// products): a code nibble a value (`k / 8` words), a scale word a 64-value step (`k / 64`
+/// words) and the column's f32 scale. A width that is no multiple of 64 makes no native form.
+fn native_fp4_col_bytes(k: usize) -> usize {
+    if k.is_multiple_of(64) {
+        k / 2 + k / 16 + size_of::<f32>()
+    } else {
+        0
+    }
 }
 
 /// The card bytes of the buffers of a prompt pass of `rows` rows over `s`, four bytes a value:
@@ -294,14 +320,16 @@ pub fn pass_shape(
 ///   word and the router's picks (`n_used` a row);
 /// - the forms: the wide forms of the model's and the attention's site widths
 ///   ([`wide_act_bytes`] of their types), the one-expert route table
-///   ([`place_hybrid::route_bytes`]) and the route block's buffers over the experts
+///   ([`place_hybrid::route_bytes`]), the route block's buffers over the experts
 ///   ([`place_hybrid::ring_pass_bytes_in`] over every expert: the rows' and the slots' forms,
-///   the gate and up rows, the route table).
+///   the gate and up rows, the route table) and, on a build that carries the native FP4 products
+///   (`native_fp4`), where a role's stacks are NVFP4 in the 32-value form, the native FP4 planes
+///   beside that form ([`native_fp4_col_bytes`]).
 ///
 /// The one formula of those bytes: the plan reserves them ([`Inputs::pass_reserve`]) and the load
 /// refuses a pass that makes more.
 #[must_use]
-pub fn pass_bytes(s: &PassShape, rows: usize) -> u64 {
+pub fn pass_bytes(s: &PassShape, rows: usize, native_fp4: bool) -> u64 {
     let (f, u) = (size_of::<f32>(), size_of::<u32>());
     let looped = usize::from(s.looped);
     let q = s.n_head * s.head;
@@ -324,7 +352,16 @@ pub fn pass_bytes(s: &PassShape, rows: usize) -> u64 {
     let wide = wide_act_bytes(s.inner.iter().copied(), cols, n)
         + wide_act_bytes(s.outer.iter().copied(), cols, q64);
     let route = place_hybrid::route_bytes(rows);
-    let experts = place_hybrid::ring_pass_bytes_in(rows, s.n_used, s.n, s.ff, s.n_expert, s.forms);
+    let native = |cols: usize, k: usize, on: bool| {
+        if native_fp4 && on {
+            cols * native_fp4_col_bytes(k)
+        } else {
+            0
+        }
+    };
+    let experts = place_hybrid::ring_pass_bytes_in(rows, s.n_used, s.n, s.ff, s.n_expert, s.forms)
+        + native(rows, s.n, s.forms.gate_up32 && s.gate_up_nvfp4)
+        + native(rows * s.n_used, s.ff, s.forms.down32 && s.down_nvfp4);
     (f32s * f + u32s * u + route + experts) as u64 + wide
 }
 
@@ -446,7 +483,7 @@ mod tests {
         let inputs = typed_inputs("inkling2-place-plan");
         let machine = workstation::plan_gate(6);
         let plan = inputs
-            .plan(&machine, 64, &PlanLevers::default())
+            .plan(&machine, 64, &PlanLevers::default(), true)
             .expect("the gate machine plans the file");
         let experts = inputs.model.experts;
         assert!(
@@ -483,7 +520,12 @@ mod tests {
     /// 3,072, 1,474,560 + 1,966,080 (the BF16 sites read the f32 rows), the one-expert table of
     /// 512 slots 4 x (512 + 2 x 9 + 2 + 512) = 4,176, the route block over 4,096 slots of 128
     /// experts 1,474,560 + 2 x 4 x 4,096 x 1,152 + 4,096 x 1,440 + 4 x (4,096 + 2 x 192 + 2) =
-    /// 45,139,464: 258,393,692 B in all. Mutant: a model row left out moves it by 4,718,592.
+    /// 45,139,464: 258,393,692 B on a build without the native FP4 products. The Mini's experts
+    /// are NVFP4, so on a build with them the planes stand beside the route block's forms: a
+    /// column of 2,304 values 1,152 B of codes, 144 of block scales and 4; of 1,152 values 576,
+    /// 72 and 4; 512 x 1,300 + 4,096 x 652 = 3,336,192 B: 261,729,884 B. Mutant: a model row
+    /// left out moves both by 4,718,592; the native planes left out, or a file whose experts are
+    /// not NVFP4 counted with them, the one figure by 3,336,192.
     #[test]
     fn the_mini_pass_is_its_buffers() {
         let mini = PassShape {
@@ -502,15 +544,27 @@ mod tests {
             inner: vec![GgmlType::Q8_0, GgmlType::BF16],
             outer: vec![GgmlType::Q8_0],
             forms: RingForms::BLOCKS32,
+            gate_up_nvfp4: true,
+            down_nvfp4: true,
         };
         let f32s =
             512 * (29 * 2304 + 4 * 3072 + 4 * 1024 + 384 + 24 + 64 + 2 + 192 + 128 + 8 + 18_432);
         assert_eq!(f32s, 512 * 102_434);
         let forms = 3_440_640 + 4_176 + 45_139_464;
         assert_eq!(
-            pass_bytes(&mini, 512),
+            pass_bytes(&mini, 512, false),
             4 * (f32s + 512 * 12 + 1) as u64 + forms
         );
-        assert_eq!(pass_bytes(&mini, 512), 258_393_692);
+        assert_eq!(pass_bytes(&mini, 512, false), 258_393_692);
+        assert_eq!(
+            pass_bytes(&mini, 512, true),
+            258_393_692 + 512 * 1_300 + 4_096 * 652
+        );
+        let q8 = PassShape {
+            gate_up_nvfp4: false,
+            down_nvfp4: false,
+            ..mini
+        };
+        assert_eq!(pass_bytes(&q8, 512, true), pass_bytes(&q8, 512, false));
     }
 }

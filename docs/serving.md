@@ -433,6 +433,14 @@ One CUDA driver variable is set for you: unset, `CUDA_SCALE_LAUNCH_QUEUES` becom
 stream, so a prompt batch's host thread does not wait on it); NVIDIA's other values (`0.25x`, `0.5x`, `4x`) are kept,
 and any other value stops the binary at start with a message, where the driver would ignore it.
 
+**Inkling 2's prompt pass: `BLOOMERY_INK2_PASS_ACT`.** On a file whose experts are NVFP4 (the Mini's `UD-Q4_K_XL`) and a
+build for a card with FP4 tensor cores, the prompt pass quantizes the rows that enter each expert GEMM to FP4 and runs
+the GEMMs on the card's FP4 product (`full`, the default). That is the faster path and it rounds the rows more coarsely
+than 8 bits do, so a prompt's first token and the cache it leaves differ slightly from the 8-bit pass's. `gate-up`
+keeps the rows of the down GEMM in 8 bits and gives back part of the speed; `exact` keeps every expert GEMM on 8-bit
+rows, the pass as it ran before FP4 rows. Only the prompt pass reads it: decode steps, a draft's verify rows and layers
+whose experts are not NVFP4 run the same under all three words. A word that is not one of them stops the start by name.
+
 ## 8. Running it as a service
 
 ### 8.1 API keys and binding

@@ -31,12 +31,15 @@
 //! until the slot's next reset, and each prompt call (or the first step when
 //! the call is empty) prints an `mtp prompt` record that names why.
 //!
-//! The lookup draft (`runtime::Lookup`, `BLOOMERY_DRAFT=lookup`) has one
-//! owner too, [`Lookups`]: it needs no weights and no draft side in the
-//! body, only a body whose session verifies rows, so every seat whose body
-//! has a multi-row pass serves it through this one type, the MTP table
+//! The drafts of the token history (`runtime::Lookup`, `BLOOMERY_DRAFT=lookup`,
+//! and `runtime::Recall`, `BLOOMERY_DRAFT=recall`) have one owner too,
+//! [`Lookups`]: they need no weights and no draft side in the body, only a
+//! body whose session verifies rows, so every seat whose body has a multi-row
+//! pass serves one through this one type, the MTP table
 //! ([`SlotDrafts::lookup`]) and the served draft (`served::ServedDraft`)
-//! alike.
+//! alike. The owner drives a draft through [`HistoryDraft`] and holds its pass
+//! width as the type of its window, so a history draft is a type and its
+//! rule, never a copy of the owner.
 
 use app::mtp::{MtpBody, MtpDraft, Parked, ParkedBytes, SlotWalks, SlotWindow, prompt_media};
 use app::{Draw, Keep, Prompt, RoundWindow, RowsLog, Session, SessionError};
@@ -51,8 +54,8 @@ use bloomery_gpu_gates::record::{self, Record};
 use runtime::prompt::CallEnd;
 use runtime::width::{Choosing, Chosen, Clock, Mode as WidthMode, Wall};
 use runtime::{
-    Advance, Argmax, Committed, Draft, Lookup, Pick, Plain, RowLogits, Sample, SampleBest,
-    Speculative, Target, Verify, Want, WidthError, Widths, Window,
+    Advance, Argmax, Committed, Draft, HistoryDraft, Lookup, Pick, Plain, RowLogits, Rule, Sample,
+    SampleBest, Speculative, Target, Verify, Want, WidthError, Widths, Window,
 };
 use serve::{DraftProps, Drafted, EngineProps, Sampler};
 
@@ -62,6 +65,17 @@ use super::rounds::{RoundDrafts, RoundRow};
 /// the lookup's one proposed id (its `WIDTH` + 1, which
 /// [`Session::with_draft`] holds it to).
 pub(crate) const LOOKUP_ROWS: usize = 2;
+
+/// The rows a recall pass verifies on a body whose pass holds eight rows
+/// ([`Verify::MAX_ROWS`]): the token at the target's position and the
+/// recall draft's seven proposed ids. A seat names this pair beside the
+/// body's own limit, so a body of fewer rows fails to compile where it
+/// would drive it ([`Draft::FITS`]), and the draft word is refused there by
+/// name.
+pub(crate) const RECALL_ROWS: usize = 8;
+
+/// The most ids a recall proposal holds on a body of [`RECALL_ROWS`] rows.
+pub(crate) const RECALL_WIDTH: usize = RECALL_ROWS - 1;
 
 /// The selected slot's token history, for a target that keeps one: the ids
 /// of the positions before the target's, in order.
@@ -85,11 +99,14 @@ pub(crate) fn reads_best(best: Option<usize>) -> bool {
     best.is_some_and(|k| k <= best::BEST)
 }
 
-/// A slot's lookup window behind its width chooser, as [`Lookups`] drives
-/// it: a trait object, so the owner is generic over its target alone.
+/// A slot's history-draft window behind its width chooser, as [`Lookups`]
+/// drives it: a trait object, so the owner is generic over its target alone,
+/// whichever draft and pass width the window holds.
 trait LookupWindow<T> {
-    fn lookup(&self) -> &Lookup;
-    fn lookup_mut(&mut self) -> &mut Lookup;
+    fn history(&self) -> &dyn HistoryDraft;
+    fn history_mut(&mut self) -> &mut dyn HistoryDraft;
+    /// The rows one pass of this window verifies.
+    fn rows(&self) -> usize;
     /// The chooser's record of the request before printed
     /// ([`print_widths`]), then its pass in flight discarded.
     fn close(&mut self);
@@ -118,18 +135,24 @@ trait LookupWindow<T> {
     fn unprinted(&mut self) -> u64;
 }
 
-impl<T, C> LookupWindow<T> for Speculative<Choosing<Lookup, C>, LOOKUP_ROWS>
+impl<T, D, C, const M: usize> LookupWindow<T> for Speculative<Choosing<D, C>, M>
 where
     T: Verify + RowLogits,
     T::Error: From<WidthError> + std::error::Error + 'static,
+    D: Draft<T> + HistoryDraft,
     C: Clock,
+    Window<M>: Widths,
 {
-    fn lookup(&self) -> &Lookup {
+    fn history(&self) -> &dyn HistoryDraft {
         self.draft().draft()
     }
 
-    fn lookup_mut(&mut self) -> &mut Lookup {
+    fn history_mut(&mut self) -> &mut dyn HistoryDraft {
         self.draft_mut().draft_mut()
+    }
+
+    fn rows(&self) -> usize {
+        M
     }
 
     fn close(&mut self) {
@@ -215,16 +238,17 @@ enum Call {
     Moved,
 }
 
-/// The lookup draft a seat serves, its one owner: each resident slot's
+/// The history draft a seat serves (the lookup of [`LOOKUP_ROWS`] rows, or
+/// the recall draft of [`RECALL_ROWS`]), its one owner: each resident slot's
 /// window over its own context behind its own width chooser, as each slot
 /// has its own MTP draft ([`SlotDrafts::open`]), verified by the target's
-/// pass of [`LOOKUP_ROWS`] rows. A chooser's acceptance, costs, pass in
+/// pass of the window's rows ([`Lookups::rows`]). A chooser's acceptance, costs, pass in
 /// flight and request record are its slot's alone: slots that take turns
 /// neither drop nor mix each other's. Every call reaches a slot's context
 /// through [`Lookups::at`], which closes the slot's chooser for the call's
 /// kind ([`Call`]) first.
 /// A context follows its slot by the positions the calls stand at
-/// ([`Lookup::stand`]): a cut back needs nothing told, the next call keeps
+/// ([`HistoryDraft::stand`]): a cut back needs nothing told, the next call keeps
 /// the context below its position. A slot whose sequence is put back from a
 /// saved state is forgotten ([`Lookups::forget`]) or given the context saved
 /// with it ([`Lookups::unpark`]). On a target that keeps its token history
@@ -241,14 +265,9 @@ pub(crate) struct Lookups<T> {
 }
 
 impl<B: Prompt + Keep + Rows + Rollback> Lookups<Session<B>> {
-    /// The lookup of `slots` resident slots on `s`, each behind a width
-    /// chooser of `mode`. Each slot the session serves now opens its window
-    /// through [`Session::with_draft`] with that slot selected, which
-    /// captures the verify pass on that slot (`log` told of it), as
-    /// [`SlotDrafts::open`] does; a slot the seat adds after captures on its
-    /// first verify. Slot 0 is selected after. Load-time; refused by name for
-    /// no slot and a rule the chooser cannot run by.
-    pub(crate) fn open(
+    /// The lookup draft ([`LOOKUP_ROWS`] rows) on `slots` resident slots
+    /// ([`Lookups::open`]).
+    pub(crate) fn lookup(
         s: &mut Session<B>,
         slots: usize,
         mode: WidthMode,
@@ -259,25 +278,44 @@ impl<B: Prompt + Keep + Rows + Rollback> Lookups<Session<B>> {
         B: Slots,
         B::Seq: 'static,
     {
+        Self::open::<Lookup, LOOKUP_ROWS>(s, slots, mode, log, history, Lookup::new, Lookup::RULE)
+    }
+
+    /// `draft` (a fresh one a slot) over `slots` resident slots on `s`, each
+    /// behind a width chooser of `mode` by `rule`, its window `M` =
+    /// [`Draft::WIDTH`] + 1 rows. Each slot the session serves now opens its
+    /// window through [`Session::with_draft`] with that slot selected, which
+    /// captures the verify pass of every width on that slot (`log` told of
+    /// each), as [`SlotDrafts::open`] does; a slot the seat adds after
+    /// captures on its first verify. Slot 0 is selected after. Load-time;
+    /// refused by name for no slot and a rule the chooser cannot run by.
+    pub(super) fn open<D, const M: usize>(
+        s: &mut Session<B>,
+        slots: usize,
+        mode: WidthMode,
+        log: &mut impl RowsLog,
+        history: Option<History<Session<B>>>,
+        draft: impl Fn() -> D,
+        rule: Rule,
+    ) -> Result<Self, GateError>
+    where
+        B: Slots,
+        B::Seq: 'static,
+        D: Draft<Session<B>> + HistoryDraft + 'static,
+        Window<M>: Widths,
+    {
         record::require(record::groups::drafted::WIDTH, "drafted::Lookups::open");
         if slots == 0 {
-            return Err("the lookup draft of no slot".into());
+            return Err(format!("the {} draft of no slot", draft().kind()).into());
         }
-        let choosing = || {
-            <Lookup as Chosen<Session<B>>>::choosing_by(
-                Lookup::new(),
-                mode,
-                Lookup::RULE,
-                Wall::new(),
-            )
-        };
+        let choosing = || <D as Chosen<Session<B>>>::choosing_by(draft(), mode, rule, Wall::new());
         let mut windows: Vec<Box<dyn LookupWindow<Session<B>>>> = Vec::with_capacity(slots);
         for slot in 0..slots {
             if slot < s.slots() {
                 s.select_slot(slot)?;
-                windows.push(Box::new(s.with_draft::<_, LOOKUP_ROWS>(choosing()?, log)?));
+                windows.push(Box::new(s.with_draft::<_, M>(choosing()?, log)?));
             } else {
-                windows.push(Box::new(Speculative::<_, LOOKUP_ROWS>::new(choosing()?)));
+                windows.push(Box::new(Speculative::<_, M>::new(choosing()?)));
             }
         }
         s.select_slot(0)?;
@@ -289,10 +327,45 @@ impl<B: Prompt + Keep + Rows + Rollback> Lookups<Session<B>> {
     }
 }
 
+impl<T> Lookups<T> {
+    /// The rows one pass of the draft verifies: its [`Draft::WIDTH`] + 1.
+    pub(crate) fn rows(&self) -> usize {
+        self.window(0).rows()
+    }
+
+    /// The draft's name, as `/props` and `BLOOMERY_DRAFT` spell it.
+    fn kind(&self) -> &'static str {
+        self.window(0).history().kind()
+    }
+
+    /// `p` with `engine.draft` the history draft's: its name and the ids a
+    /// pass proposes (its rows less the token at the position); no file, no
+    /// device bytes.
+    pub(crate) fn props(&self, mut p: EngineProps) -> EngineProps {
+        let kind = self.kind();
+        p.draft = Some(DraftProps {
+            model: kind.to_owned(),
+            n_max: Some(self.rows() as u64 - 1),
+            kind: Some(kind.to_owned()),
+            ..DraftProps::default()
+        });
+        p
+    }
+
+    /// A window of the table: every slot's holds the same draft and width,
+    /// and the table holds a slot at least ([`Lookups::open`] refuses none).
+    fn window(&self, slot: usize) -> &dyn LookupWindow<T> {
+        self.windows
+            .get(slot)
+            .expect("a history-draft table holds a window a slot, and a slot at least")
+            .as_ref()
+    }
+}
+
 impl<T: Target> Lookups<T> {
     /// `slot`'s context, the slot's chooser closed for `call` first: the one
     /// way to a slot's context. Refused by name past the slots.
-    fn at(&mut self, slot: usize, call: Call) -> Result<&mut Lookup, GateError> {
+    fn at(&mut self, slot: usize, call: Call) -> Result<&mut dyn HistoryDraft, GateError> {
         let slots = self.windows.len();
         let w = self
             .windows
@@ -301,7 +374,7 @@ impl<T: Target> Lookups<T> {
         if let Call::Moved = call {
             w.close();
         }
-        Ok(w.lookup_mut())
+        Ok(w.history_mut())
     }
 
     /// [`Lookups::at`], the context rebuilt from the target's history of the
@@ -312,7 +385,7 @@ impl<T: Target> Lookups<T> {
         slot: usize,
         pos: usize,
         call: Call,
-    ) -> Result<&mut Lookup, GateError> {
+    ) -> Result<&mut dyn HistoryDraft, GateError> {
         let history = self.history.and_then(|h| h(t)).filter(|h| h.len() >= pos);
         let l = self.at(slot, call)?;
         if l.context().len() < pos
@@ -432,7 +505,7 @@ impl<T: Target> Lookups<T> {
     /// `slot`'s context, for a state the seat saves of that slot.
     pub(crate) fn park(&self, slot: usize) -> Result<Vec<u32>, GateError> {
         match self.windows.get(slot) {
-            Some(w) => Ok(w.lookup().context().to_vec()),
+            Some(w) => Ok(w.history().context().to_vec()),
             None => Err(format!("slot {slot}: the lookup draft holds no such slot").into()),
         }
     }
@@ -461,18 +534,6 @@ pub(crate) fn drafted(c: Committed) -> Drafted {
     } else {
         Drafted::default()
     }
-}
-
-/// `engine.draft` of the lookup draft ([`Lookups`]): no file, no device
-/// bytes.
-pub(crate) fn lookup_props(mut p: EngineProps) -> EngineProps {
-    p.draft = Some(DraftProps {
-        model: "lookup".to_owned(),
-        n_max: Some(LOOKUP_ROWS as u64 - 1),
-        kind: Some("lookup".to_owned()),
-        ..DraftProps::default()
-    });
-    p
 }
 
 /// A slot's draft side of a saved sequence ([`SlotDrafts::park`]): what the
@@ -601,7 +662,7 @@ where
         }
     }
 
-    /// The lookup draft on each of `slots` resident slots ([`Lookups::open`]:
+    /// The lookup draft on each of `slots` resident slots ([`Lookups::lookup`]:
     /// each slot's verify pass captured now, `log` told of each, behind the
     /// width chooser of `mode`) in place of the MTP draft: no slot's draft is
     /// ever off, and a cut or a state put back needs no rejoin. Load-time.
@@ -619,7 +680,7 @@ where
             specs: Vec::new(),
             batch: runtime::width::Batch::default(),
             off: Vec::new(),
-            lookups: Some(Lookups::open(s, slots, mode, log, None)?),
+            lookups: Some(Lookups::lookup(s, slots, mode, log, None)?),
         })
     }
 
@@ -683,6 +744,15 @@ where
     /// Whether the lookup draft runs ([`SlotDrafts::lookup`]).
     pub(crate) fn looks_up(&self) -> bool {
         self.lookups.is_some()
+    }
+
+    /// `p` with `engine.draft` the lookup draft's ([`Lookups::props`]); `p`
+    /// as it was where the table runs none.
+    pub(crate) fn lookup_props(&self, p: EngineProps) -> EngineProps {
+        match &self.lookups {
+            Some(l) => l.props(p),
+            None => p,
+        }
     }
 
     /// Whether `slot` drafts through a window of the table: false with no
@@ -1083,8 +1153,8 @@ where
     /// The most positions one pass on `slot` runs: a window's rows while its
     /// draft runs, one step's without it or while it is off.
     pub(crate) fn pass_rows(&self, slot: usize) -> usize {
-        if self.lookups.is_some() {
-            return LOOKUP_ROWS;
+        if let Some(l) = &self.lookups {
+            return l.rows();
         }
         match (self.specs.get(slot), self.is_off(slot)) {
             (Some(Some(_)), false) => <Spec<B, M> as Advance<Session<B>>>::ROWS,
@@ -1297,8 +1367,9 @@ where
     }
 }
 
-/// The lookup's round of several slots' windows: each busy slot's context
-/// stood at its slot's position and asked for its one id, then the windows
+/// The history draft's round of several slots' windows: each busy slot's
+/// context stood at its slot's position and asked for up to the slot's width
+/// of ids, then the windows
 /// verified together ([`Session::verify_rounds`]), each context given the
 /// ids its rows kept, as [`Draft::accept`] and [`Draft::stepped`] give them
 /// on one slot. Each slot's chooser is bypassed, as the MTP table's is.
@@ -1345,17 +1416,17 @@ where
     ) -> Result<(Vec<Committed>, usize), GateError> {
         let mut rows = Vec::with_capacity(round.len());
         let mut firsts = Vec::with_capacity(round.len());
+        let most = (self.rows() - 1).min(RECALL_WIDTH);
         for r in round.iter() {
             s.select_slot(r.slot)?;
             let pos = s.pos();
             let l = self.before(s, r.slot, pos as usize, Call::Pass)?;
             l.stand(pos as usize, r.last);
             let mut ids = vec![r.last];
-            if r.width > 0
-                && let Some(id) = Lookup::propose(l)
-            {
-                ids.push(id);
-            }
+            let mut proposal = [0u32; RECALL_WIDTH];
+            let room = r.width.min(most);
+            let n = l.propose_ids(&mut proposal[..room]);
+            ids.extend_from_slice(&proposal[..n]);
             rows.push(ids);
             firsts.push(pos);
         }
@@ -1377,7 +1448,7 @@ where
             .collect();
         let contexts = &mut self.windows;
         Ok(s.verify_rounds(&mut windows, |i, ids, kept| {
-            let l = contexts[slots[i]].lookup_mut();
+            let l = contexts[slots[i]].history_mut();
             ids[..kept].iter().for_each(|&id| l.push(id));
             Ok(())
         })?)
@@ -1459,7 +1530,7 @@ pub(crate) fn print_widths<D, C: Clock, const M: usize>(spec: &mut Speculative<C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::Out;
+    use runtime::{Out, Recall};
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::Duration;
@@ -1582,6 +1653,9 @@ mod tests {
     const STEP: Duration = Duration::from_millis(10);
     const VERIFY: Duration = Duration::from_micros(13_500);
     const PROMPT: Duration = Duration::from_millis(40);
+    /// What a verified row yields once an earlier row did not hold the
+    /// stream's id: an id no stream holds.
+    const POISON: u32 = u32::MAX;
 
     /// A target that walks a fixed id stream, the id at position `i` its
     /// `ids[i % len]` and each call's argmax the id at the position after
@@ -1665,14 +1739,25 @@ mod tests {
     }
 
     impl Verify for Position {
-        const MAX_ROWS: usize = LOOKUP_ROWS;
-        fn verify<const M: usize>(&mut self, _: [u32; M]) -> Result<[u32; M], WidthError> {
+        const MAX_ROWS: usize = RECALL_ROWS;
+        /// Causal: row `r`'s argmax is the stream's id after position
+        /// `at + r` while every row up to it held the stream's own id, and
+        /// `POISON` once one did not, so a pass that keeps what stood past a
+        /// refused row keeps ids no stream holds.
+        fn verify<const M: usize>(&mut self, rows: [u32; M]) -> Result<[u32; M], WidthError> {
             let at = self.pos;
             self.verified = u32::try_from(M).unwrap();
             self.pos += self.verified;
             self.took(self.verify_wall);
+            let mut standing = true;
             Ok(std::array::from_fn(|r| {
-                self.id(at + 1 + u32::try_from(r).unwrap())
+                let r = u32::try_from(r).unwrap();
+                standing &= rows[r as usize] == self.id(at + r);
+                if standing {
+                    self.id(at + 1 + r)
+                } else {
+                    POISON
+                }
             }))
         }
         fn commit(&mut self, accepted: usize) -> Result<(), WidthError> {
@@ -1695,18 +1780,22 @@ mod tests {
         }
     }
 
-    /// The lookup of `slots` slots under the cost mode, by `rule`, on
-    /// `clock`.
-    fn lookups(slots: usize, rule: runtime::Rule, clock: &Rc<Cell<Duration>>) -> Lookups<Position> {
+    /// `slots` windows of the history draft `draft` makes (one a slot), `M`
+    /// rows each, under `mode` by `rule`, on `clock`.
+    fn table<D, const M: usize>(
+        slots: usize,
+        draft: impl Fn() -> D,
+        (mode, rule): (WidthMode, Rule),
+        clock: &Rc<Cell<Duration>>,
+    ) -> Lookups<Position>
+    where
+        D: Draft<Position> + HistoryDraft + 'static,
+        Window<M>: Widths,
+    {
         let window = |_| -> Box<dyn LookupWindow<Position>> {
-            Box::new(Speculative::<_, LOOKUP_ROWS>::new(
-                <Lookup as Chosen<Position>>::choosing_by(
-                    Lookup::new(),
-                    WidthMode::Cost,
-                    rule,
-                    Shared(Rc::clone(clock)),
-                )
-                .unwrap(),
+            Box::new(Speculative::<_, M>::new(
+                <D as Chosen<Position>>::choosing_by(draft(), mode, rule, Shared(Rc::clone(clock)))
+                    .unwrap(),
             ))
         };
         Lookups {
@@ -1714,6 +1803,23 @@ mod tests {
             history: None,
             batch: runtime::width::Batch::default(),
         }
+    }
+
+    /// The lookup of `slots` slots under the cost mode, by `rule`, on
+    /// `clock`.
+    fn lookups(slots: usize, rule: Rule, clock: &Rc<Cell<Duration>>) -> Lookups<Position> {
+        table::<Lookup, LOOKUP_ROWS>(slots, Lookup::new, (WidthMode::Cost, rule), clock)
+    }
+
+    /// The recall draft of `slots` slots as a seat serves it, every width
+    /// verified (`Fixed`), on `clock`.
+    fn recalls(slots: usize, clock: &Rc<Cell<Duration>>) -> Lookups<Position> {
+        table::<Recall<RECALL_WIDTH>, RECALL_ROWS>(
+            slots,
+            Recall::served,
+            (WidthMode::Fixed, Recall::<RECALL_WIDTH>::RULE),
+            clock,
+        )
     }
 
     /// What `slot`'s chooser's gate stands on.
@@ -1746,7 +1852,7 @@ mod tests {
         let mut l = lookups(1, Lookup::RULE, &clock);
         t.begin(&mut l, 0);
         t.begin(&mut l, 0);
-        assert_eq!(l.windows[0].lookup().context(), &ids[..3]);
+        assert_eq!(l.windows[0].history().context(), &ids[..3]);
     }
 
     #[test]
@@ -1769,7 +1875,7 @@ mod tests {
             let choosing = <Lookup as Chosen<Position>>::choosing_by(
                 Lookup::new(),
                 WidthMode::Cost,
-                runtime::Rule {
+                Rule {
                     min_timings: 1,
                     ..Lookup::RULE
                 },
@@ -1834,7 +1940,7 @@ mod tests {
         let mut wrong = Vec::new();
         for (what, between) in cases {
             let clock = Rc::new(Cell::new(Duration::ZERO));
-            let rule = runtime::Rule {
+            let rule = Rule {
                 min_timings: 1,
                 ..Lookup::RULE
             };
@@ -1921,5 +2027,197 @@ mod tests {
                 "slot {slot}: the gate stays open, {state:?}"
             );
         }
+    }
+
+    /// A stream whose id at position `i` is `phrase[i % phrase.len()]` for
+    /// the first `n` positions, then `tail` made after: two such streams
+    /// agree below `n` and part there, as a sequence that was cut back and
+    /// went on differently does.
+    fn stream(phrase: &[u32], n: usize, tail: u32, len: usize) -> Rc<[u32]> {
+        (0..len)
+            .map(|i| {
+                if i < n {
+                    phrase[i % phrase.len()]
+                } else {
+                    tail + u32::try_from(i).unwrap()
+                }
+            })
+            .collect()
+    }
+
+    /// One pass on `slot` from the stream's id at the target's position: the
+    /// ids it kept and what it drafted.
+    fn passed(t: &mut Position, l: &mut Lookups<Position>, slot: usize) -> (Drafted, Vec<u32>) {
+        let last = t.id(t.pos);
+        let mut out = Vec::new();
+        let drafted = l.pass(t, slot, last, Taking::Argmax, &mut out).unwrap();
+        (drafted, out)
+    }
+
+    const PHRASE: [u32; 10] = [7, 3, 9, 4, 8, 1, 6, 2, 5, 0];
+
+    /// The phrase repeated, every `every`th position (the last of each run)
+    /// an id the phrase never holds: a stream that a draft of the history
+    /// follows for a while and is refused on.
+    fn glitched(phrase: &[u32], every: usize, len: usize) -> Rc<[u32]> {
+        (0..len)
+            .map(|i| {
+                if i % every == every - 1 {
+                    9000 + u32::try_from(i).unwrap()
+                } else {
+                    phrase[i % phrase.len()]
+                }
+            })
+            .collect()
+    }
+
+    /// The recall draft behind the one owner keeps the target's own ids
+    /// whatever it proposed (the kept ids are the plain stream's, pass after
+    /// pass, the refused rows' ids never kept), proposes nothing before its
+    /// context holds a match, and then proposes its whole width and has it
+    /// kept until the stream breaks the phrase, where the pass keeps what
+    /// stood and no more. Mutants: a kept id past what the pass verified or
+    /// past a refused row, a proposal short of the width, one before any
+    /// match.
+    #[test]
+    fn a_recall_window_keeps_the_streams_own_ids_and_drafts_its_width() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let ids = glitched(&PHRASE, 23, 4096);
+        let mut t = Position::new(&ids, &clock);
+        let mut l = recalls(1, &clock);
+        t.begin(&mut l, 0);
+        assert_eq!(l.rows(), RECALL_ROWS);
+        assert_eq!(l.kind(), "recall");
+        let (mut got, mut passes, mut drafted_at) = (Vec::new(), 0, Vec::new());
+        while got.len() < 200 {
+            let (d, out) = passed(&mut t, &mut l, 0);
+            drafted_at.push(d);
+            got.extend(out);
+            passes += 1;
+        }
+        let want: Vec<u32> = (2..2 + got.len()).map(|i| ids[i]).collect();
+        assert_eq!(got, want, "the kept ids are the stream's own");
+        assert_eq!(
+            drafted_at[0],
+            Drafted::default(),
+            "no match yet, no proposal"
+        );
+        let whole = Drafted {
+            proposed: RECALL_WIDTH,
+            accepted: RECALL_WIDTH,
+        };
+        assert!(
+            drafted_at.contains(&whole),
+            "a run of the phrase is matched and its whole width kept: {drafted_at:?}"
+        );
+        assert!(
+            drafted_at
+                .iter()
+                .any(|d| d.proposed > 0 && d.accepted < d.proposed),
+            "the stream breaks the phrase and a proposal is refused: {drafted_at:?}"
+        );
+        assert!(
+            drafted_at.iter().all(|d| d.accepted <= d.proposed),
+            "{drafted_at:?}"
+        );
+        assert!(
+            passes * 2 < got.len(),
+            "{passes} passes kept {} ids: the draft pays",
+            got.len()
+        );
+    }
+
+    /// A target that is cut back and goes on differently leaves no id of the
+    /// tail it left in the draft's context: the context follows the
+    /// positions the calls stand at. Mutant: a pass that does not stand its
+    /// context at the target's position keeps the old tail.
+    #[test]
+    fn a_cut_leaves_no_stale_tail_in_a_recall_context() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let cut = 14;
+        let first = stream(&PHRASE, usize::MAX, 0, 4096);
+        let then = stream(&PHRASE, cut, 1000, 4096);
+        let mut t = Position::new(&first, &clock);
+        let mut l = recalls(1, &clock);
+        t.begin(&mut l, 0);
+        while (t.pos() as usize) < cut + 12 {
+            passed(&mut t, &mut l, 0);
+        }
+        t.cut(u32::try_from(cut).unwrap()).unwrap();
+        t.ids = Rc::clone(&then);
+        let mut got = Vec::new();
+        for _ in 0..4 {
+            got.extend(passed(&mut t, &mut l, 0).1);
+        }
+        let ctx = l.windows[0].history().context().to_vec();
+        assert_eq!(
+            ctx[..],
+            then[..ctx.len()],
+            "the context is the new sequence"
+        );
+        assert_eq!(
+            got[..],
+            then[cut + 1..cut + 1 + got.len()],
+            "and its ids kept"
+        );
+    }
+
+    /// A state put back as a slot's context (a saved side) is the context
+    /// the draft then proposes from, whichever history draft saved it: what
+    /// the lookup parked puts back under the recall draft and the reverse,
+    /// and the table proposes what a fresh one built over the same ids
+    /// does. Mutants: a put back that starts the context over; one that
+    /// leaves the tables as they were.
+    #[test]
+    fn a_state_put_back_is_the_context_a_recall_draft_proposes_from() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let ids = stream(&PHRASE, usize::MAX, 0, 4096);
+        let mut t = Position::new(&ids, &clock);
+        let mut lookup = lookups(1, Lookup::RULE, &clock);
+        t.begin(&mut lookup, 0);
+        for _ in 0..30 {
+            passed(&mut t, &mut lookup, 0);
+        }
+        let saved = lookup.park(0).unwrap();
+        assert!(saved.len() > 30, "the lookup held the sequence");
+        let mut recall = recalls(2, &clock);
+        // Slot 1 holds another sequence; slot 0 takes the saved state.
+        recall.unpark(1, &[1, 2, 3, 1, 2]).unwrap();
+        recall.unpark(0, &saved).unwrap();
+        assert_eq!(recall.park(0).unwrap(), saved);
+        let mut fresh = Recall::<RECALL_WIDTH>::served();
+        fresh.rebuild(&saved);
+        let (mut want, mut got) = ([0u32; RECALL_WIDTH], [0u32; RECALL_WIDTH]);
+        let w = fresh.propose_ids(&mut want);
+        let g = recall.windows[0].history().propose_ids(&mut got);
+        assert_eq!((g, got), (w, want), "the same ids from the same context");
+        assert_eq!(w, RECALL_WIDTH, "the saved sequence is a periodic match");
+        assert_eq!(recall.park(1).unwrap(), [1, 2, 3, 1, 2], "slot 1 untouched");
+        let back = recall.park(0).unwrap();
+        lookup.unpark(0, &back).unwrap();
+        assert_eq!(lookup.park(0).unwrap(), saved, "and the other way");
+    }
+
+    /// `/props` names the history draft the table holds and its width.
+    #[test]
+    fn props_name_the_history_draft_and_its_width() {
+        let clock = Rc::new(Cell::new(Duration::ZERO));
+        let rows = |l: &Lookups<Position>| (l.kind(), l.rows());
+        let (lookup, recall) = (lookups(1, Lookup::RULE, &clock), recalls(1, &clock));
+        assert_eq!(rows(&lookup), ("lookup", 2));
+        assert_eq!(rows(&recall), ("recall", RECALL_ROWS));
+        let drafts = |p: EngineProps| p.draft.unwrap();
+        let (lookup, recall) = (
+            drafts(lookup.props(EngineProps::default())),
+            drafts(recall.props(EngineProps::default())),
+        );
+        assert_eq!(
+            (recall.model.as_str(), recall.kind.as_deref(), recall.n_max),
+            ("recall", Some("recall"), Some(7))
+        );
+        assert_eq!(
+            (lookup.model.as_str(), lookup.kind.as_deref(), lookup.n_max),
+            ("lookup", Some("lookup"), Some(1))
+        );
     }
 }
