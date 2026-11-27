@@ -1,0 +1,18 @@
+# Inkling 2's `rel_bias` attention kernel on a 16-byte cp.async double buffer with two tiles in flight and a per-lane
+# bias read; bit-identical to main (the attention gate's 72 clauses and a probe's bits). [measured, nsys on the 5090] the
+# ring pass at depth 512 warm 8.10 -> 3.10 us and the plane pass 5.09 -> 3.26 us a launch; [look, no lease] serve tg
+# 160.6 -> 170.9 tok/s at P=512 (+6.4 %) and 158.5 -> 166.1 at P=4096 (+4.8 %). The band is the look with its ruler: the
+# look had no lease and one session an arm.
+kind: ab
+question: does the regridded rel_bias kernel give Inkling 2 Mini the decode speed its untimed look showed?
+term: tg tok/s @ n=256, prose, depth 512, Inkling 2 Mini UD-Q4_K_XL, RTX 5090, bloomery-serve at the serving defaults,
+  one fresh server an arm and a round, the regridded kernel against main
+unit: %
+predict: 4..9
+rounds: 5
+sd: 0.6 % same-binary runs (AGENTS.md "Know the ruler")
+condition: one lease; arms bloomery:512 and bloomery-inkattn:512, then the same pair at depth 4096 read in their own
+  table (look: +4.8 %); no compute process on the 5090 but ours
+decide-in: land the kernel (its gates are green on the fixture tier)
+decide-below: under 4 %: the look overstated it; read the nsys rows again before landing a kernel for less
+decide-above: over 9 %: more than the two passes moved; read which before landing
