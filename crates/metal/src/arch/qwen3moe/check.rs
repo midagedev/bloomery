@@ -2546,6 +2546,7 @@ mod tests {
                 requested: 313_808_912,
                 paged: 313_835_520,
             },
+            pipelines: Tally::default(),
             copies: Tally::default(),
         };
         let free = 19_069_665_280u64;

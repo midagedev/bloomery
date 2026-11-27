@@ -32,7 +32,7 @@ use crate::library::Library;
 use crate::residency::Alloc;
 use crate::session::clock::Stepped;
 use crate::session::pass::{PassOut, Passed};
-use crate::session::room::Bytes;
+use crate::session::room::{Bytes, Tally};
 use crate::stream::MetalStream;
 
 /// The family's name in an error.
@@ -176,6 +176,8 @@ pub struct Session {
     arena: Arena,
     /// The prompt pass's buffers.
     rows: PassBufs,
+    /// The bytes the open's pipeline build took of the device.
+    pipelines: u64,
     prefill: PrefillMode,
     pos: u32,
     poisoned: Option<Fault>,
@@ -255,7 +257,13 @@ impl Session {
             .ok()
             .and_then(|r| r.spec.logit_epilogue)
             .map_or(1.0, |e| e.scale);
+        // The pipelines are the one thing the open takes that is no buffer and
+        // no formula of the file prices: the driver's count grows by what
+        // building them takes, which is read where they are built (a count that
+        // fell meanwhile, a session freed on the device, reads as none).
+        let built_from = device.allocated_bytes()?;
         let kernels = Kernels::from_library(library)?;
+        let pipelines = device.allocated_bytes()?.saturating_sub(built_from);
         let mut stream = device.new_stream()?;
         stream.enable_residency(device.metal())?;
         let residency = stream
@@ -281,6 +289,7 @@ impl Session {
             checked,
             arena,
             rows,
+            pipelines,
             prefill,
             pos: 0,
             poisoned: None,
@@ -315,10 +324,15 @@ impl Session {
         &self.checked
     }
 
-    /// The bytes the open's buffers were planned at.
+    /// The bytes the open took of the device: its buffers at the byte
+    /// formula's figures, and the pipelines at the growth the open measured
+    /// building them.
     #[must_use]
     pub fn bytes(&self) -> Bytes {
-        self.checked.bytes()
+        Bytes {
+            pipelines: Tally::measured(self.pipelines),
+            ..self.checked.bytes()
+        }
     }
 
     /// Run `id` at [`Session::pos`] and pick the next id.

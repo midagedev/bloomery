@@ -18,6 +18,17 @@ pub struct Tally {
 }
 
 impl Tally {
+    /// A class the driver's count grew by `bytes` for, made of no buffer of
+    /// ours: what a session measured, not what a formula planned.
+    #[must_use]
+    pub const fn measured(bytes: u64) -> Self {
+        Self {
+            buffers: 0,
+            requested: bytes,
+            paged: bytes,
+        }
+    }
+
     /// Adds one buffer of `bytes`: the family's byte plan calls this, a
     /// macOS module.
     #[cfg(target_os = "macos")]
@@ -28,12 +39,19 @@ impl Tally {
     }
 }
 
-/// The bytes a session makes buffers of, by class: the file's weights, the
+/// The bytes a session takes of the driver, by class: the file's weights, the
 /// attention caches, the recurrent stores, the token arena's other buffers
-/// and the rows arena, which the open makes, and the copies the session
-/// makes after it: a pass's mark copies and the checkpoints the budget
-/// grants at the cache's rows (a buffer a store a point, made a point at a
-/// time).
+/// and the rows arena, which the open makes buffers of, the compute pipelines
+/// the open builds, and the copies the session makes after it: a pass's mark
+/// copies and the checkpoints the budget grants at the cache's rows (a buffer
+/// a store a point, made a point at a time).
+///
+/// The driver counts a pipeline's bytes in its allocated size beside the
+/// buffers', and no byte formula of a file reaches them: they are the
+/// library's, found by building them. A header's plan therefore holds none
+/// (`pipelines` is empty), and the session that built them holds the
+/// growth its open measured there, so that its tally names every byte the
+/// open took.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bytes {
     pub weights: Tally,
@@ -41,15 +59,25 @@ pub struct Bytes {
     pub state: Tally,
     pub scratch: Tally,
     pub rows: Tally,
+    /// The compute pipelines the open built, as the driver's count grew
+    /// across the build ([`Tally::measured`]); empty in a plan made from a
+    /// header.
+    pub pipelines: Tally,
     pub copies: Tally,
 }
 
 impl Bytes {
-    /// The classes the open makes buffers of, together: every class but the
-    /// copies.
+    /// The classes the open takes, together: every class but the copies.
     #[must_use]
     pub fn total(&self) -> Tally {
-        sum(&[self.weights, self.kv, self.state, self.scratch, self.rows])
+        sum(&[
+            self.weights,
+            self.kv,
+            self.state,
+            self.scratch,
+            self.rows,
+            self.pipelines,
+        ])
     }
 
     /// Every class the session can hold, the copies among them: the room
@@ -188,4 +216,46 @@ pub fn largest_ctx_of<F: SessionBytes>(
         }
     }
     Some(lo)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pipelines are a class of the open's total and of the held bytes, made
+    /// of no buffer: a session's tally names every byte its open took, and the
+    /// room line's page slack stays the buffers' alone.
+    ///
+    /// Mutant: a `total` that leaves `pipelines` out drops the build's growth
+    /// from both figures.
+    #[test]
+    fn the_pipelines_are_part_of_the_total_and_the_held_bytes() {
+        let weights = Tally {
+            buffers: 2,
+            requested: 20_000,
+            paged: 32_768,
+        };
+        let copies = Tally {
+            buffers: 1,
+            requested: 5_000,
+            paged: 16_384,
+        };
+        let bytes = Bytes {
+            weights,
+            copies,
+            pipelines: Tally::measured(13_893_632),
+            ..Bytes::default()
+        };
+        assert_eq!(bytes.pipelines.buffers, 0);
+        assert_eq!(
+            bytes.total(),
+            Tally {
+                buffers: 2,
+                requested: 20_000 + 13_893_632,
+                paged: 32_768 + 13_893_632,
+            }
+        );
+        assert_eq!(bytes.held().requested, 20_000 + 13_893_632 + 5_000);
+        assert_eq!(bytes.held().buffers, 3);
+    }
 }

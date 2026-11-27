@@ -31,8 +31,10 @@
 //!   is red.
 //! - `k_visits`: the session's walk is mlx-lm's over the folder's config
 //!   ([`VISIT_LAYERS`]).
-//! - `k_room`: the open's device bytes are the plan's, to within a page a
-//!   buffer, and the room line the plan prints.
+//! - `k_room`: the open's device bytes are the session's tally, to within a
+//!   page a buffer: the buffers at the byte formula's figures and the
+//!   pipelines at the growth the open measured building them, and the room
+//!   line the tally prints.
 //! - `k_count`: a plain step encodes the paper's token (`count::token_count`
 //!   over the file's own description: its groups, dispatches and barriers),
 //!   and the profiled step ([`Session::step_profile`]) ran the same groups to
@@ -753,23 +755,28 @@ fn k_visits(session: &Session) -> Clause {
     )))
 }
 
-/// `k_room`: the device bytes the open took, `opened`, against the plan.
+/// `k_room`: the device bytes the open took, `opened`, against the session's tally: the
+/// buffers' formula and the pipelines' measured growth, to within a page a buffer.
 fn k_room(session: &Session, opened: u64) -> Clause {
-    let held = session.bytes().held();
+    let bytes = session.bytes();
+    let held = bytes.held();
     let slack = held.buffers * PAGE;
     if opened.abs_diff(held.requested) > slack {
         return Err(format!(
-            "the open took {opened} device bytes; the plan asks {} in {} buffers (± {slack})",
-            held.requested, held.buffers
+            "the open took {opened} device bytes; the plan asks {} ({} paged) in {} buffers, the \
+             pipelines' {} among them (± {slack})",
+            held.requested, held.paged, held.buffers, bytes.pipelines.requested
         ));
     }
     let free = bloomery_metal::plan::device_room()?.free;
     Ok(Verdict::Noted(format!(
-        "the open took {opened} bytes, the plan {} ({} paged) in {} buffers; {}",
+        "the open took {opened} bytes, the plan {} ({} paged) in {} buffers, the pipelines' {} \
+         among them; {}",
         held.requested,
         held.paged,
         held.buffers,
-        bloomery_metal::session::room::room_words(&session.bytes(), free, None)
+        bytes.pipelines.requested,
+        bloomery_metal::session::room::room_words(&bytes, free, None)
     )))
 }
 
