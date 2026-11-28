@@ -35,11 +35,13 @@
 //! A body whose every store is a plane of positions takes no checkpoint: its
 //! state is the rows alone ([`planes`]).
 //!
-//! A state's byte form, what a slot file carries, is [`bytes`]'.
+//! A state's byte form, what a slot file carries, is [`bytes`]'; a restore
+//! from it onto a model, read as it is put, is [`restore`]'s skeleton.
 
 use crate::DeviceBufferRaw;
 pub mod bytes;
 pub mod planes;
+pub mod restore;
 pub mod saved;
 pub mod staging;
 
@@ -589,6 +591,18 @@ impl Checkpoints {
             off += b.len();
         }
         Ok(())
+    }
+
+    /// The point at `at`'s stores as the host slices its slot holds, in the
+    /// body's order: [`Checkpoints::read_point`]'s values with no copy.
+    /// Refused by name as it refuses for a point that does not stand or whose
+    /// slot holds another position. Host memory only.
+    pub fn point_stores(&self, at: u32) -> Result<impl Iterator<Item = &[f32]> + '_, GpuError> {
+        Ok(self
+            .slot_of(at)?
+            .bufs
+            .iter()
+            .map(PinnedHostBuffer::as_slice))
     }
 
     /// The point at `at`'s stores put on `stores`, another sequence's stores

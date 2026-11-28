@@ -654,7 +654,7 @@ impl Seat for MistralLarge4 {
 
     /// The selected slot's state in the byte form of a slot file ([`planes::save_state`]).
     fn save_state(&mut self, out: &mut dyn Write) -> Result<u64, StateError> {
-        planes::save_state(self.s.model_mut(), out, WHOSE)
+        planes::save_state(self.s.model_mut(), out)
     }
 
     /// The state a slot file holds, put into the selected slot as a cached one is
@@ -663,7 +663,7 @@ impl Seat for MistralLarge4 {
         self.draft
             .replaced(self.s.selected())
             .map_err(|e| StateError::Engine(EngineError(e.to_string())))?;
-        planes::restore_state(self.s.model_mut(), input, WHOSE)
+        planes::restore_state(self.s.model_mut(), input)
     }
 
     /// `engine.draft`, and the draft's resident bytes in its card's placement row

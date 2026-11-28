@@ -1065,6 +1065,7 @@ mod gate {
         pass &= slot_plan(s.model(), inputs, cfg)?;
         pass &= put_back(&mut s)?;
         pass &= snap_cut_after_resume(&mut s, &adapter, cfg)?;
+        pass &= snap_streamed(&mut s, &adapter)?;
         pass &= snap_refusals(&mut s, &adapter)?;
         pass &= snap_stream_fails(&mut s, &adapter)?;
         pass &= stagger_line("G2 stale ring", stagger_stale_ring(&mut s, hp));
@@ -1340,13 +1341,18 @@ mod gate {
     /// The byte form's refusals by name, through `body::restore_state` on the
     /// last slot's own saved bytes rewritten: another model file (a byte of
     /// the identity's path), another context (named with both counts),
-    /// another slot count, another format, a stream one byte short, a byte
-    /// past the state. Each is
-    /// `StateFail::Refused` naming what differs, and the slot keeps its
-    /// position and state hash (nothing on the device touched). A resume of
-    /// a host snapshot of another identity is the same check (`Body::load`
-    /// runs it on the snapshot's header); a snapshot names the model it was
-    /// taken of, and no other is made on this load.
+    /// another slot count, another format, a pending restore that is no flag
+    /// (a host part, read before the arrays), a stream one byte short, a byte
+    /// past the state. Each is `StateFail::Refused` naming what differs.
+    /// PIN(2026-11-27): a refusal in the header or the host parts leaves the
+    /// slot at its position and state hash (nothing on the device touched); a
+    /// refusal after them, in the arrays or at the stream's end, leaves the
+    /// slot reset (position 0, a reset slot's state hash) because the arrays
+    /// go to the card as they are read. After each of those the saved bytes
+    /// are put back and the slot is the one it was. A resume of a host
+    /// snapshot of another identity is the same check (`Body::load` runs it
+    /// on the snapshot's header); a snapshot names the model it was taken of,
+    /// and no other is made on this load.
     fn snap_refusals(
         s: &mut Interleaved<'_, SlotsV41<'_>>,
         a: &SlotsV41<'_>,
@@ -1355,6 +1361,18 @@ mod gate {
             snap_refused(s, a).unwrap_or_else(|e| (false, format!("a call failed: {e}")));
         println!("check snap refusals: {detail} {}", verdict(pass));
         Ok(pass)
+    }
+
+    /// The saved bytes put back into the selected slot: it stands at `pos`
+    /// with state hash `hash`.
+    fn snap_put_back(
+        m: &mut Deepseek41Model,
+        a: &SlotsV41<'_>,
+        bytes: &[u8],
+        (pos, hash): (u32, u64),
+    ) -> Result<bool, GateError> {
+        let n = body::restore_state(m, &mut &*bytes)?;
+        Ok(n == pos as usize && m.pos() == pos && a.state_hash(m)? == hash)
     }
 
     /// [`snap_refusals`]'s verdict and its line; a line per case before it.
@@ -1368,27 +1386,52 @@ mod gate {
         let (pos, before) = (m.pos(), a.state_hash(m)?);
         let mut bytes = Vec::new();
         body::save_state(m, &mut bytes)?;
-        let mut named = 0;
+        m.reset()?;
+        let fresh = a.state_hash(m)?;
+        let back = snap_put_back(m, a, &bytes, (pos, before))?;
         let cases = SnapCase::rewrites(&bytes)?;
-        for SnapCase { case, bytes, says } in &cases {
-            let r = body::restore_state(m, &mut bytes.as_slice());
+        let (mut named, mut stood, mut resets, mut again) = (0, 0, 0, 0);
+        for SnapCase {
+            case,
+            bytes: rewritten,
+            says,
+            stage,
+        } in &cases
+        {
+            let r = body::restore_state(m, &mut rewritten.as_slice());
             let ok = matches!(&r, Err(body::StateFail::Refused(e)) if e.to_string().contains(says));
             named += usize::from(ok);
+            let at = (m.pos(), a.state_hash(m)?);
+            let (want, how) = match stage {
+                Left::Untouched => ((pos, before), "untouched"),
+                Left::Reset => ((0, fresh), "reset"),
+            };
+            stood += usize::from(at == want);
             println!(
-                "  snap refusals: {case}: {} {}",
+                "  snap refusals: {case}: {} {how} {} {}",
                 match &r {
                     Ok(p) => format!("accepted, {p} positions put back"),
                     Err(e) => e.to_string(),
                 },
-                verdict(ok)
+                if at == want {
+                    "as it must be"
+                } else {
+                    "NOT as it must be"
+                },
+                verdict(ok && at == want)
             );
+            if matches!(stage, Left::Reset) {
+                resets += 1;
+                again += usize::from(snap_put_back(m, a, &bytes, (pos, before))?);
+            }
         }
-        let kept = m.pos() == pos && a.state_hash(m)? == before;
         Ok((
-            named == cases.len() && kept,
+            back && named == cases.len() && stood == cases.len() && again == resets,
             format!(
                 "slot {last}'s saved bytes rewritten {} ways, {named} refused by name; the slot \
-                 kept its position {pos} and its state hash {kept}",
+                 stood as the contract says after {stood} (untouched in the header and the host \
+                 parts, reset after them); the saved bytes put back after the {resets} resets \
+                 {again} times, and into a reset slot {back}",
                 cases.len()
             ),
         ))
@@ -1473,20 +1516,34 @@ mod gate {
         ))
     }
 
-    /// A case [`snap_refusals`] restores: its bytes and the words its
-    /// refusal must hold.
+    /// What a restore refused leaves of the slot ([`snap_refusals`]).
+    #[derive(Clone, Copy)]
+    enum Left {
+        /// Refused in the header or the host parts: the slot is as it was.
+        Untouched,
+        /// Refused in the arrays or at the stream's end: the slot is reset.
+        Reset,
+    }
+
+    /// A case [`snap_refusals`] restores: its bytes, the words its refusal
+    /// must hold and what it leaves of the slot.
     struct SnapCase {
         case: &'static str,
         bytes: Vec<u8>,
         says: String,
+        stage: Left,
     }
 
     impl SnapCase {
         /// The cases, each a rewrite of a saved state's `bytes`. The header's
         /// fields are found by walking the byte form's table (`body/snap.rs`):
         /// the tag (8 bytes), the format (u32), the architecture, the model
-        /// file and the card (each a u32 length and its bytes), the context
-        /// and the slot count (u64).
+        /// file and the card (each a u32 length and its bytes), then counts
+        /// (u64): the context, the slot count, the positions, the layers'
+        /// start and end, five a layer, the shadow's width, the ring's
+        /// slots, the state rings (a count, each ratio), the shadow's start,
+        /// and three lists of runs; the host parts follow: the history, the
+        /// slots' record, the pending restore.
         fn rewrites(bytes: &[u8]) -> Result<Vec<SnapCase>, GateError> {
             let at = |b: &[u8], i: usize, len: usize| -> Result<u64, GateError> {
                 let f = b.get(i..i + len).ok_or("a state shorter than its header")?;
@@ -1502,6 +1559,24 @@ mod gate {
             let ctx = card + 4 + usize::try_from(at(bytes, card, 4)?)?;
             let slots = ctx + 8;
             let path = file + 4..card;
+            let count =
+                |i: usize| -> Result<usize, GateError> { Ok(usize::try_from(at(bytes, i, 8)?)?) };
+            let positions = count(slots + 8)?;
+            let layers = count(slots + 24)?
+                .checked_sub(count(slots + 16)?)
+                .ok_or("a state whose layers end before they start")?;
+            let width = slots + 32 + 40 * layers;
+            let ring = count(width + 8)?;
+            let rings = count(width + 16)?;
+            let mut slots_held = 0;
+            for k in 0..rings {
+                slots_held += count(width + 24 + 8 * k)?;
+            }
+            let mut i = width + 24 + 8 * rings + 8;
+            for _ in 0..3 {
+                i += 8 + 16 * count(i)?;
+            }
+            let restore = i + 4 * positions + 8 * (ring + slots_held);
             let mut other_file = bytes.to_vec();
             let end = path.end - 1;
             other_file[end] = if other_file[end] == b'X' { b'Y' } else { b'X' };
@@ -1515,40 +1590,77 @@ mod gate {
             let mut other_format = bytes.to_vec();
             let f = at(bytes, format, 4)? + 1;
             put(&mut other_format, format, 4, f);
+            let mut no_flag = bytes.to_vec();
+            if at(bytes, restore, 1)? > 1 {
+                return Err("a pending restore that is already no flag".into());
+            }
+            no_flag[restore] = 2;
             let short = bytes[..bytes.len() - 1].to_vec();
             let mut long = bytes.to_vec();
             long.push(0);
-            let case = |case, bytes, says| SnapCase { case, bytes, says };
+            let case = |case, bytes, says, stage| SnapCase {
+                case,
+                bytes,
+                says,
+                stage,
+            };
             Ok(vec![
                 case(
                     "another model file",
                     other_file,
                     format!("a state of deepseek41 {other_path} on"),
+                    Left::Untouched,
                 ),
                 case(
                     "another context",
                     other_ctx,
                     format!("a context of {c} positions, the load's {}", c - 1),
+                    Left::Untouched,
                 ),
                 case(
                     "another slot count",
                     other_slots,
                     format!("plan counts {n} slots restored"),
+                    Left::Untouched,
                 ),
-                case("another format", other_format, format!("format {f};")),
-                case("a short stream", short, "a short stream".to_string()),
-                case("a byte past the state", long, "trailing bytes".to_string()),
+                case(
+                    "another format",
+                    other_format,
+                    format!("format {f};"),
+                    Left::Untouched,
+                ),
+                case(
+                    "a pending restore of 2",
+                    no_flag,
+                    "a pending restore of 2".to_string(),
+                    Left::Untouched,
+                ),
+                case(
+                    "a short stream",
+                    short,
+                    "a short stream".to_string(),
+                    Left::Reset,
+                ),
+                case(
+                    "a byte past the state",
+                    long,
+                    "trailing bytes".to_string(),
+                    Left::Reset,
+                ),
             ])
         }
     }
 
     /// A stream that fails, on the last slot: `body::save_state` into a
-    /// writer that takes half the state and then fails as a full disk does,
-    /// and `body::restore_state` from a reader that hands half the slot's own
-    /// bytes and then fails as a closed pipe does, are each
-    /// `StateFail::Io` — never `Card`, which a server ends on — and leave the
-    /// model unpoisoned and the slot at its position and state hash; a save
-    /// after them writes the same bytes as the one before.
+    /// writer that takes half the state and then fails as a full disk does is
+    /// `StateFail::Io`, never `Card`, which a server ends on, and leaves the
+    /// model unpoisoned and the slot at its position and state hash, the next
+    /// save writing the same bytes; `body::restore_state` from a reader that
+    /// hands half the slot's own bytes and then fails as a closed pipe does is
+    /// `StateFail::Io` too and leaves the model unpoisoned and reset.
+    /// PIN(2026-11-27): the restore leaves the slot reset where it left it at
+    /// its position and state hash, because the arrays go to the card as they
+    /// are read; the saved bytes put back after it give the slot it was.
     fn snap_stream_fails(
         s: &mut Interleaved<'_, SlotsV41<'_>>,
         a: &SlotsV41<'_>,
@@ -1571,31 +1683,117 @@ mod gate {
         let mut bytes = Vec::new();
         body::save_state(m, &mut bytes)?;
         let half = bytes.len() / 2;
-        let save = body::save_state(m, &mut SnapFull { left: half }).map(|_| ());
-        let broken = &mut SnapBroken {
-            bytes: &bytes[..half],
-        };
-        let restore = body::restore_state(m, broken).map(|_| ());
         let io = |r: &Result<(), body::StateFail>, kind: std::io::ErrorKind| matches!(r, Err(body::StateFail::Io(e)) if e.kind() == kind);
-        let saved_io = io(&save, std::io::ErrorKind::StorageFull);
-        let restored_io = io(&restore, std::io::ErrorKind::BrokenPipe);
-        let healthy = m.poisoned().is_none() && m.pos() == pos && a.state_hash(m)? == before;
-        let mut again = Vec::new();
-        body::save_state(m, &mut again)?;
-        let same = again == bytes;
         let said = |r: &Result<(), body::StateFail>| match r {
             Ok(()) => "succeeded".to_string(),
             Err(e) => e.to_string(),
         };
+        let save = body::save_state(m, &mut SnapFull { left: half }).map(|_| ());
+        let saved_io = io(&save, std::io::ErrorKind::StorageFull);
+        let healthy = m.poisoned().is_none() && m.pos() == pos && a.state_hash(m)? == before;
+        let mut again = Vec::new();
+        body::save_state(m, &mut again)?;
+        let same = again == bytes;
+        m.reset()?;
+        let fresh = a.state_hash(m)?;
+        let back = snap_put_back(m, a, &bytes, (pos, before))?;
+        let broken = &mut SnapBroken {
+            bytes: &bytes[..half],
+        };
+        let restore = body::restore_state(m, broken).map(|_| ());
+        let restored_io = io(&restore, std::io::ErrorKind::BrokenPipe);
+        let reset = m.poisoned().is_none() && m.pos() == 0 && a.state_hash(m)? == fresh;
+        let after = snap_put_back(m, a, &bytes, (pos, before))?;
         Ok((
-            saved_io && restored_io && healthy && same,
+            saved_io && healthy && same && back && restored_io && reset && after,
             format!(
-                "slot {last}'s state of {} B: a save into a writer full after {half} B {}; a \
-                 restore from a reader broken after {half} B {}; the model unpoisoned, at its \
-                 position and state hash {healthy}; the next save's bytes the same {same}",
+                "slot {last}'s state of {} B: a save into a writer full after {half} B {}, the \
+                 model unpoisoned, at its position and state hash {healthy}, the next save's \
+                 bytes the same {same}; a restore from a reader broken after {half} B {}, the \
+                 model unpoisoned and reset (position 0, a reset slot's state hash) {reset}; \
+                 the saved bytes put back after it give the slot's position {pos} and state \
+                 hash {after} (and into a reset slot {back})",
                 bytes.len(),
                 said(&save),
                 said(&restore),
+            ),
+        ))
+    }
+
+    /// A writer that keeps what it is given, counts its writes and the
+    /// longest of them.
+    #[derive(Default)]
+    struct SnapCounted {
+        data: Vec<u8>,
+        writes: usize,
+        longest: usize,
+    }
+
+    impl std::io::Write for SnapCounted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.data.extend_from_slice(buf);
+            self.writes += 1;
+            self.longest = self.longest.max(buf.len());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The byte form streamed off the live slot is the byte form of a held
+    /// snapshot of it, at every card chunk, and no write to the stream passes
+    /// the writer's buffer; a restore at a chunk of 1002 bytes (seams inside
+    /// every array) gives the slot back.
+    fn snap_streamed(
+        s: &mut Interleaved<'_, SlotsV41<'_>>,
+        a: &SlotsV41<'_>,
+    ) -> Result<bool, GateError> {
+        let (pass, detail) =
+            snap_streamed_line(s, a).unwrap_or_else(|e| (false, format!("a call failed: {e}")));
+        println!("check snap streamed: {detail} {}", verdict(pass));
+        Ok(pass)
+    }
+
+    /// [`snap_streamed`]'s verdict and its line.
+    fn snap_streamed_line(
+        s: &mut Interleaved<'_, SlotsV41<'_>>,
+        a: &SlotsV41<'_>,
+    ) -> Result<(bool, String), GateError> {
+        use bloomery_gpu::checkpoint::bytes::{CARD_CHUNK, CHUNK};
+        let last = slots_gate::STREAMS - 1;
+        let m = s.model();
+        m.select_slot(last)?;
+        let (pos, before) = (m.pos(), a.state_hash(m)?);
+        let mut oracle = SnapCounted::default();
+        body::snapshot(m)?.write_state(&mut oracle)?;
+        let mut pass = true;
+        let mut rows = Vec::new();
+        for chunk in [CARD_CHUNK, 4096, 1002] {
+            let mut out = SnapCounted::default();
+            let written = body::save_state_chunked(m, &mut out, chunk)?;
+            let same = out.data == oracle.data && written == oracle.data.len() as u64;
+            let bounded = out.longest <= CHUNK;
+            pass &= same && bounded;
+            rows.push(format!(
+                "chunk {chunk} B: {} B in {} writes, the longest {} B, the snapshot's bytes {same}",
+                out.data.len(),
+                out.writes,
+                out.longest
+            ));
+        }
+        let n = body::restore_state_chunked(m, &mut oracle.data.as_slice(), 1002)?;
+        let back = n == pos as usize && m.pos() == pos && a.state_hash(m)? == before;
+        pass &= back;
+        Ok((
+            pass,
+            format!(
+                "slot {last} at {pos} positions, the snapshot path's {} B (writer buffer {CHUNK} \
+                 B): {}; restored at a chunk of 1002 B the slot stands at its position and state \
+                 hash {back}",
+                oracle.data.len(),
+                rows.join("; ")
             ),
         ))
     }

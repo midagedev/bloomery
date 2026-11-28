@@ -8,8 +8,8 @@
 //! (`app::Keep` keeps every held position). The body lists its stores
 //! ([`PlaneBody::lend`]) and nothing more; this owner copies them through the
 //! shared state ([`SeqState::save_rows`], [`SeqState::save_rows_async`],
-//! [`SeqState::load_rows`]) and holds the model-level rules every such body
-//! shares:
+//! [`SeqState::put_save_rows`], [`SeqState::load_rows`]) and holds the
+//! model-level rules every such body shares:
 //! - a save is refused by name on a poisoned model, at 0 positions, and when
 //!   the body's own record of what its stores hold is short of the model's
 //!   position;
@@ -30,6 +30,7 @@ use cuda_core::CudaStream;
 use model::arch::place_hybrid::KvLayout;
 
 use super::bytes::{Fail, Put, Take};
+use super::restore::restore_streamed;
 use super::saved::{Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams};
 use super::staging::NoRoom;
 use crate::model::ChainBody;
@@ -180,12 +181,78 @@ pub fn seq_save<B: PlaneBody>(m: &mut GpuModel<B>) -> Result<PlaneSeq<B>, GpuErr
     Ok(PlaneSeq::new(Arc::new(state)))
 }
 
+/// The sequence state of `m` written to `w` in the byte form [`PlaneSeq::put`] writes, straight
+/// from the card, a bounded chunk at a time ([`SeqState::put_save_rows`]): no copy of the state
+/// is held on the host, and the model is as it was. Refused by name as [`seq_save`] refuses,
+/// before the first byte; a failure of the card is [`Fail::Card`], of the stream [`Fail::Io`].
+pub fn seq_put<B: PlaneBody>(m: &mut GpuModel<B>, w: &mut Put<'_>) -> Result<(), Fail> {
+    take(m, |stream, who, pos, lent| {
+        Ok(SeqState::<()>::put_save_rows(w, stream, &who, pos, lent))
+    })
+    .map_err(Fail::card)?
+}
+
 /// The state [`PlaneSeq::put`] wrote, read for `m`'s load and the model untouched: refused by
 /// name for a state of another model, card or context ([`Identity`]) and for a stream that is
 /// not one. The layout against the model's own stores is [`seq_resume_prefix`]'s to check.
 pub fn seq_take<B: PlaneBody>(m: &GpuModel<B>, r: &mut Take<'_>) -> Result<PlaneSeq<B>, Fail> {
     let body = m.body(B::WHAT).map_err(Fail::Refused)?;
     SeqState::<()>::take(r, body.who()).map(|state| PlaneSeq::new(Arc::new(state)))
+}
+
+/// The state [`PlaneSeq::put`] or [`seq_put`] wrote, read from `r` and put into `m`'s sequence as
+/// it is read, a bounded chunk of its rows at a time ([`SeqState::take_rows_head`],
+/// [`super::saved::RowsHead::take_rows`]): no copy of the state is held on the host. The
+/// positions put back.
+///
+/// The restore skeleton of [`restore_streamed`], with the plane bodies' parts: the header, the
+/// rows' count and the layout against the model's stores are read and checked first, a refusal
+/// or a failure of the stream in them leaving the model untouched; then the model is reset and
+/// the rows go to the card as they are read; the model stands at the state's positions only after
+/// the stream ended where it must ([`PlaneBody::stand`]). Refused by name on a poisoned model.
+pub fn seq_restore<B: PlaneBody>(m: &mut GpuModel<B>, r: &mut Take<'_>) -> Result<u32, Fail> {
+    restore_streamed(
+        m,
+        r,
+        |m, r| {
+            if let Some(fault) = m.poisoned() {
+                return Err(Fail::Card(GpuError::Poisoned {
+                    what: B::WHAT,
+                    fault,
+                }));
+            }
+            let head = {
+                let body = m.body(B::WHAT).map_err(Fail::Refused)?;
+                SeqState::<()>::take_rows_head(r, body.who())?
+            };
+            let (_, _, body) = m.body_parts(B::WHAT).map_err(Fail::card)?;
+            let mut spans = body.lend(head.positions() as usize).map_err(Fail::card)?;
+            let lent = Lent {
+                positional: &mut spans,
+                recurrent: &mut [],
+            };
+            head.check(&lent).map_err(Fail::Refused)?;
+            Ok(head)
+        },
+        |m, r, head| {
+            let (gpu, _, body) = m.body_parts(B::WHAT).map_err(Fail::card)?;
+            let mut spans = body.lend(head.positions() as usize).map_err(Fail::card)?;
+            let mut lent = Lent {
+                positional: &mut spans,
+                recurrent: &mut [],
+            };
+            head.take_rows(r, gpu.stream(), &mut lent)
+        },
+        |m, head, ()| {
+            let n = head.positions();
+            m.run_rows(n as usize, B::WHAT, |_, _, body, _, _| {
+                body.stand(n);
+                Ok(false)
+            })
+            .map_err(Fail::card)?;
+            Ok(n)
+        },
+    )
 }
 
 /// The host bytes a sequence save would hold, without reading the card.

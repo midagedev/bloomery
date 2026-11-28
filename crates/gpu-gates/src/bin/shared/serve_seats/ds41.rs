@@ -1742,12 +1742,14 @@ impl Seat for V41 {
 
 /// The body's state failure as the server's kind: a refusal is the
 /// request's (a 400 or a 500 that keeps the server), a stream's error is the
-/// file's (`Io`), a card failure the model's, which ends it.
+/// file's (`Io`), a card failure the model's, which ends it, and so does a
+/// restore whose reset failed too.
 fn state_error(e: body::StateFail) -> StateError {
     match e {
         body::StateFail::Refused(e) => StateError::Format(e.to_string()),
         body::StateFail::Io(e) => StateError::Io(e),
         body::StateFail::Card(e) => StateError::Engine(EngineError(e.to_string())),
+        e @ body::StateFail::Reset { .. } => StateError::Engine(EngineError(e.to_string())),
     }
 }
 

@@ -54,7 +54,13 @@
 //! A landed state goes to bytes and back ([`SeqState::put`],
 //! [`SeqState::take`], the byte form of [`super::bytes`]), each position's host
 //! value by its own [`HostBytes`]; a state read back is the one written, and
-//! puts back as it would have. In order:
+//! puts back as it would have. A save to a stream that holds no state on the
+//! host ([`SeqState::put_save`], [`SeqState::put_save_rows`]) writes the same
+//! bytes straight from the card and the checkpoints' host slots, a bounded
+//! chunk of a plane at a time ([`Put::from_card`]), and a state of rows alone
+//! reads back the same way ([`SeqState::take_rows_head`], [`RowsHead::take_rows`]):
+//! its rows go to the card as they are read, a bounded chunk at a time
+//! ([`Take::to_card`]). In order:
 //!
 //! | part | fields |
 //! |---|---|
@@ -671,6 +677,114 @@ fn pitched(s: &Strip) -> (Pitched, usize) {
     )
 }
 
+/// `out.len()` 16-bit halves of the positional store `spans` from half `at`,
+/// device to host, blocking.
+fn read_halves(
+    stream: &CudaStream,
+    spans: &Spans<'_>,
+    at: usize,
+    out: &mut [u16],
+) -> Result<(), GpuError> {
+    let bytes = size_of_val(out);
+    let one = Pitched {
+        width: bytes,
+        rows: 1,
+        dev_pitch: bytes,
+        host_pitch: bytes,
+    };
+    let (host, off) = (out.as_mut_ptr().cast::<u8>(), at * size_of::<u16>());
+    // SAFETY: `out` is writable memory that nothing reads until the
+    // synchronize below, which runs whether or not the copy was enqueued.
+    let sent = unsafe {
+        match &spans.buf {
+            Plane::U16(b) => dtoh_2d(stream, &**b, off, host, bytes, one),
+            Plane::U32(b) => dtoh_2d(stream, &**b, off, host, bytes, one),
+        }
+    };
+    let synced = stream.synchronize();
+    sent?;
+    synced?;
+    Ok(())
+}
+
+/// `out.len()` f32s of the recurrent store `store` from word `at`, device to
+/// host, blocking.
+fn read_words(
+    stream: &CudaStream,
+    store: &DeviceBuffer<f32>,
+    at: usize,
+    out: &mut [f32],
+) -> Result<(), GpuError> {
+    let bytes = size_of_val(out);
+    let one = Pitched {
+        width: bytes,
+        rows: 1,
+        dev_pitch: bytes,
+        host_pitch: bytes,
+    };
+    let host = out.as_mut_ptr().cast::<u8>();
+    // SAFETY: as `read_halves`.
+    let sent = unsafe { dtoh_2d(stream, store, at * size_of::<f32>(), host, bytes, one) };
+    let synced = stream.synchronize();
+    sent?;
+    synced?;
+    Ok(())
+}
+
+/// `chunk` written to the positional store `spans` from half `at`, host to
+/// device, blocking.
+fn write_halves(
+    stream: &CudaStream,
+    spans: &mut Spans<'_>,
+    at: usize,
+    chunk: &[u16],
+) -> Result<(), GpuError> {
+    let bytes = size_of_val(chunk);
+    let one = Pitched {
+        width: bytes,
+        rows: 1,
+        dev_pitch: bytes,
+        host_pitch: bytes,
+    };
+    let (host, off) = (chunk.as_ptr().cast::<u8>(), at * size_of::<u16>());
+    // SAFETY: `chunk` is readable memory that nothing writes until the
+    // synchronize below, which runs whether or not the copy was enqueued.
+    let sent = unsafe {
+        match &mut spans.buf {
+            Plane::U16(b) => htod_2d(stream, &mut **b, off, host, bytes, one),
+            Plane::U32(b) => htod_2d(stream, &mut **b, off, host, bytes, one),
+        }
+    };
+    let synced = stream.synchronize();
+    sent?;
+    synced?;
+    Ok(())
+}
+
+/// `chunk` written to the recurrent store `store` from word `at`, host to
+/// device, blocking.
+fn write_words(
+    stream: &CudaStream,
+    store: &mut DeviceBuffer<f32>,
+    at: usize,
+    chunk: &[f32],
+) -> Result<(), GpuError> {
+    let bytes = size_of_val(chunk);
+    let one = Pitched {
+        width: bytes,
+        rows: 1,
+        dev_pitch: bytes,
+        host_pitch: bytes,
+    };
+    let (host, off) = (chunk.as_ptr().cast::<u8>(), at * size_of::<f32>());
+    // SAFETY: as `write_halves`.
+    let sent = unsafe { htod_2d(stream, store, off, host, bytes, one) };
+    let synced = stream.synchronize();
+    sent?;
+    synced?;
+    Ok(())
+}
+
 impl<T> SeqState<T> {
     /// The state of `who`'s model standing at `positions`: `lent`'s
     /// positional rows, its recurrent stores (the checkpoints' list, which
@@ -1098,6 +1212,86 @@ impl<T> SeqState<T> {
     }
 }
 
+/// What a streamed save ([`SeqState::put_save`]) carries beside the rows,
+/// borrowed: the host value of the current position, the points with theirs,
+/// and the checkpoints those points' stores are read from.
+pub struct Live<'a, T> {
+    pub current: &'a T,
+    pub points: &'a [(u32, T)],
+    pub ckpt: &'a Checkpoints,
+}
+
+/// [`Carry`] for a save that moves nothing to the host first.
+struct Carried<'a, T> {
+    current: &'a T,
+    points: &'a [(u32, T)],
+    ckpt: Option<&'a Checkpoints>,
+    cuts: Cuts,
+}
+
+/// The byte form's parts before its arrays: the identity, the positions and
+/// the cut rule, the runs, the stores' lengths and the host values.
+struct Head<'a, T> {
+    who: &'a Identity,
+    positions: u32,
+    cuts: Cuts,
+    runs: &'a [Run],
+    lens: &'a [usize],
+    current: &'a T,
+    points: &'a [(u32, T)],
+}
+
+/// The byte form's parts before its arrays, read ([`SeqState::take`]).
+struct Taken<T> {
+    positions: u32,
+    cuts: Cuts,
+    runs: Vec<Run>,
+    lens: Vec<usize>,
+    current: T,
+    points: Vec<(u32, T)>,
+}
+
+impl<T: HostBytes> Head<'_, T> {
+    fn put(&self, w: &mut Put<'_>) -> Result<(), Fail> {
+        let who = self.who;
+        w.name(who.arch.as_bytes())?;
+        w.name(who.file.as_os_str().as_encoded_bytes())?;
+        w.name(who.card.as_bytes())?;
+        w.count(who.ctx)?;
+        w.one(self.positions)?;
+        w.one(u8::from(self.cuts == Cuts::Anywhere))?;
+        w.count(self.runs.len())?;
+        for r in self.runs {
+            for v in [r.planes, r.stride, r.len] {
+                w.count(v)?;
+            }
+            match r.per {
+                Per::Whole => w.one(0u8)?,
+                Per::Position { values } => {
+                    w.one(1u8)?;
+                    w.count(values)?;
+                }
+                Per::Pool { every, values } => {
+                    w.one(2u8)?;
+                    w.count(every)?;
+                    w.count(values)?;
+                }
+            }
+        }
+        w.count(self.lens.len())?;
+        for &l in self.lens {
+            w.count(l)?;
+        }
+        self.current.put(w)?;
+        w.count(self.points.len())?;
+        for (p, v) in self.points {
+            w.one(*p)?;
+            v.put(w)?;
+        }
+        Ok(())
+    }
+}
+
 /// A host value a state carries beside a position, in the byte form
 /// ([`SeqState::put`]).
 pub trait HostBytes: Sized {
@@ -1126,51 +1320,116 @@ impl<T: HostBytes> SeqState<T> {
                 "a state whose copy is still running written: wait for the save to land first",
             ));
         }
-        let who = &self.who;
-        w.name(who.arch.as_bytes())?;
-        w.name(who.file.as_os_str().as_encoded_bytes())?;
-        w.name(who.card.as_bytes())?;
-        w.count(who.ctx)?;
-        w.one(self.positions)?;
-        w.one(u8::from(self.cuts == Cuts::Anywhere))?;
-        w.count(self.runs.len())?;
-        for r in &self.runs {
-            for v in [r.planes, r.stride, r.len] {
-                w.count(v)?;
-            }
-            match r.per {
-                Per::Whole => w.one(0u8)?,
-                Per::Position { values } => {
-                    w.one(1u8)?;
-                    w.count(values)?;
-                }
-                Per::Pool { every, values } => {
-                    w.one(2u8)?;
-                    w.count(every)?;
-                    w.count(values)?;
-                }
-            }
+        Head {
+            who: &self.who,
+            positions: self.positions,
+            cuts: self.cuts,
+            runs: &self.runs,
+            lens: &self.lens,
+            current: &self.current,
+            points: &self.points,
         }
-        w.count(self.lens.len())?;
-        for &l in &self.lens {
-            w.count(l)?;
-        }
-        self.current.put(w)?;
-        w.count(self.points.len())?;
-        for (p, v) in &self.points {
-            w.one(*p)?;
-            v.put(w)?;
-        }
+        .put(w)?;
         w.array(self.host.rows())?;
         w.array(self.host.recurrent())
     }
 
-    /// The state [`SeqState::put`] wrote, of `who`'s model: refused by name
-    /// for another identity before any array is read, for a position past
-    /// the context, points that do not ascend inside the positions, and
-    /// arrays whose lengths are not the runs' and the stores'. The layout
-    /// against the model's own stores is the put back's to check.
-    pub fn take(r: &mut Take<'_>, who: &Identity) -> Result<SeqState<T>, Fail> {
+    /// The byte form of the state `lent` holds now, which [`SeqState::save`]
+    /// of the same arguments and [`SeqState::put`] would write, written to `w`
+    /// straight from the card and from `live`'s checkpoints' host slots, one
+    /// bounded chunk of a plane at a time: no array of the state is held on
+    /// the host. Everything that can be refused is refused before the first
+    /// byte ([`SeqState::save`]'s refusals, a point whose slot holds another
+    /// position); a failure after it leaves the bytes written so far to the
+    /// caller, who drops them, and the card as it was. `lead` writes what
+    /// precedes the state in the byte form of a larger one (a tag): it runs
+    /// after the last refusal, so a refused save has written none of it.
+    pub fn put_save(
+        w: &mut Put<'_>,
+        stream: &CudaStream,
+        who: &Identity,
+        positions: u32,
+        lent: &Lent<'_, '_, '_>,
+        live: Live<'_, T>,
+        lead: impl FnOnce(&mut Put<'_>) -> Result<(), Fail>,
+    ) -> Result<(), Fail> {
+        let Live {
+            current,
+            points,
+            ckpt,
+        } = live;
+        let carry = Carried {
+            current,
+            points,
+            ckpt: Some(ckpt),
+            cuts: Cuts::AtPoints,
+        };
+        Self::put_live(w, stream, who, positions, lent, carry, lead)
+    }
+
+    fn put_live(
+        w: &mut Put<'_>,
+        stream: &CudaStream,
+        who: &Identity,
+        positions: u32,
+        lent: &Lent<'_, '_, '_>,
+        carry: Carried<'_, T>,
+        lead: impl FnOnce(&mut Put<'_>) -> Result<(), Fail>,
+    ) -> Result<(), Fail> {
+        let Carried {
+            current,
+            points,
+            ckpt,
+            cuts,
+        } = carry;
+        let lens = Self::checked(lent, positions, points, ckpt, cuts).map_err(Fail::card)?;
+        let runs = lent.runs();
+        plan_whole(&runs).map_err(|e| Fail::Refused(shape(e.to_string())))?;
+        if let Some(ckpt) = ckpt {
+            for &(at, _) in points {
+                ckpt.point_stores(at).map(drop).map_err(Fail::card)?;
+            }
+        }
+        lead(w)?;
+        Head {
+            who,
+            positions,
+            cuts,
+            runs: &runs,
+            lens: &lens,
+            current,
+            points,
+        }
+        .put(w)?;
+        w.count(runs.iter().map(Run::values).sum::<usize>())?;
+        for (run, spans) in runs.iter().zip(lent.positional.iter()) {
+            for plane in 0..run.planes {
+                let from = plane * run.stride;
+                w.from_card::<u16>(run.len, |at, out| {
+                    read_halves(stream, spans, from + at.start, out)
+                })?;
+            }
+        }
+        let one: usize = lens.iter().sum();
+        w.count(one * (1 + points.len()))?;
+        for store in lent.recurrent.iter() {
+            w.from_card::<f32>(store.len(), |at, out| {
+                read_words(stream, store, at.start, out)
+            })?;
+        }
+        if let Some(ckpt) = ckpt {
+            for &(at, _) in points {
+                for store in ckpt.point_stores(at).map_err(Fail::card)? {
+                    w.vals(store)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The parts of the byte form before its arrays, read and checked: the
+    /// refusals of [`SeqState::take`] that need no array.
+    fn take_head(r: &mut Take<'_>, who: &Identity) -> Result<Taken<T>, Fail> {
         let (arch, file, card) = (
             r.name("the architecture")?,
             r.name("the model file")?,
@@ -1235,27 +1494,33 @@ impl<T: HostBytes> SeqState<T> {
             points.push((p, T::take(r)?));
         }
         check_points(positions, points.iter().map(|&(p, _)| p)).map_err(Fail::Refused)?;
-        let rows_n = runs.iter().try_fold(0usize, |n, run| {
-            run.planes.checked_mul(run.len)?.checked_add(n)
-        });
-        let rec_n = lens
-            .iter()
-            .try_fold(0usize, |n, &l| n.checked_add(l))
-            .and_then(|one| one.checked_mul(1 + points.len()));
-        let rows_at = r.count("the rows")?;
-        if rows_n != Some(rows_at) {
-            return Err(refused(format!(
-                "{rows_at} rows beside runs of {rows_n:?} values"
-            )));
-        }
+        Ok(Taken {
+            positions,
+            cuts,
+            runs,
+            lens,
+            current,
+            points,
+        })
+    }
+
+    /// The state [`SeqState::put`] wrote, of `who`'s model: refused by name
+    /// for another identity before any array is read, for a position past
+    /// the context, points that do not ascend inside the positions, and
+    /// arrays whose lengths are not the runs' and the stores'. The layout
+    /// against the model's own stores is the put back's to check.
+    pub fn take(r: &mut Take<'_>, who: &Identity) -> Result<SeqState<T>, Fail> {
+        let Taken {
+            positions,
+            cuts,
+            runs,
+            lens,
+            current,
+            points,
+        } = Self::take_head(r, who)?;
+        let rows_at = take_rows_count(r, &runs)?;
         let rows = r.vals(rows_at, "the rows")?;
-        let rec_at = r.count("the recurrent stores' values")?;
-        if rec_n != Some(rec_at) {
-            return Err(refused(format!(
-                "{rec_at} recurrent values beside stores of {lens:?} f32s at {} positions",
-                1 + points.len()
-            )));
-        }
+        let rec_at = take_recurrent_count(r, &lens, points.len())?;
         let recurrent = r.vals(rec_at, "the recurrent stores' values")?;
         Ok(SeqState {
             who: who.clone(),
@@ -1299,6 +1564,53 @@ impl SeqState<()> {
         Self::save_async_in(streams, who, positions, lent, Carry::rows())
     }
 
+    /// The parts of a state of rows alone [`SeqState::put`] or
+    /// [`SeqState::put_save_rows`] wrote that come before its rows, and the
+    /// rows' count, read for `who`'s model: refused by name, nothing read
+    /// past them, for another identity, a position past the context, a state
+    /// of no positions, one that carries a recurrent store or a point, and a
+    /// count of rows that is not the runs'. The layout against the model's
+    /// own stores is [`RowsHead::check`]'s.
+    pub fn take_rows_head(r: &mut Take<'_>, who: &Identity) -> Result<RowsHead, Fail> {
+        let Taken {
+            positions,
+            runs,
+            lens,
+            points,
+            ..
+        } = Self::take_head(r, who)?;
+        if positions == 0 {
+            return Err(refused("a state of 0 positions"));
+        }
+        if !lens.is_empty() || !points.is_empty() {
+            return Err(refused(format!(
+                "recurrent stores of {lens:?} f32s and {} points in a state of positional rows \
+                 alone",
+                points.len()
+            )));
+        }
+        take_rows_count(r, &runs)?;
+        Ok(RowsHead { positions, runs })
+    }
+
+    /// [`SeqState::put_save`] of `lent`'s positional rows alone. Refused by
+    /// name as [`SeqState::save_rows`] refuses, before the first byte.
+    pub fn put_save_rows(
+        w: &mut Put<'_>,
+        stream: &CudaStream,
+        who: &Identity,
+        positions: u32,
+        lent: &Lent<'_, '_, '_>,
+    ) -> Result<(), Fail> {
+        let carry = Carried {
+            current: &(),
+            points: &[],
+            ckpt: None,
+            cuts: Cuts::Anywhere,
+        };
+        Self::put_live(w, stream, who, positions, lent, carry, |_| Ok(()))
+    }
+
     /// The first `n` positions of the state put back on `who`'s model: only
     /// the rows of those positions move ([`SeqState::load_prefix`] of a state
     /// that can be cut anywhere). Refused by name, nothing copied, for another
@@ -1319,6 +1631,245 @@ impl SeqState<()> {
         }
         self.resume(stream, who, lent, None, Some(n))
     }
+}
+
+/// A state of positional rows alone, read up to its rows
+/// ([`SeqState::take_rows_head`]): its positions and the runs its rows are
+/// laid out by.
+pub struct RowsHead {
+    positions: u32,
+    runs: Vec<Run>,
+}
+
+impl RowsHead {
+    /// The positions the state holds.
+    #[must_use]
+    pub fn positions(&self) -> u32 {
+        self.positions
+    }
+
+    /// Refused by name, nothing copied, unless `lent` lists the positional
+    /// stores this state's runs lay out and no recurrent store.
+    pub fn check(&self, lent: &Lent<'_, '_, '_>) -> Result<(), GpuError> {
+        let runs = lent.runs();
+        if runs != self.runs {
+            return Err(shape(format!(
+                "a state of positional runs {:?} put back into {runs:?}",
+                self.runs
+            )));
+        }
+        let lens = lent.lens();
+        if !lens.is_empty() {
+            return Err(shape(format!(
+                "a state of positional rows alone put back into recurrent stores of {lens:?} f32s"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The state's rows from `r`, which stands at them, put on `lent`'s
+    /// stores a bounded chunk at a time ([`Take::to_card`]), then the end of
+    /// the recurrent array a state of rows alone holds none in. Each chunk
+    /// is on the card when the next is read, so a stream that ends or fails
+    /// inside the rows leaves the stores written up to it: the caller resets
+    /// the model. Refused by name when `lent` is not what [`RowsHead::check`]
+    /// takes, before any row moves.
+    pub fn take_rows(
+        &self,
+        r: &mut Take<'_>,
+        stream: &CudaStream,
+        lent: &mut Lent<'_, '_, '_>,
+    ) -> Result<(), Fail> {
+        self.check(lent).map_err(Fail::Refused)?;
+        take_rows_to_card(r, stream, &self.runs, lent.positional)?;
+        let rec_at = r.count("the recurrent stores' values")?;
+        if rec_at != 0 {
+            return Err(refused(format!(
+                "{rec_at} recurrent values in a state of positional rows alone"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A state with recurrent stores and points, read up to its arrays
+/// ([`SeqState::take_state_head`]): its positions, the runs its rows are laid
+/// out by, the recurrent stores' lengths, and the host values of the current
+/// position and of each point.
+pub struct StateHead<T> {
+    positions: u32,
+    runs: Vec<Run>,
+    lens: Vec<usize>,
+    current: T,
+    points: Vec<(u32, T)>,
+}
+
+impl<T> StateHead<T> {
+    /// The positions the state holds.
+    #[must_use]
+    pub fn positions(&self) -> u32 {
+        self.positions
+    }
+
+    /// The host value of the state's own position.
+    #[must_use]
+    pub fn current(&self) -> &T {
+        &self.current
+    }
+
+    /// The points the state carries, ascending, each below its positions,
+    /// with their host values.
+    #[must_use]
+    pub fn points(&self) -> &[(u32, T)] {
+        &self.points
+    }
+
+    /// The host values: of the state's own position and of each point.
+    #[must_use]
+    pub fn into_host(self) -> (T, Vec<(u32, T)>) {
+        (self.current, self.points)
+    }
+
+    /// Refused by name, nothing copied, unless `lent` lists the positional
+    /// stores this state's runs lay out and the recurrent stores it holds,
+    /// which are the checkpoints' `ckpt`.
+    pub fn check(&self, lent: &Lent<'_, '_, '_>, ckpt: &Checkpoints) -> Result<(), GpuError> {
+        let runs = lent.runs();
+        if runs != self.runs {
+            return Err(shape(format!(
+                "a state of positional runs {:?} put back into {runs:?}",
+                self.runs
+            )));
+        }
+        let lens = lent.lens();
+        if lens != self.lens || lens != ckpt.lens() {
+            return Err(shape(format!(
+                "a state of recurrent stores of {:?} f32s put back into {lens:?} (the \
+                 checkpoints copy {:?})",
+                self.lens,
+                ckpt.lens()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The state's arrays from `r`, which stands at them, put back on the
+    /// empty model `lent` and `ckpt` are of: the rows and the recurrent
+    /// stores of the state's own position to the card a bounded chunk at a
+    /// time ([`Take::to_card`]), each point's stores adopted by `ckpt` one
+    /// checkpoint's f32s at a time (the host holds one point beyond the
+    /// slots). A stream that ends or fails inside the arrays leaves the
+    /// stores written up to it: the caller resets the model. Refused by name
+    /// when `lent` is not what [`StateHead::check`] takes or `ckpt` holds a
+    /// point, before any array moves.
+    pub fn take_arrays(
+        &self,
+        r: &mut Take<'_>,
+        stream: &CudaStream,
+        lent: &mut Lent<'_, '_, '_>,
+        ckpt: &mut Checkpoints,
+    ) -> Result<(), Fail> {
+        self.check(lent, ckpt).map_err(Fail::Refused)?;
+        if !ckpt.positions().is_empty() || ckpt.pending() {
+            return Err(refused(format!(
+                "a state put back beside checkpoints at {:?}: restore onto an empty model",
+                ckpt.positions()
+            )));
+        }
+        take_rows_to_card(r, stream, &self.runs, lent.positional)?;
+        let one: usize = self.lens.iter().sum();
+        take_recurrent_count(r, &self.lens, self.points.len())?;
+        for store in lent.recurrent.iter_mut() {
+            let n = store.len();
+            r.to_card::<f32>(n, "the recurrent stores' values", |at, chunk| {
+                write_words(stream, store, at.start, chunk)
+            })?;
+        }
+        for &(at, _) in &self.points {
+            let stores = r.vals::<f32>(one, "a point's stores")?;
+            ckpt.adopt(at, &stores).map_err(Fail::card)?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: HostBytes> SeqState<T> {
+    /// The parts of a state [`SeqState::put`] or [`SeqState::put_save`] wrote
+    /// that come before its arrays, and the rows' count, read for `who`'s
+    /// model: refused by name, nothing read past them, for another identity,
+    /// a position past the context, points that do not ascend inside the
+    /// positions, and a count of rows that is not the runs'. The layout
+    /// against the model's own stores is [`StateHead::check`]'s.
+    pub fn take_state_head(r: &mut Take<'_>, who: &Identity) -> Result<StateHead<T>, Fail> {
+        let Taken {
+            positions,
+            runs,
+            lens,
+            current,
+            points,
+            ..
+        } = Self::take_head(r, who)?;
+        take_rows_count(r, &runs)?;
+        Ok(StateHead {
+            positions,
+            runs,
+            lens,
+            current,
+            points,
+        })
+    }
+}
+
+/// The rows' count a state's byte form holds before its rows, read: refused
+/// by name unless it is the values of `runs`. The count.
+fn take_rows_count(r: &mut Take<'_>, runs: &[Run]) -> Result<usize, Fail> {
+    let rows_n = runs.iter().try_fold(0usize, |n, run| {
+        run.planes.checked_mul(run.len)?.checked_add(n)
+    });
+    let rows_at = r.count("the rows")?;
+    if rows_n != Some(rows_at) {
+        return Err(refused(format!(
+            "{rows_at} rows beside runs of {rows_n:?} values"
+        )));
+    }
+    Ok(rows_at)
+}
+
+/// The recurrent array's count a state's byte form holds after its rows,
+/// read: refused by name unless it is the stores `lens` of the state's own
+/// position and of its `points`. The count.
+fn take_recurrent_count(r: &mut Take<'_>, lens: &[usize], points: usize) -> Result<usize, Fail> {
+    let rec_n = lens
+        .iter()
+        .try_fold(0usize, |n, &l| n.checked_add(l))
+        .and_then(|one| one.checked_mul(1 + points));
+    let rec_at = r.count("the recurrent stores' values")?;
+    if rec_n != Some(rec_at) {
+        return Err(refused(format!(
+            "{rec_at} recurrent values beside stores of {lens:?} f32s at {} positions",
+            1 + points
+        )));
+    }
+    Ok(rec_at)
+}
+
+/// The rows of `runs` from `r`, which stands at them, put on `positional`'s
+/// stores a bounded chunk at a time ([`Take::to_card`]).
+fn take_rows_to_card(
+    r: &mut Take<'_>,
+    stream: &CudaStream,
+    runs: &[Run],
+    positional: &mut [Spans<'_>],
+) -> Result<(), Fail> {
+    for (run, spans) in runs.iter().zip(positional.iter_mut()) {
+        for plane in 0..run.planes {
+            let from = plane * run.stride;
+            r.to_card::<u16>(run.len, "the rows", |at, chunk| {
+                write_halves(stream, spans, from + at.start, chunk)
+            })?;
+        }
+    }
+    Ok(())
 }
 
 impl Carry<'_, ()> {
@@ -1358,8 +1909,10 @@ fn shape(detail: impl Into<String>) -> GpuError {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
-    use crate::checkpoint::hold;
+    use crate::checkpoint::{bytes, hold};
 
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
@@ -2012,6 +2565,310 @@ mod tests {
         assert_eq!(cost2.alloc_ms, 0.0, "the pool had the memory");
         assert_eq!(lane.staging().stats().grown, 1, "one slab for both");
         assert_eq!(state2.host.rows(), sync.host.rows());
+    }
+
+    /// A writer that keeps what it is given and the longest write it took.
+    #[derive(Default)]
+    struct Counting {
+        data: Vec<u8>,
+        longest: usize,
+    }
+
+    impl Write for Counting {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.data.extend_from_slice(b);
+            self.longest = self.longest.max(b.len());
+            Ok(b.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What a save's lead writes before the state's own first byte.
+    const LEAD: &[u8] = b"LEAD";
+
+    /// The card chunks the streamed saves and restores of a state with f32
+    /// stores run at: the owner's, one that cuts every store inside, and one
+    /// value of the largest type.
+    const CHUNKS: [usize; 4] = [bytes::CARD_CHUNK, 4096, 50, 4];
+
+    /// The same for a state of u16 rows alone: the last chunk is one value.
+    const ROW_CHUNKS: [usize; 4] = [bytes::CARD_CHUNK, 4096, 50, 2];
+
+    /// Runs `f` with `m`'s positional stores of `n` positions lent, no
+    /// recurrent store.
+    fn lend_rows<R>(m: &mut Model, n: usize, f: impl FnOnce(&mut Lent<'_, '_, '_>) -> R) -> R {
+        let Model {
+            k, v, raw, pooled, ..
+        } = m;
+        let stride = CTX * H;
+        let mut spans = [
+            Spans::by_position(k, PLANES, stride, n, H).expect("spans"),
+            Spans::by_position(v, PLANES, stride, n, H).expect("spans"),
+            Spans::by_position(raw, 1, 0, n, RAW).expect("spans"),
+            Spans::by_pool(pooled, 1, 0, n, (POOL, PV)).expect("spans"),
+        ];
+        let mut lent = Lent {
+            positional: &mut spans,
+            recurrent: &mut [],
+        };
+        f(&mut lent)
+    }
+
+    /// A save streamed from the card is the byte form of the held state of
+    /// the same stores, whatever the card chunk, and no write to the stream is
+    /// longer than the writer's buffer; refused by name, before the first
+    /// byte, for a point whose slot holds no such position.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_streamed_save_is_the_held_states_bytes_at_every_card_chunk() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let mut src = source(&ctx, &stream);
+        let at = || vec![(16, Val(7)), (32, Val(8))];
+        let held = lend(&mut src, POS as usize, |lent, ckpt| {
+            SeqState::save(&stream, who(), POS, lent, Val(9), at(), ckpt).expect("a save")
+        });
+        let oracle = put_bytes(&held).expect("the held state's bytes");
+        for chunk in CHUNKS {
+            let mut out = Counting::default();
+            let points = at();
+            let written = lend(&mut src, POS as usize, |lent, ckpt| {
+                let mut w = Put::new(&mut out).with_card_chunk(chunk);
+                let live = Live {
+                    current: &Val(9),
+                    points: &points,
+                    ckpt,
+                };
+                SeqState::put_save(&mut w, &stream, &who(), POS, lent, live, |w| w.vals(LEAD))
+                    .expect("streamed");
+                w.flush().expect("flushed");
+                w.bytes()
+            });
+            assert_eq!(out.data[..LEAD.len()], *LEAD, "card chunk {chunk} B");
+            assert_eq!(out.data[LEAD.len()..], oracle, "card chunk {chunk} B");
+            assert_eq!(
+                written,
+                (LEAD.len() + oracle.len()) as u64,
+                "card chunk {chunk} B"
+            );
+            assert!(
+                out.longest <= bytes::CHUNK,
+                "a write of {} B at card chunk {chunk} B",
+                out.longest
+            );
+        }
+        let mut out = Counting::default();
+        let nowhere = vec![(20, Val(1))];
+        let first = lend(&mut src, POS as usize, |lent, ckpt| {
+            let mut w = Put::new(&mut out);
+            let live = Live {
+                current: &Val(9),
+                points: &nowhere,
+                ckpt,
+            };
+            // A lead that wrote before the last refusal would show below.
+            let r = SeqState::put_save(&mut w, &stream, &who(), POS, lent, live, |w| w.vals(LEAD));
+            // The writer buffers: only a flushed byte reaches the stream.
+            w.flush().expect("flushed");
+            r
+        });
+        refused_with(first, "no checkpoint at position 20");
+        assert!(
+            out.data.is_empty(),
+            "a refusal wrote {} bytes",
+            out.data.len()
+        );
+    }
+
+    /// A state with recurrent stores and points streams in onto another
+    /// model's stores at every card chunk: the rows below the positions, the
+    /// recurrent stores and the points are the source's, the rows past the
+    /// positions untouched, the host values come back; refused by name,
+    /// nothing written, for another layout and for checkpoints that already
+    /// hold a point; a stream cut inside the points and one that goes on past
+    /// the state are refused by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_state_with_recurrent_stores_streams_in_at_every_card_chunk() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let mut src = source(&ctx, &stream);
+        let n = POS as usize;
+        let held = lend(&mut src, n, |lent, ckpt| {
+            let points = vec![(16, Val(7)), (32, Val(8))];
+            SeqState::save(&stream, who(), POS, lent, Val(9), points, ckpt).expect("a save")
+        });
+        let oracle = put_bytes(&held).expect("the held state's bytes");
+        let want = rows_below(&src, &stream, n);
+        for chunk in CHUNKS {
+            let mut dst = Model::new(&ctx, &stream, false);
+            let mut input = oracle.as_slice();
+            let mut r = Take::new(&mut input).with_card_chunk(chunk);
+            let head = SeqState::<Val>::take_state_head(&mut r, &who()).expect("the head");
+            assert_eq!(head.positions(), POS);
+            assert_eq!(head.current().0, 9);
+            let hosts: Vec<(u32, u32)> = head.points().iter().map(|(p, v)| (*p, v.0)).collect();
+            assert_eq!(hosts, [(16, 7), (32, 8)]);
+            lend(&mut dst, n, |lent, ckpt| {
+                head.check(lent, ckpt).expect("the layout");
+                head.take_arrays(&mut r, &stream, lent, ckpt)
+                    .expect("the arrays");
+            });
+            r.end().expect("the stream ended where the state does");
+            assert_eq!(rows_below(&dst, &stream, n), want, "card chunk {chunk} B");
+            let k = dst.k.to_host_vec(&stream).expect("k");
+            for p in 0..PLANES {
+                assert!(
+                    k[p * CTX * H + n * H..(p + 1) * CTX * H]
+                        .iter()
+                        .all(|&v| v == POISON),
+                    "a row past the positions at card chunk {chunk} B"
+                );
+            }
+            for (rec, len) in dst.rec.iter().zip(LENS) {
+                let now = rec.to_host_vec(&stream).expect("rec");
+                assert_eq!(now, vec![3.0; len], "card chunk {chunk} B");
+            }
+            assert_eq!(dst.ckpt.positions(), [16, 32], "card chunk {chunk} B");
+            for (at, v) in [(16, 1.0f32), (32, 2.0)] {
+                let stores: Vec<Vec<f32>> = dst
+                    .ckpt
+                    .point_stores(at)
+                    .expect("a point")
+                    .map(<[f32]>::to_vec)
+                    .collect();
+                assert_eq!(
+                    stores,
+                    [vec![v; LENS[0]], vec![v; LENS[1]]],
+                    "the point at {at}, card chunk {chunk} B"
+                );
+            }
+        }
+
+        let mut dst = Model::new(&ctx, &stream, false);
+        let mut input = oracle.as_slice();
+        let mut r = Take::new(&mut input);
+        let head = SeqState::<Val>::take_state_head(&mut r, &who()).expect("the head");
+        let other = lend(&mut dst, n - 1, |lent, ckpt| head.check(lent, ckpt));
+        let other = other.expect_err("another layout is refused");
+        assert!(other.to_string().contains("positional runs"), "{other}");
+        dst.fill_rec(&stream, 5.0);
+        {
+            let Model { rec, ckpt, .. } = &mut dst;
+            let [r0, r1] = rec;
+            ckpt.take(&stream, 16, &mut [r0, r1]).expect("a point");
+        }
+        let held_point = lend(&mut dst, n, |lent, ckpt| {
+            head.take_arrays(&mut r, &stream, lent, ckpt)
+        });
+        refused_with(held_point, "restore onto an empty model");
+        assert_eq!(
+            rows_below(&dst, &stream, n),
+            vec![POISON; want.len()],
+            "a refusal moved no row"
+        );
+        assert_eq!(dst.rec[0].to_host_vec(&stream).expect("rec"), [5.0; 4]);
+
+        let dst = &mut Model::new(&ctx, &stream, false);
+        let cut = &oracle[..oracle.len() - 10];
+        let mut input = cut;
+        let mut r = Take::new(&mut input);
+        let head = SeqState::<Val>::take_state_head(&mut r, &who()).expect("the head");
+        let short = lend(dst, n, |lent, ckpt| {
+            head.take_arrays(&mut r, &stream, lent, ckpt)
+        });
+        refused_with(short, "a short stream");
+
+        let mut long = oracle.clone();
+        long.push(0);
+        let mut input = long.as_slice();
+        let mut r = Take::new(&mut input);
+        let head = SeqState::<Val>::take_state_head(&mut r, &who()).expect("the head");
+        let dst = &mut Model::new(&ctx, &stream, false);
+        lend(dst, n, |lent, ckpt| {
+            head.take_arrays(&mut r, &stream, lent, ckpt)
+        })
+        .expect("the arrays");
+        refused_with(r.end(), "trailing bytes past the state");
+    }
+
+    /// A state of rows alone streams out as the held state's bytes and in
+    /// onto another model's stores at every card chunk: the rows below the
+    /// positions are the source's, the rows past them untouched; refused by
+    /// name, nothing written, for another layout; a stream cut inside the
+    /// rows and one that goes on past the state are refused by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_state_of_rows_alone_streams_out_and_in_at_every_card_chunk() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let mut src = source(&ctx, &stream);
+        let n = POS as usize;
+        let held = lend_rows(&mut src, n, |lent| {
+            SeqState::save_rows(&stream, who(), POS, lent).expect("a save")
+        });
+        let mut oracle = Vec::new();
+        {
+            let mut w = Put::new(&mut oracle);
+            held.put(&mut w).expect("the held state's bytes");
+            w.flush().expect("flushed");
+        }
+        let want = rows_below(&src, &stream, n);
+        for chunk in ROW_CHUNKS {
+            let mut out = Counting::default();
+            lend_rows(&mut src, n, |lent| {
+                let mut w = Put::new(&mut out).with_card_chunk(chunk);
+                SeqState::put_save_rows(&mut w, &stream, &who(), POS, lent).expect("streamed");
+                w.flush().expect("flushed");
+            });
+            assert_eq!(out.data, oracle, "card chunk {chunk} B");
+            assert!(out.longest <= bytes::CHUNK, "a write of {} B", out.longest);
+
+            let mut dst = Model::new(&ctx, &stream, false);
+            let mut input = oracle.as_slice();
+            let mut r = Take::new(&mut input).with_card_chunk(chunk);
+            let head = SeqState::<()>::take_rows_head(&mut r, &who()).expect("the head");
+            assert_eq!(head.positions(), POS);
+            lend_rows(&mut dst, n, |lent| {
+                head.check(lent).expect("the layout");
+                head.take_rows(&mut r, &stream, lent).expect("the rows");
+            });
+            r.end().expect("the stream ended where the state does");
+            assert_eq!(rows_below(&dst, &stream, n), want, "card chunk {chunk} B");
+            let past = dst.k.to_host_vec(&stream).expect("k");
+            assert!(
+                past[n * H..CTX * H].iter().all(|&v| v == POISON),
+                "a row past the positions at card chunk {chunk} B"
+            );
+        }
+
+        let dst = &mut Model::new(&ctx, &stream, false);
+        let mut input = oracle.as_slice();
+        let mut r = Take::new(&mut input);
+        let head = SeqState::<()>::take_rows_head(&mut r, &who()).expect("the head");
+        let other = lend_rows(dst, n - 1, |lent| head.check(lent));
+        let other = other.expect_err("another layout is refused");
+        assert!(other.to_string().contains("positional runs"), "{other}");
+        assert_eq!(
+            rows_below(dst, &stream, n - 1),
+            vec![POISON; rows_below(dst, &stream, n - 1).len()],
+            "a refusal moved no row"
+        );
+
+        let cut = &oracle[..oracle.len() - 100];
+        let mut input = cut;
+        let mut r = Take::new(&mut input);
+        let head = SeqState::<()>::take_rows_head(&mut r, &who()).expect("the head");
+        let short = lend_rows(dst, n, |lent| head.take_rows(&mut r, &stream, lent));
+        refused_with(short, "a short stream");
+
+        let mut long = oracle.clone();
+        long.push(0);
+        let mut input = long.as_slice();
+        let mut r = Take::new(&mut input);
+        let head = SeqState::<()>::take_rows_head(&mut r, &who()).expect("the head");
+        lend_rows(dst, n, |lent| head.take_rows(&mut r, &stream, lent)).expect("the rows");
+        refused_with(r.end(), "trailing bytes past the state");
     }
 
     /// A prefix of `n` positions leaves the card as a load and a cut to its

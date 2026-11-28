@@ -36,16 +36,28 @@
 //! "Another build" is the bytes, not a commit: a state of this format and
 //! layout reads the same whichever commit wrote it, and a change to any
 //! part, its order or its encoding raises [`STATE_FORMAT`].
+//!
+//! The byte form is never built whole on the host. A save ([`save_state`])
+//! writes the live sequence part by part: the card's arrays through
+//! [`Put::from_card`], a chunk of [`bytes::CARD_CHUNK`] bytes at a time, the
+//! pinned shadows' rows straight from their host memory. A restore
+//! ([`restore_state`]) reads the header and the host parts (history, the
+//! slots' record, the pending restore) and refuses by name, with the model
+//! untouched, anything those hold; then it resets the model and reads the
+//! arrays through [`Take::to_card`] onto the card, and stands the model at
+//! the state's positions only once the stream has ended where it must. A
+//! stream that fails or is refused after the reset leaves the model reset.
+//! [`SeqSnapshot::write_state`] writes the same bytes from a held snapshot.
 
 use std::ffi::OsStr;
-use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use bloomery_gpu::checkpoint::bytes::{self, Put, Take};
+use bloomery_gpu::checkpoint::bytes::{self, Le, Put, Take};
+use bloomery_gpu::checkpoint::restore::restore_streamed;
 use bloomery_gpu::checkpoint::saved::Identity;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{DeviceBuffer, DeviceCopy};
@@ -66,96 +78,162 @@ const STATE_TAG: [u8; 8] = *b"BLMV41SQ";
 /// order or its encoding changes.
 const STATE_FORMAT: u32 = 2;
 
-/// Why [`save_state`] or [`restore_state`] failed.
-#[derive(Debug)]
-pub enum StateFail {
-    /// Refused by name: a state of another model file, build, layout or
-    /// context, a stream that is not one, or a sequence that cannot be saved
-    /// as it stands. A save leaves the sequence as it was; a restore may have
-    /// read part of the stream, and the caller resets the sequence.
-    Refused(GpuError),
-    /// The card failed mid-copy: the model's error.
-    Card(GpuError),
-    /// The stream itself failed: a write or a read it refused (a closed
-    /// pipe, a full disk) — neither the request's form nor the model's. A
-    /// stream that ends early is a short stream, refused by name. A save
-    /// leaves the sequence as it was; a restore touched nothing on the
-    /// device, and the caller resets the sequence as for a refusal.
-    Io(io::Error),
-}
-
-impl fmt::Display for StateFail {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StateFail::Refused(e) => write!(f, "refused: {e}"),
-            StateFail::Card(e) => write!(f, "the card failed: {e}"),
-            StateFail::Io(e) => write!(f, "the stream failed: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for StateFail {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            StateFail::Refused(e) | StateFail::Card(e) => Some(e),
-            StateFail::Io(e) => Some(e),
-        }
-    }
-}
-
-/// `e` as a failure of the byte form: a refusal by name
-/// ([`GpuError::Shape`], [`GpuError::State`]) is the request's, every other
-/// error the model's.
-fn fail(e: GpuError) -> StateFail {
-    match e {
-        GpuError::Shape { .. } | GpuError::State { .. } => StateFail::Refused(e),
-        e => StateFail::Card(e),
-    }
-}
+/// Why [`save_state`] or [`restore_state`] failed: the byte form's own
+/// ([`bytes::Fail`]). Refused by name: a state of another model file, build,
+/// layout or context, a stream that is not one, or a sequence that cannot be
+/// saved as it stands. The card failing mid-copy is the model's, the stream's
+/// own failure the file's. A save leaves the sequence as it was; a restore
+/// refused in the header or the host parts that follow it leaves it as it
+/// was, one failed after them (a short stream, a byte past the state, a
+/// stream or card failure) leaves it reset, and [`bytes::Fail::Reset`] names
+/// a reset that failed too.
+pub use bytes::Fail as StateFail;
 
 /// A refusal by name of the byte form ([`StateFail::Refused`]).
 fn refused(detail: String) -> StateFail {
     StateFail::Refused(refuse(detail))
 }
 
-/// A failure of the shared byte form as this state's: its refusal by name or
-/// its stream's error, never the model's.
-impl From<bytes::Fail> for StateFail {
-    fn from(e: bytes::Fail) -> StateFail {
-        match e {
-            bytes::Fail::Refused(e) => StateFail::Refused(e),
-            bytes::Fail::Io(e) => StateFail::Io(e),
-        }
-    }
+/// The selected sequence's state written to `out` in the byte form (the
+/// module table), part by part through one buffer and one chunk of the card's
+/// copy, the sequence unchanged; the bytes written. Everything a refusal
+/// depends on is settled before the first byte: a refused or failed save
+/// writes none of the header. A card or stream failure after it leaves the
+/// bytes written so far to the caller, who drops them.
+pub fn save_state(m: &mut Deepseek41Model, out: &mut dyn Write) -> Result<u64, StateFail> {
+    save_state_chunked(m, out, bytes::CARD_CHUNK)
 }
 
-/// The selected sequence's state ([`snapshot`]) written to `out` in the byte
-/// form (the module table), part by part through one buffer, the sequence
-/// unchanged; the bytes written. The host holds one snapshot and the buffer.
-pub fn save_state(m: &mut Deepseek41Model, out: &mut dyn Write) -> Result<u64, StateFail> {
-    let s = snapshot(m).map_err(fail)?;
-    let mut w = Put::new(out);
-    s.write(&mut w)?;
+/// [`save_state`] with the card copied `card_chunk` bytes at a time in place
+/// of [`bytes::CARD_CHUNK`]: the same bytes, whatever the chunk.
+pub fn save_state_chunked(
+    m: &mut Deepseek41Model,
+    out: &mut dyn Write,
+    card_chunk: usize,
+) -> Result<u64, StateFail> {
+    refuse_poisoned(m, "a save").map_err(StateFail::card)?;
+    let (gpu, _, body) = m.body_parts(WHAT).map_err(StateFail::card)?;
+    let mut w = Put::new(out).with_card_chunk(card_chunk);
+    body.put_state(gpu, &mut w)?;
     w.flush()?;
     Ok(w.bytes())
 }
 
-/// The state `input` carries, which [`save_state`] wrote, put back into the
-/// selected sequence as [`resume`] puts a snapshot back; the positions it
-/// holds. `input` runs to the state's end. The header is read and checked
-/// first ([`check`]), then the values, then the stream's end — a refusal in
-/// any of them is [`StateFail::Refused`], and a failure of the stream
-/// [`StateFail::Io`], with nothing on the device touched; a failure of the
-/// put back is the model's.
+/// The state `input` carries, which [`save_state`] wrote, put into the
+/// selected sequence; the positions it holds. `input` runs to the state's
+/// end. The header is read and checked first ([`check`]), then the host parts
+/// (the history, the slots' record, the pending restore): a refusal in any of
+/// them is [`StateFail::Refused`], and a failure of the stream
+/// [`StateFail::Io`], with the sequence untouched. Then the model is reset and
+/// the arrays go to the card as they are read; the model stands at the state's
+/// positions only after the stream ended where it must. A refusal, a stream
+/// failure or a card failure from the reset on leaves the model reset (no
+/// position, no history), never a part of the state claimed whole; a reset
+/// that fails too is [`StateFail::Reset`], which keeps the failure that
+/// called for it. A failure of the put back is the model's.
 pub fn restore_state(m: &mut Deepseek41Model, input: &mut dyn Read) -> Result<usize, StateFail> {
-    let mut r = Take::new(input);
-    let h = Header::read(&mut r)?;
-    let (gpu, _, body) = m.body_parts(WHAT).map_err(fail)?;
-    body.check_state(gpu, &h).map_err(fail)?;
-    let s = SeqSnapshot::read(&mut r, h)?;
-    r.end()?;
-    resume(m, &s).map_err(fail)?;
-    Ok(s.positions())
+    restore_state_chunked(m, input, bytes::CARD_CHUNK)
+}
+
+/// [`restore_state`] with the card written `card_chunk` bytes at a time in
+/// place of [`bytes::CARD_CHUNK`]: the same restore, whatever the chunk.
+pub fn restore_state_chunked(
+    m: &mut Deepseek41Model,
+    input: &mut dyn Read,
+    card_chunk: usize,
+) -> Result<usize, StateFail> {
+    let mut r = Take::new(input).with_card_chunk(card_chunk);
+    restore_streamed(
+        m,
+        &mut r,
+        |m, r| {
+            let h = Header::read(r)?;
+            let (gpu, _, body) = m.body_parts(WHAT).map_err(StateFail::card)?;
+            body.check_state(gpu, &h).map_err(StateFail::card)?;
+            let host = HostPart::read(r, &h)?;
+            Ok((h, host))
+        },
+        |m, r, (h, _)| {
+            let (gpu, _, body) = m.body_parts(WHAT).map_err(StateFail::card)?;
+            body.take_state(gpu, r, h)
+        },
+        |m, (h, host), ()| {
+            let n = h.positions;
+            if n == 0 {
+                return Ok(0);
+            }
+            let (shadow_from, holes) = (h.shadow_from, h.holes);
+            m.run_rows(n, WHAT, move |_, _, body, _, _| {
+                body.stand(host, shadow_from, holes);
+                Ok(false)
+            })
+            .map_err(StateFail::card)?;
+            Ok(n)
+        },
+    )
+}
+
+/// The parts of a state a restore keeps on the host, read before the
+/// arrays: the history, the slots' record of the rings, the pending restore.
+struct HostPart {
+    history: History,
+    holds: Holds,
+    restore: bool,
+}
+
+impl HostPart {
+    /// The values after header `h` up to the arrays (the module table), read
+    /// from `r`: refused by name for a media span of positions that pass
+    /// u32, a history the spans do not fit, a slot that holds a position
+    /// past usize, and a pending restore that is not 0 or 1.
+    fn read(r: &mut Take<'_>, h: &Header) -> Result<HostPart, StateFail> {
+        let ids = r.vals::<u32>(h.positions, "the history")?;
+        let media = h
+            .media
+            .iter()
+            .map(|r| {
+                u32::try_from(r.start)
+                    .and_then(|s| u32::try_from(r.end).map(|e| s..e))
+                    .map_err(|_| refused(format!("a media span {r:?} of positions that pass u32")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut history = History::default();
+        history
+            .set_media(&ids, &media)
+            .map_err(|e| refused(format!("{e}")))?;
+        let held = |q: u64| -> Result<Option<usize>, StateFail> {
+            if q == u64::MAX {
+                return Ok(None);
+            }
+            usize::try_from(q)
+                .map(Some)
+                .map_err(|_| refused(format!("a slot that holds position {q}, past usize")))
+        };
+        let ring = r
+            .vals::<u64>(h.shape.ring, "the ring slots' record")?
+            .into_iter()
+            .map(held)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut states = Vec::with_capacity(h.shape.ratios.len());
+        for &ratio in &h.shape.ratios {
+            let slots = r
+                .vals::<u64>(ratio, "the state slots' record")?
+                .into_iter()
+                .map(held)
+                .collect::<Result<Vec<_>, _>>()?;
+            states.push((ratio, slots));
+        }
+        let restore = match r.one::<u8>("the pending restore")? {
+            0 => false,
+            1 => true,
+            b => return Err(refused(format!("a pending restore of {b}: 0 or 1"))),
+        };
+        Ok(HostPart {
+            history,
+            holds: Holds { ring, states },
+            restore,
+        })
+    }
 }
 
 /// One layer's cache as saved: the ring whole, the compressed rows and index
@@ -306,6 +384,16 @@ impl SeqSnapshot {
         }
     }
 
+    /// The byte form (the module table) of this snapshot written to `out`;
+    /// the bytes written. Those [`save_state`] streams for the same state,
+    /// which is what holds the two to one form.
+    pub fn write_state(&self, out: &mut dyn Write) -> Result<u64, StateFail> {
+        let mut w = Put::new(out);
+        self.write(&mut w)?;
+        w.flush()?;
+        Ok(w.bytes())
+    }
+
     /// The byte form (the module table) into `w`.
     fn write(&self, w: &mut Put<'_>) -> Result<(), StateFail> {
         self.header().write(w)?;
@@ -325,81 +413,7 @@ impl SeqSnapshot {
             w.vals(&l.values)?;
             w.vals(&l.scores)?;
         }
-        Ok(w.vals(&self.shadow)?)
-    }
-
-    /// The values after header `h` (the module table), read from `r`.
-    fn read(r: &mut Take<'_>, h: Header) -> Result<SeqSnapshot, StateFail> {
-        let ids = r.vals::<u32>(h.positions, "the history")?;
-        let media = h
-            .media
-            .iter()
-            .map(|r| {
-                u32::try_from(r.start)
-                    .and_then(|s| u32::try_from(r.end).map(|e| s..e))
-                    .map_err(|_| refused(format!("a media span {r:?} of positions that pass u32")))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut history = History::default();
-        history
-            .set_media(&ids, &media)
-            .map_err(|e| refused(format!("{e}")))?;
-        let held = |q: u64| -> Result<Option<usize>, StateFail> {
-            if q == u64::MAX {
-                return Ok(None);
-            }
-            usize::try_from(q)
-                .map(Some)
-                .map_err(|_| refused(format!("a slot that holds position {q}, past usize")))
-        };
-        let ring = r
-            .vals::<u64>(h.shape.ring, "the ring slots' record")?
-            .into_iter()
-            .map(held)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut states = Vec::with_capacity(h.shape.ratios.len());
-        for &ratio in &h.shape.ratios {
-            let slots = r
-                .vals::<u64>(ratio, "the state slots' record")?
-                .into_iter()
-                .map(held)
-                .collect::<Result<Vec<_>, _>>()?;
-            states.push((ratio, slots));
-        }
-        let restore = match r.one::<u8>("the pending restore")? {
-            0 => false,
-            1 => true,
-            b => return Err(refused(format!("a pending restore of {b}: 0 or 1"))),
-        };
-        let mut kv = Vec::with_capacity(h.shape.kv.len());
-        for &[ring, rows, keys, values, scores] in &h.shape.kv {
-            kv.push(LayerSaved {
-                ring: r.vals(ring, "a layer's ring")?,
-                rows: r.vals(rows, "a layer's compressed rows")?,
-                keys: r.vals(keys, "a layer's index keys")?,
-                values: r.vals(values, "a layer's state values")?,
-                scores: r.vals(scores, "a layer's state scores")?,
-            });
-        }
-        let positions: usize = h.runs.iter().map(Range::len).sum();
-        let shadow = r.vals(
-            positions * h.shape.kv.len() * h.shape.width,
-            "the shadow rows",
-        )?;
-        Ok(SeqSnapshot {
-            who: h.who,
-            slots: h.slots,
-            layers: h.shape.layers,
-            kv,
-            width: h.shape.width,
-            runs: h.runs,
-            shadow,
-            history,
-            holds: Holds { ring, states },
-            shadow_from: h.shadow_from,
-            holes: h.holes,
-            restore,
-        })
+        w.vals(&self.shadow)
     }
 }
 
@@ -785,6 +799,148 @@ impl Shadows {
         }
         Ok(())
     }
+
+    /// Layer `i`'s shadow rows `rows` written to `w`, after the stream
+    /// finished every append (the caller synchronized): from the host
+    /// allocation as it stands, or a chunk at a time from the room's rows.
+    pub(super) fn put_rows(
+        &self,
+        gpu: &Gpu,
+        i: usize,
+        rows: Range<usize>,
+        w: &mut Put<'_>,
+    ) -> Result<(), StateFail> {
+        let (width, per) = (self.width(), self.rows());
+        let refuse = || {
+            StateFail::card(GpuError::Shape {
+                what: WHAT,
+                detail: format!("shadow {i} rows {rows:?} of shadows of {per} rows of {width}"),
+            })
+        };
+        if rows.end > per || rows.start > rows.end {
+            return Err(refuse());
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Shadows::Pinned(p) => {
+                let at = (i * per + rows.start) * width;
+                let src = p.host.get(at..at + rows.len() * width).ok_or_else(refuse)?;
+                w.vals(src)?;
+            }
+            Shadows::Room(r) => {
+                let t = r.layers.get(i).ok_or_else(refuse)?;
+                put_card(
+                    w,
+                    gpu,
+                    Some(t.buf()),
+                    rows.start * width,
+                    rows.len() * width,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Layer `i`'s shadow rows `rows` read from `r`, the stream idle (the
+    /// caller synchronized): into the host allocation, or a chunk at a time
+    /// onto the room's rows, which the caller fitted.
+    pub(super) fn take_rows(
+        &mut self,
+        gpu: &Gpu,
+        i: usize,
+        rows: Range<usize>,
+        r: &mut Take<'_>,
+    ) -> Result<(), StateFail> {
+        const PART: &str = "the shadow rows";
+        let (width, per) = (self.width(), self.rows());
+        let refuse = || {
+            StateFail::card(GpuError::Shape {
+                what: WHAT,
+                detail: format!("shadow {i} rows {rows:?} of shadows of {per} rows of {width}"),
+            })
+        };
+        if rows.end > per || rows.start > rows.end {
+            return Err(refuse());
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let len = rows.len() * width;
+        match self {
+            Shadows::Pinned(p) => {
+                let at = (i * per + rows.start) * width;
+                let dst = p
+                    .host
+                    .as_mut_slice()
+                    .get_mut(at..at + len)
+                    .ok_or_else(refuse)?;
+                r.to_card::<u16>(len, PART, |at, chunk| {
+                    dst[at].copy_from_slice(chunk);
+                    Ok(())
+                })?;
+            }
+            Shadows::Room(room) => {
+                let t = room.layers.get_mut(i).ok_or_else(refuse)?;
+                let off = rows.start * width;
+                r.to_card::<u16>(len, PART, |at, chunk| {
+                    span_mut(WHAT, t.buf_mut(), off + at.start, chunk.len())?
+                        .copy_from_host(gpu.stream(), chunk)?;
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `len` values of `buf` from value `off` written to `w` as [`Put::vals`]
+/// writes them, copied from the card a chunk at a time
+/// ([`Put::from_card`]); `None` holds none.
+fn put_card<T: Le + DeviceCopy + Default>(
+    w: &mut Put<'_>,
+    gpu: &Gpu,
+    buf: Option<&DeviceBuffer<T>>,
+    off: usize,
+    len: usize,
+) -> Result<(), StateFail> {
+    if len == 0 {
+        return Ok(());
+    }
+    let buf =
+        buf.ok_or_else(|| refused(format!("{len} values of a part the body does not hold")))?;
+    w.from_card::<T>(len, |at, out| {
+        span(WHAT, buf, off + at.start, at.len())?.copy_to_host(gpu.stream(), out)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// `len` values of a part read from `r`, onto the first values of `buf`
+/// a chunk at a time ([`Take::to_card`]) when `onto_card`, else read and
+/// dropped (a state of no positions keeps its arrays in the stream).
+fn take_card<T: Le + DeviceCopy + Default>(
+    r: &mut Take<'_>,
+    gpu: &Gpu,
+    buf: Option<&mut DeviceBuffer<T>>,
+    len: usize,
+    part: &str,
+    onto_card: bool,
+) -> Result<(), StateFail> {
+    match buf {
+        Some(buf) if onto_card => r.to_card::<T>(len, part, |at, chunk| {
+            span_mut(WHAT, buf, at.start, chunk.len())?.copy_from_host(gpu.stream(), chunk)?;
+            Ok(())
+        })?,
+        None if len > 0 => {
+            return Err(refused(format!(
+                "{part}: {len} values for a body that holds none"
+            )));
+        }
+        _ => r.to_card::<T>(len, part, |_, _| Ok(()))?,
+    }
+    Ok(())
 }
 
 /// `len` values of `buf` from value `off`, device to host (a blocking copy).
@@ -852,9 +1008,10 @@ impl Body {
         })
     }
 
-    /// The sequence state to the host: the rows in flight delivered, the
-    /// stream finished, then every saved part copied (module comment).
-    fn save(&mut self, gpu: &Gpu) -> Result<SeqSnapshot, GpuError> {
+    /// What a save of the sequence waits for before it reads any part: the
+    /// rows in flight delivered, the stream finished, and an earlier step's
+    /// failed rows refused.
+    fn settle_for_save(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         self.arrive()?;
         self.rows.finish()?;
         if self.seq.rows_failed {
@@ -864,6 +1021,146 @@ impl Body {
             });
         }
         gpu.stream().synchronize()?;
+        Ok(())
+    }
+
+    /// The live sequence's state as [`save_state`] writes it, part by part
+    /// (the module table): everything that can refuse is settled first
+    /// ([`Body::settle_for_save`], the identity, the layout), then the bytes
+    /// are written in the order [`SeqSnapshot::write_state`] writes them, the
+    /// card's arrays a chunk at a time.
+    fn put_state(&mut self, gpu: &Gpu, w: &mut Put<'_>) -> Result<(), StateFail> {
+        self.settle_for_save(gpu).map_err(StateFail::card)?;
+        let n = self.seq.history.len();
+        let h = Header {
+            who: self.identity(gpu).map_err(StateFail::card)?,
+            slots: self.slots_planned,
+            positions: n,
+            shape: self.shape(n).map_err(StateFail::card)?,
+            shadow_from: self.seq.shadow_from,
+            holes: self.seq.holes.clone(),
+            runs: kept_runs(self.seq.shadow_from, n, &self.seq.holes),
+            media: self
+                .seq
+                .history
+                .media()
+                .iter()
+                .map(|r| r.start as usize..r.end as usize)
+                .collect(),
+        };
+        h.write(w)?;
+        w.vals(self.seq.history.ids())?;
+        let held = |q: &Option<usize>| q.map_or(u64::MAX, |q| q as u64);
+        let ring: Vec<u64> = self.seq.holds.ring.iter().map(held).collect();
+        w.vals(&ring)?;
+        for (_, s) in &self.seq.holds.states {
+            let s: Vec<u64> = s.iter().map(held).collect();
+            w.vals(&s)?;
+        }
+        w.vals(&[u8::from(self.seq.restore)])?;
+        for (l, &[ring, rows, keys, values, scores]) in self.seq.kv.iter().zip(&h.shape.kv) {
+            put_card(w, gpu, Some(l.ring.buf()), 0, ring)?;
+            put_card(w, gpu, l.rows.as_deref().map(|t| t.buf()), 0, rows)?;
+            put_card(w, gpu, l.keys.as_deref().map(|t| t.buf()), 0, keys)?;
+            put_card(w, gpu, l.values.as_ref().map(|t| t.buf()), 0, values)?;
+            put_card(w, gpu, l.scores.as_ref().map(|t| t.buf()), 0, scores)?;
+        }
+        for run in &h.runs {
+            for i in 0..self.seq.kv.len() {
+                self.seq.shadows.put_rows(gpu, i, run.clone(), w)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The arrays of the state of header `h` read from `r` onto the card of
+    /// this body, which was just reset and takes the header ([`Body::check_state`]):
+    /// the held positions' rooms backed first, then every layer's arrays and
+    /// the shadows' rows a chunk at a time. Nothing of the host record is
+    /// set ([`Body::stand`]).
+    fn take_state(&mut self, gpu: &Gpu, r: &mut Take<'_>, h: &Header) -> Result<(), StateFail> {
+        let onto_card = h.positions > 0;
+        if onto_card {
+            // The saved rows land on pages of this sequence's own: the held positions' rooms
+            // are backed before the copies, outside any capture.
+            self.fit_on(None, 0, h.positions).map_err(StateFail::card)?;
+        }
+        for (l, &[ring, rows, keys, values, scores]) in self.seq.kv.iter_mut().zip(&h.shape.kv) {
+            take_card(
+                r,
+                gpu,
+                Some(l.ring.buf_mut()),
+                ring,
+                "a layer's ring",
+                onto_card,
+            )?;
+            let part = "a layer's compressed rows";
+            take_card(
+                r,
+                gpu,
+                l.rows.as_mut().map(|t| t.buf_mut()),
+                rows,
+                part,
+                onto_card,
+            )?;
+            let part = "a layer's index keys";
+            take_card(
+                r,
+                gpu,
+                l.keys.as_mut().map(|t| t.buf_mut()),
+                keys,
+                part,
+                onto_card,
+            )?;
+            let part = "a layer's state values";
+            take_card(
+                r,
+                gpu,
+                l.values.as_mut().map(|t| t.buf_mut()),
+                values,
+                part,
+                onto_card,
+            )?;
+            let part = "a layer's state scores";
+            take_card(
+                r,
+                gpu,
+                l.scores.as_mut().map(|t| t.buf_mut()),
+                scores,
+                part,
+                onto_card,
+            )?;
+        }
+        // No step in flight writes a shadow row while the host does.
+        gpu.stream()
+            .synchronize()
+            .map_err(|e| StateFail::card(GpuError::from(e)))?;
+        for run in &h.runs {
+            for i in 0..self.seq.kv.len() {
+                self.seq.shadows.take_rows(gpu, i, run.clone(), r)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The host record of a state whose arrays [`Body::take_state`] put on the
+    /// card: the sequence stands at the history's positions.
+    fn stand(&mut self, host: HostPart, shadow_from: usize, holes: Vec<Range<usize>>) {
+        self.seq.history.clone_from(&host.history);
+        self.seq.holds.clone_from(&host.holds);
+        self.seq.shadow_from = shadow_from;
+        self.seq.holes = holes;
+        self.seq.restore = host.restore;
+        self.need = None;
+        if let Some(tap) = self.tap.as_mut() {
+            tap.pos = [None; PAIR_ROWS];
+        }
+    }
+
+    /// The sequence state to the host: the rows in flight delivered, the
+    /// stream finished, then every saved part copied (module comment).
+    fn save(&mut self, gpu: &Gpu) -> Result<SeqSnapshot, GpuError> {
+        self.settle_for_save(gpu)?;
         let n = self.seq.history.len();
         let shape = self.shape(n)?;
         let mut kv = Vec::with_capacity(self.seq.kv.len());
@@ -981,14 +1278,21 @@ fn kept_runs(shadow_from: usize, n: usize, holes: &[Range<usize>]) -> Vec<Range<
 /// `m`'s sequence state on the host. Refused on a poisoned model: its caches
 /// hold what a fault condemned.
 pub fn snapshot(m: &mut Deepseek41Model) -> Result<SeqSnapshot, GpuError> {
-    if let Some(fault) = m.poisoned() {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!("a snapshot of a model a fault poisoned ({fault:?})"),
-        });
-    }
+    refuse_poisoned(m, "snapshot")?;
     let (gpu, _, body) = m.body_parts(WHAT)?;
     body.save(gpu)
+}
+
+/// Refused by name on a model a fault poisoned: its caches hold what the
+/// fault condemned, so no `what` of them is taken.
+fn refuse_poisoned(m: &Deepseek41Model, what: &str) -> Result<(), GpuError> {
+    match m.poisoned() {
+        Some(fault) => Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!("a {what} of a model a fault poisoned ({fault:?})"),
+        }),
+        None => Ok(()),
+    }
 }
 
 fn state_bytes(
@@ -1043,6 +1347,9 @@ pub fn resume(m: &mut Deepseek41Model, s: &SeqSnapshot) -> Result<(), GpuError> 
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
+    use std::io;
+
     use super::*;
 
     /// A header of two layers, the second without a compressor, 40 positions
@@ -1184,10 +1491,7 @@ mod tests {
         let mut input = past.as_slice();
         let mut r = Take::new(&mut input);
         Header::read(&mut r).expect("its own header");
-        named(
-            r.end().map_err(StateFail::from),
-            "trailing bytes past the state's",
-        );
+        named(r.end(), "trailing bytes past the state's");
     }
 
     /// A header cut anywhere is a short stream, refused by name.
@@ -1209,7 +1513,7 @@ mod tests {
         for left in [0, 10, b.len() - 1] {
             let mut out = FullAfter { left };
             let mut w = Put::new(&mut out);
-            let r = h.write(&mut w).and_then(|()| Ok(w.flush()?));
+            let r = h.write(&mut w).and_then(|()| w.flush());
             assert!(
                 matches!(&r, Err(StateFail::Io(e)) if e.kind() == io::ErrorKind::StorageFull),
                 "a write failing after {left} bytes: {r:?}"
@@ -1279,5 +1583,61 @@ mod tests {
             check(&h, &who, slots, |_| Ok(layout.clone())),
             "layer 4's ring",
         );
+    }
+
+    /// The bytes of header `h`'s host parts: the history of 0, 1, 2, ..., the
+    /// slots' record (four slots of the ring, then two of the one state
+    /// ring) and the pending restore `restore`.
+    fn host_bytes(h: &Header, restore: u8) -> Vec<u8> {
+        let mut b = Vec::new();
+        let mut w = Put::new(&mut b);
+        let ids: Vec<u32> = (0..h.positions as u32).collect();
+        w.vals(&ids).expect("ids into memory");
+        w.vals(&[u64::MAX, 3, 4, 5]).expect("the ring into memory");
+        w.vals(&[0u64, u64::MAX]).expect("a state ring into memory");
+        w.vals(&[restore]).expect("a byte into memory");
+        w.flush().expect("a flush into memory");
+        b
+    }
+
+    fn read_host(h: &Header, b: &[u8]) -> Result<(), StateFail> {
+        let mut input = b;
+        HostPart::read(&mut Take::new(&mut input), h).map(drop)
+    }
+
+    /// The host parts are read up to the arrays and no further, and what they
+    /// hold is refused by name before any array: a pending restore that is
+    /// no flag, spans the history does not fit or that pass u32, a stream cut
+    /// inside them.
+    #[test]
+    fn the_host_parts_are_read_before_any_array_and_refused_by_name() {
+        let h = header();
+        let b = host_bytes(&h, 1);
+        let mut input = b.as_slice();
+        let mut r = Take::new(&mut input);
+        let host = HostPart::read(&mut r, &h).expect("its own host parts");
+        assert_eq!(r.bytes(), b.len() as u64, "up to the arrays and no further");
+        assert!(host.restore);
+        assert_eq!(host.history.len(), h.positions);
+        assert_eq!(host.history.media(), &[4..12, 30..31]);
+        assert_eq!(host.holds.ring, vec![None, Some(3), Some(4), Some(5)]);
+        assert_eq!(host.holds.states, vec![(2, vec![Some(0), None])]);
+        named(read_host(&h, &host_bytes(&h, 2)), "a pending restore of 2");
+        let outside = Header {
+            media: std::iter::once(30..50).collect(),
+            ..h.clone()
+        };
+        named(
+            read_host(&outside, &host_bytes(&outside, 0)),
+            "the media positions",
+        );
+        let wide = Header {
+            media: std::iter::once(0..u32::MAX as usize + 1).collect(),
+            ..h.clone()
+        };
+        named(read_host(&wide, &host_bytes(&wide, 0)), "pass u32");
+        for cut in [0, 5, b.len() - 1] {
+            named(read_host(&h, &b[..cut]), "a short stream: it ends inside");
+        }
     }
 }

@@ -1163,12 +1163,21 @@ where
     }
 
     /// The session's reset, then `slot`'s draft — the session's selected
-    /// slot's, the sequence the reset emptied — started over and on again;
-    /// every other slot's draft stands as it is. Refused as
-    /// [`SlotDrafts::has`] refuses, before the reset.
+    /// slot's, the sequence the reset emptied — started over and on again
+    /// ([`SlotDrafts::restart`]); every other slot's draft stands as it is.
+    /// Refused as [`SlotDrafts::has`] refuses, before the reset.
     pub(crate) fn reset(&mut self, s: &mut Session<B>, slot: usize) -> Result<(), GateError> {
-        let drafting = self.has(slot)?;
+        self.has(slot)?;
         s.reset()?;
+        self.restart(slot)
+    }
+
+    /// `slot`'s draft started over and on again, for a sequence the model's
+    /// reset emptied without the session's ([`SlotDrafts::reset`] is both):
+    /// the history draft's context forgotten, the MTP draft's off reason
+    /// cleared and its walk restarted. Refused as [`SlotDrafts::has`] refuses.
+    pub(crate) fn restart(&mut self, slot: usize) -> Result<(), GateError> {
+        let drafting = self.has(slot)?;
         if let Some(l) = &mut self.history_drafts {
             l.forget(slot)?;
         }
