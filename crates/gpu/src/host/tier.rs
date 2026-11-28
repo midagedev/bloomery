@@ -173,11 +173,12 @@ impl TierSet {
         })
     }
 
-    /// Tier `tier`'s set as `map` holds it: per layer of the map, the ids of
-    /// that tier's entries in its slot order. The map is the one owner of
-    /// where an expert runs; the set is a copy of one tier's rows the tier
-    /// card keeps. Host-only edges are omitted; empty interior rows keep
-    /// their layer index. A tier the map does not name is refused by name.
+    /// Tier `tier`'s set as `map` holds it: per layer of the map, the ids homed
+    /// on that tier ([`SlotMap::home`]: an expert lent to the stage card
+    /// stays in it) in its slot order. The map is the one owner of where an
+    /// expert runs; the set is a copy of one tier's rows the tier card keeps.
+    /// Host-only edges are omitted; empty interior rows keep their layer
+    /// index. A tier the map does not name is refused by name.
     pub fn of_map(map: &SlotMap, tier: usize) -> Result<TierSet, GpuError> {
         const WHAT: &str = "TierSet::of_map";
         let layers = map.layers();
@@ -188,7 +189,7 @@ impl TierSet {
             let k = map.on_tier_of(tier, l)?;
             let mut ids = vec![u32::MAX; k];
             for id in 0..n {
-                if let Some(Slot::Tier { tier: t, slot: s }) = map.slot(l, id)
+                if let Some(Slot::Tier { tier: t, slot: s }) = map.home(l, id)
                     && t == tier
                 {
                     let at = ids.get_mut(s as usize).ok_or_else(|| {

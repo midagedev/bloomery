@@ -47,6 +47,10 @@ pub const RING_SLOTS: usize = 4;
 /// once.
 pub const LANE_THREADS: usize = 4;
 
+/// The hint threads. A hint costs the kernel the cache pages of the bytes it
+/// queues, so two threads queue ahead of what the drive reads.
+pub const ADVISE_THREADS: usize = 2;
+
 // The arena's floor counts a lane's slots: one open read a thread and a victim
 // claim.
 const _: () = assert!(LANE_THREADS as u64 + 1 == model::placement::ARENA_LANE_SLOTS);
@@ -437,6 +441,12 @@ pub(crate) struct Shared {
     failed: Mutex<Option<StagingFailure>>,
     /// Per lane thread, the jobs it took ([`LaneStats::taken`]).
     taken: [AtomicU64; LANE_THREADS],
+    /// The read-ahead hints ([`SwapSource::advise`]): handed to the hint
+    /// thread, done, the bytes they covered, and those that failed.
+    advise_sent: AtomicU64,
+    advised: AtomicU64,
+    advised_bytes: AtomicU64,
+    advise_failed: AtomicU64,
     /// The jobs staging now that the window opened, and those a flush or
     /// their landing opened; the most of each at once ([`LaneStats`]).
     in_window: AtomicU32,
@@ -598,6 +608,40 @@ impl Shared {
             peak_window: self.peak_window.load(Ordering::Relaxed),
             peak_open: self.peak_open.load(Ordering::Relaxed),
             victims: self.victims.load(Ordering::Relaxed),
+            advise_sent: self.advise_sent.load(Ordering::Relaxed),
+            advised: self.advised.load(Ordering::Acquire),
+            advised_bytes: self.advised_bytes.load(Ordering::Relaxed),
+            advise_failed: self.advise_failed.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The hint thread's loop: each expert handed over is hinted to the
+    /// source until the lane stops and drops the channel. A failed hint is
+    /// counted and the first one printed; it never stops the lane, whose
+    /// reads need no hint.
+    fn advise_loop(&self, hints: &Mutex<mpsc::Receiver<(usize, u32)>>) {
+        loop {
+            // The receive lock is held for the wait only: a thread hinting
+            // an expert is not holding the other from the next one.
+            let next = hints.lock().unwrap_or_else(PoisonError::into_inner).recv();
+            let Ok((layer, id)) = next else { return };
+            if self.stop.load(Ordering::Acquire) {
+                return;
+            }
+            match self.source.advise(layer, id) {
+                Ok(bytes) => {
+                    self.advised_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    self.advised.fetch_add(1, Ordering::Release);
+                }
+                Err(e) => {
+                    if self.advise_failed.fetch_add(1, Ordering::AcqRel) == 0 {
+                        eprintln!(
+                            "swap: the read-ahead hint of layer {layer} expert {id} failed, the \
+                             lane reads without it: {e}"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -767,12 +811,22 @@ pub struct LaneStats {
     /// The victims the lane threads prepared: the fills the lane's jobs
     /// asked of the source, each read on the lane thread.
     pub victims: u64,
+    /// The read-ahead hints handed to the hint thread (one per lent expert
+    /// the machine issued), those it has finished, the bytes they covered
+    /// and those that failed.
+    pub advise_sent: u64,
+    pub advised: u64,
+    pub advised_bytes: u64,
+    pub advise_failed: u64,
 }
 
 /// The lane's threads and their job queue, which the machine holds beside
 /// the shared state ([`start`]) and stops in its drop ([`Lane::stop`]).
 pub(super) struct Lane {
     tx: Option<mpsc::Sender<Job>>,
+    /// The channel of the hint threads, the last [`ADVISE_THREADS`] of `threads`;
+    /// `None` on a lane started without them ([`start`]).
+    advise_tx: Option<mpsc::Sender<(usize, u32)>>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -787,12 +841,27 @@ impl Lane {
         dispatch::send(self.tx.as_ref(), job, what)
     }
 
+    /// Hand layer `layer`'s expert `id` to the hint thread: its bytes are
+    /// about to be staged. A lane started without hint threads and one whose
+    /// threads have stopped count the hint failed.
+    pub(super) fn advise(&self, shared: &Shared, layer: usize, id: u32) {
+        shared.advise_sent.fetch_add(1, Ordering::Relaxed);
+        if self
+            .advise_tx
+            .as_ref()
+            .is_none_or(|tx| tx.send((layer, id)).is_err())
+        {
+            shared.advise_failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Stop the lane threads of `shared` and join them, all within one
     /// `deadline`: whether every one ended. A thread still running past it
     /// is left to finish on its own.
     pub(super) fn stop(&mut self, shared: &Shared, deadline: Duration) -> bool {
         shared.stop.store(true, Ordering::Release);
         self.tx = None;
+        self.advise_tx = None;
         let t0 = Instant::now();
         while !self.threads.iter().all(JoinHandle::is_finished) && t0.elapsed() <= deadline {
             std::thread::sleep(Duration::from_micros(200));
@@ -812,13 +881,17 @@ impl Lane {
 
 /// The ring, the staging words and the lane's [`LANE_THREADS`] threads over
 /// `source`, every host wait bounded by `deadline`, whose pick stamps cover
-/// the layer indices below `layers_end`.
+/// the layer indices below `layers_end`. With `hint`, the [`ADVISE_THREADS`]
+/// read-ahead threads of a lending machine ([`Lane::advise`]) start too;
+/// without it the lane has none, and a load that does not lend starts exactly
+/// the threads it always did.
 pub(super) fn start(
     ctx: &Arc<CudaContext>,
     source: Arc<dyn SwapSource>,
     slot_bytes: usize,
     deadline: Duration,
     layers_end: usize,
+    hint: bool,
 ) -> Result<(Arc<Shared>, Lane), GpuError> {
     let shared = Arc::new(Shared {
         source,
@@ -849,29 +922,71 @@ pub(super) fn start(
         in_open: AtomicU32::new(0),
         peak_window: AtomicU32::new(0),
         peak_open: AtomicU32::new(0),
+        advise_sent: AtomicU64::new(0),
+        advised: AtomicU64::new(0),
+        advised_bytes: AtomicU64::new(0),
+        advise_failed: AtomicU64::new(0),
     });
     let (tx, rx) = mpsc::channel::<Job>();
     let jobs = Arc::new(Mutex::new(rx));
+    let (advise_tx, hints) = if hint {
+        let (advise_tx, advise_rx) = mpsc::channel::<(usize, u32)>();
+        (Some(advise_tx), Some(Arc::new(Mutex::new(advise_rx))))
+    } else {
+        (None, None)
+    };
     let mut lane = Lane {
         tx: Some(tx),
-        threads: Vec::with_capacity(LANE_THREADS),
+        advise_tx,
+        threads: Vec::with_capacity(LANE_THREADS + if hint { ADVISE_THREADS } else { 0 }),
+    };
+    // The threads started are ending on an error: joined here, so their
+    // references to the shared state go before this one.
+    let fail = |lane: &mut Lane, e: GpuError| {
+        shared.stop.store(true, Ordering::Release);
+        lane.tx = None;
+        lane.advise_tx = None;
+        for thread in lane.threads.drain(..) {
+            let _ = thread.join();
+        }
+        e
     };
     for t in 0..LANE_THREADS {
         match spawn(ctx, &shared, &jobs, t) {
             Ok(thread) => lane.threads.push(thread),
-            // The threads started are ending: joined here, so their
-            // references to the shared state go before this one.
-            Err(e) => {
-                shared.stop.store(true, Ordering::Release);
-                lane.tx = None;
-                for thread in lane.threads.drain(..) {
-                    let _ = thread.join();
-                }
-                return Err(e);
+            Err(e) => return Err(fail(&mut lane, e)),
+        }
+    }
+    if let Some(hints) = &hints {
+        for k in 0..ADVISE_THREADS {
+            match spawn_advise(&shared, hints, k) {
+                Ok(thread) => lane.threads.push(thread),
+                Err(e) => return Err(fail(&mut lane, e)),
             }
         }
     }
     Ok((shared, lane))
+}
+
+/// Hint thread `k` over `shared`, taking experts from `hints`: a helper that
+/// binds no context, since a hint reads no device state and the step thread
+/// must not wait for the system calls of a hint. It runs where lane thread
+/// `LANE_THREADS + k` would ([`lane_placement`]): on the sibling of a pool
+/// worker past those of the staging threads and off the dispatcher's core,
+/// since the kernel's work for a hint (the cache pages of the bytes it
+/// queues) is CPU time that must not land on the critical path.
+fn spawn_advise(
+    shared: &Arc<Shared>,
+    hints: &Arc<Mutex<mpsc::Receiver<(usize, u32)>>>,
+    k: usize,
+) -> Result<JoinHandle<()>, GpuError> {
+    let (for_thread, hints) = (Arc::clone(shared), Arc::clone(hints));
+    let (thread, _) =
+        threads::helper::spawn_helper("swap-advise", lane_placement(LANE_THREADS + k), move || {
+            for_thread.advise_loop(&hints);
+        })
+        .map_err(|e| GpuError::plan("SwapMachine::new: the hint thread", e))?;
+    Ok(thread)
 }
 
 /// Lane thread `t` over `shared`, taking from `jobs`, once it has bound

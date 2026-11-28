@@ -66,7 +66,7 @@ pub const STAGE_TIER: usize = 0;
 /// places; the card sum over both cards' slots reads the places. Built once at
 /// load by a body with a tier card.
 pub struct TierSide {
-    places: DeviceTensor<u32>,
+    places: Arc<DeviceTensor<u32>>,
     tsel: Vec<DeviceBuffer<u32>>,
     k: Vec<usize>,
 }
@@ -93,12 +93,7 @@ impl TierSide {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(TierSide {
-            places: DeviceTensor::upload(
-                stream,
-                &map.tier_view(STAGE_TIER)?,
-                run.len(),
-                map.n_expert(),
-            )?,
+            places: map.tier_places(stream, STAGE_TIER)?,
             tsel: (0..rows)
                 .map(|_| DeviceBuffer::zeroed(stream, n_used))
                 .collect::<Result<Vec<_>, _>>()?,

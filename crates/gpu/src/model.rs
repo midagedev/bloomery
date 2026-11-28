@@ -1025,6 +1025,7 @@ impl<B: ChainBody> GpuModel<B> {
                         max_rows: residency.max_rows,
                         unrouted: residency.stacks.unrouted(),
                         deadline: residency.deadline,
+                        lend: bloomery_levers::node_lend().map_err(|e| GpuError::plan(WHAT, e))?,
                     },
                 )
             }

@@ -43,10 +43,10 @@ pub use registry::{
     ENGRAM_HELPER, EXPERT_RANK, FORCE_IDS, GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES,
     HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM, HOSTSTREAM, KV_FLOOR, KV_HOST,
     LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS,
-    NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_CUT,
-    PREFILL_CUT_MAX, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV,
-    QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK,
-    TIER_NODES, TP_NODES, WARM_PROFILE, WORD_OPS,
+    NEED_HOOK, NODE_LEND, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL,
+    PREFILL_CUT, PREFILL_CUT_MAX, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX,
+    QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS,
+    TIER_LINK, TIER_NODES, TP_NODES, WARM_PROFILE, WORD_OPS,
 };
 
 #[cfg(test)]
@@ -1092,6 +1092,10 @@ pub(crate) enum Scope<'a> {
     /// How a card adds to its page words ([`word_ops`]), read where the
     /// owner of a card's words opens, below every binary's `main`.
     WordOps,
+    /// Whether the residency machine lends the experts homed on a tier
+    /// ([`node_lend`]), read where a placed load builds the machine, below
+    /// every binary's `main`.
+    NodeLend,
     /// The cards' budget ([`card_budget`]), read where a placement meets the
     /// census, below every binary's `main`, which still refuses it in a
     /// binary that does not act on it; and the cards' margin
@@ -1137,6 +1141,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
     let link = |name: &str| name == TIER_LINK;
     let nodes = |name: &str| name == TIER_NODES;
     let words = |name: &str| name == WORD_OPS;
+    let lend = |name: &str| name == NODE_LEND;
     let hook = |name: &str| name == NEED_HOOK;
     let margin = |name: &str| name == CARD_MARGIN;
     let mut entries = Vec::new();
@@ -1149,6 +1154,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
                     || link(row.name)
                     || nodes(row.name)
                     || words(row.name)
+                    || lend(row.name)
                     || hook(row.name)
                     || margin(row.name)
                     || acts_on.contains(&row.name)
@@ -1163,6 +1169,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
             (Site::Parsed { .. }, Scope::TierLink) if link(row.name) => true,
             (Site::Parsed { .. }, Scope::TierNodes) if nodes(row.name) || link(row.name) => true,
             (Site::Parsed { .. }, Scope::WordOps) if words(row.name) => true,
+            (Site::Parsed { .. }, Scope::NodeLend) if lend(row.name) => true,
             (Site::Parsed { .. }, Scope::CardBudget)
                 if row.name == CARD_BUDGET || margin(row.name) =>
             {
@@ -3933,6 +3940,16 @@ fn word_ops_of(levers: &Levers) -> WordOps {
         Some(Value::Word("kernel")) => WordOps::Kernel,
         v => panic!("{WORD_OPS} holds {v:?}, not auto, memop or kernel"),
     }
+}
+
+/// `BLOOMERY_NODE_LEND` from the process environment ([`NODE_LEND`]), parsed
+/// as [`at_main`] parses it, and refused when it is set to a value its kind
+/// does not take and when a retired name is set: whether the residency
+/// machine lends the experts homed on a tier to the stage card. Nothing
+/// else.
+pub fn node_lend() -> Result<bool, LeverError> {
+    let env = process_env();
+    Ok(read(&env, Scope::NodeLend)?.flag(NODE_LEND))
 }
 
 /// Whether a tier's explicit listen or connect address is on a trusted local network:

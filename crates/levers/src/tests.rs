@@ -43,10 +43,12 @@ fn retired() -> impl Iterator<Item = &'static LeverSpec> {
 /// The rows read below every binary's `main` (the pool's two, the host's
 /// room, the NVMe tier's four, [`nvtier_levers`], the tier link,
 /// [`tier_link`], the tiers' nodes, [`tier_nodes`], the page words' adds,
-/// [`word_ops`], the need hook, [`need_levers`], and the cards' margin,
-/// [`card_margin`]), which no `at_main` list refuses.
+/// [`word_ops`], the residency machine's lend, [`node_lend`], the need hook,
+/// [`need_levers`], and the cards' margin, [`card_margin`]), which no
+/// `at_main` list refuses.
 fn pool(r: &LeverSpec) -> bool {
     r.name == CARD_MARGIN
+        || r.name == NODE_LEND
         || r.name == THREADS
         || r.name == SPIN
         || r.name == HOST_ROOM
@@ -737,6 +739,7 @@ fn accessors_read_their_rows() {
             CARD_DONTNEED,
             R8,
             RESIDENCY,
+            NODE_LEND,
             QWEN38_EXPERTS,
             HOSTSTREAM,
             XSTREAM,
@@ -2865,6 +2868,29 @@ fn word_ops_reads_each_word_and_refuses_the_rest() {
     let e = side(&[(WORD_OPS, "atomic")]).expect_err("a word the row does not take");
     assert!(e.to_string().contains(WORD_OPS), "{e}");
     assert!(read(&env(&[(WORD_OPS, "kernel")]), NO_LEVER).is_ok());
+}
+
+/// The residency machine's lend ([`Scope::NodeLend`]): unset is off, `0` and `1`
+/// are the two values, anything else is refused by name, and every binary's
+/// `main` acts on it.
+#[test]
+fn node_lend_is_off_unless_one() {
+    let lend =
+        |pairs: &[(&str, &str)]| read(&env(pairs), Scope::NodeLend).map(|l| l.flag(NODE_LEND));
+    assert!(!lend(&[]).unwrap());
+    assert!(!lend(&[(NODE_LEND, "0")]).unwrap());
+    assert!(lend(&[(NODE_LEND, "1")]).unwrap());
+    for bad in ["on", "true", "2", "", " 1"] {
+        let Err(e) = lend(&[(NODE_LEND, bad)]) else {
+            panic!("{bad:?} is not a flag of the row and must be refused");
+        };
+        assert!(e.to_string().contains(NODE_LEND), "{e}");
+    }
+    assert!(read(&env(&[(NODE_LEND, "1")]), NO_LEVER).is_ok());
+    let Err(e) = read(&env(&[(NODE_LEND, "2")]), NO_LEVER) else {
+        panic!("a binary's reading checks the value as the machine's does");
+    };
+    assert!(e.to_string().contains(NODE_LEND), "{e}");
 }
 
 /// The pool reads its two levers alone — any other lever, whatever its value,

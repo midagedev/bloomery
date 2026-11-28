@@ -1,0 +1,22 @@
+# DeepSeek-V4.1-Flash bq3km on ws (RTX 5090 + 252 GiB host) with the Spark's GB10 as the expert tier node over RDMA (listed pass, graph per
+# service), residency pool on, BLOOMERY_NODE_LEND=1. Round lendwarm, 2026-11-28; the tree is /root/agents/bloomery-nodepromo (base 10efa0e4d + the
+# lend diff + this round's hint).
+# What the card prices: the first request of a fresh lend server. Probe and confirm sittings (probe.md "confirm (4 depths)", binary 2a8572a8e3ec): the
+# first request reads 45.45 tok/s against 54.12 with the lend off (-16.0 % +- 12.1 %); its residency passes made 683..759 flips of which 240..279
+# landed late, and the host waited wait_us 0.521 / 0.618 / 0.638 s (mean 0.592 s) for the lane to stage them; majflt 376..477 (lend off: 0..2).
+# [derived, design.md "Paper": a cold lent admit is 16.77 MB read over the file mapping by a lane thread at ~1.2 GB/s (128 KB kernel read-around,
+# queue depth ~1) = 14..18 ms in the lane's serial window; a plan's lead is 4 passes ~ 69 ms; the wait is the overshoot of the plan's serial
+# staging over the lead.] The change: every lent admit's part runs are handed to the kernel at issue time (madvise WILLNEED, 1 MiB calls, one
+# helper thread), so the drive reads them at queue depth while the lane stages the jobs ahead of them; the map and the flip's landing boundary do
+# not change (a hint, no new state). Predicted: the cold bytes arrive at >= 2.5 GB/s (the cliff of the paper's model is 2.0 GB/s, the drive's
+# sequential rate 7 GB/s), the serial window no longer exceeds the lead, residual wait 0..0.15 s a first request [derived], first-request tg
+# 128 / (2.816 - 0.592 + w) = 53.9..57.6 tok/s for w 0.15..0 [derived] against 54.1 with the lend off.
+kind: profile
+question: does an issue-time read-ahead hint on the lent experts' source bytes take the first request's host wait for late flips from 0.52..0.64 s to under 0.15 s?
+term: wait_us (the host's wait for landing jobs to stage, summed over the residency pass records of the first request) of a fresh BLOOMERY_NODE_LEND=1 bloomery-serve @ n=128, D 512/520 (prose), ctx 16384, --place bp, RTX 5090 + host 252 GiB + the Spark's GB10 node (3,201 experts, RDMA, graph), read in the serve log per request (probe/rows4stats.py form)
+unit: s
+predict: 0.00..0.15
+condition: one bloomery-serve built from this tree (sha256 before and after the sitting equal), tier_server of the same commit restarted per server, 3 rounds x 2 arms (LEND=0 and LEND=1) x 4 depths a server (DEPTH_SERVE_FOLD=depths inside BLOOMERY_BOX_ENV), the arms interleaved so each arm's first request is a fresh load; ~~the hint's counters read from the lend server's log (sent == advised, failed 0)~~ [corrected 2026-11-28: the serve prints no hint counters; the lend gate pins sent == advised and failed 0, as decide-above says]; nothing else computes on the 5090 or loads a model on ws (timing hold LEAD-TIMING-HOLD taken, compute_apps empty); majflt, [cold], [cpu-busy] and [other-busy] flags read from the runner rows and marked, not dropped
+decide-in: the burst is removed: read the fresh rows (tg of the first request, LEND=1 against LEND=0 on the same binary) and the warm rows beside them (the confirmed +8.7 % must stay); report the claim and the diff, the lead lands behind the owning gates and then decides default-on
+decide-below: wait_us is not negative: a value under 0 is a stats read error, re-read the record lines before any claim
+decide-above: the hint did not hide the reads: read the first request's majflt and late-flip count beside wait_us (the hint counters are pinned by the lend gate, not printed by the serve): majflt still near the old 376..477 means the lane still faulted most lent bytes itself (the hint came too late or the kernel dropped it), majflt low with the wait still above 0.15 s means the drive's rate under the hint is below the 2.0 GB/s cliff; either way no landing, and the next design is the plan-earlier hint or a load-time top-K prefetch

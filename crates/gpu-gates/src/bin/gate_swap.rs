@@ -112,6 +112,9 @@
 //!   name.
 //! - placement: a machine built on a thread pinned to one cpu runs each of
 //!   its lane threads off that cpu.
+//! - hints: a machine whose config does not lend starts no `swap-advise`
+//!   thread, one that lends starts `ADVISE_THREADS` (its mutant: the lane
+//!   starts them for every machine).
 //! - lane-a: a reset under a closed window (c7's arm, every job's staging
 //!   paced so that jobs taken one after another overlap) stages its seed
 //!   copies on two lane threads or more, back at the seed, and the trace
@@ -360,7 +363,7 @@ mod gate {
     use std::time::{Duration, Instant};
 
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats, RING_SLOTS};
+    use bloomery_gpu::host::lane::{ADVISE_THREADS, LANE_THREADS, LaneStats, RING_SLOTS};
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap};
     use bloomery_gpu::host::swap::{
         CallCfg, CallPick, CallReport, CardTable, HostSite, Leak, LeakReason, MachineCfg,
@@ -792,17 +795,22 @@ mod gate {
         }
     }
 
-    /// The tids of this process's threads named as the swap machine names
-    /// its lane threads.
-    fn staging_tids() -> Result<Vec<String>, GateError> {
+    /// The tids of this process's threads named `name`.
+    fn tids_named(name: &str) -> Result<Vec<String>, GateError> {
         let mut out = Vec::new();
         for t in std::fs::read_dir("/proc/self/task")? {
             let t = t?;
-            if task_comm(&t)?.as_deref() == Some("swap-staging") {
+            if task_comm(&t)?.as_deref() == Some(name) {
                 out.push(t.file_name().to_string_lossy().into_owned());
             }
         }
         Ok(out)
+    }
+
+    /// The tids of this process's threads named as the swap machine names
+    /// its lane threads.
+    fn staging_tids() -> Result<Vec<String>, GateError> {
+        tids_named("swap-staging")
     }
 
     /// Cpus in a kernel cpu list (`0-63`, `0,32`, `0-3,8`).
@@ -881,6 +889,38 @@ mod gate {
             "placement: a machine built on a thread pinned to cpu {c}: its {} lane threads (want \
              {LANE_THREADS}) {named:?}, each off cpu {c} {off} {}",
             lanes.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// hints: a machine whose config does not lend starts no `swap-advise`
+    /// thread (a load that does not lend starts the lane's threads and no
+    /// more), one that lends starts [`ADVISE_THREADS`]. Both machines open
+    /// over a map with no tier: only the lane's threads differ.
+    fn hints(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        let mut started = [0; 2];
+        for (n, lend) in started.iter_mut().zip([false, true]) {
+            let before = tids_named("swap-advise")?;
+            let asked = MachineCfg {
+                lend,
+                ..cfg(DELAY, DEADLINE)
+            };
+            let r = start(gpu, pm, seed_map(&[])?, Faults::default(), asked)?;
+            if let Some(e) = &r.err {
+                println!("hints: the machine (lend {lend}) did not open: {e} FAIL");
+                return Ok(false);
+            }
+            let now = tids_named("swap-advise")?;
+            *n = now.iter().filter(|t| !before.contains(t)).count();
+            drop(r);
+        }
+        let ok = started == [0, ADVISE_THREADS];
+        println!(
+            "hints: a machine that does not lend started {} swap-advise threads (want 0), one \
+             that lends {} (want {ADVISE_THREADS}) {}",
+            started[0],
+            started[1],
             verdict(ok)
         );
         Ok(ok)
@@ -1539,6 +1579,7 @@ mod gate {
             max_rows: MAX_ROWS,
             unrouted: Vec::new(),
             deadline,
+            lend: false,
         }
     }
 
@@ -5936,6 +5977,7 @@ mod gate {
         ok &= fault_code()?;
         ok &= stall(&gpu, &pm, &trace)?;
         ok &= placement(&gpu, &pm)?;
+        ok &= hints(&gpu, &pm)?;
         ok &= lane_window(&gpu, &pm, &trace, &a)?;
         ok &= lane_due(&gpu, &pm, &trace, &a)?;
         ok &= lane_flush(&gpu, &pm, &trace, &a)?;
