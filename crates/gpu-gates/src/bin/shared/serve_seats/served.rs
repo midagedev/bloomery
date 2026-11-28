@@ -462,6 +462,10 @@ where
     /// draft's own call feeds its rows besides the target's, where a history
     /// draft's call is the seat's own ([`ServedDraft::prefill`]'s `plain`) with
     /// its ids fed to the slot's context, and no draft leaves the call as it is.
+    #[allow(
+        dead_code,
+        reason = "the qwen3 seat's prompt call reads it; the V4.1 binary that includes this file serves no such seat"
+    )]
     pub fn takes_prompt_call(&self) -> bool {
         self.dspark.is_some()
     }
