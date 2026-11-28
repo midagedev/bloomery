@@ -876,7 +876,7 @@ disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line,
 # after another in this process, the serial form). The summary names the three slowest cases.
 SELFTEST_PARTS=23
 self_test() {
-  local self t h n=0 bad=0 out rc real_classes part=${1:-all} case_t0=$SECONDS
+  local self t h n=0 bad=0 out rc real_classes part=${1:-all} case_t0=$SECONDS HOLDER
   gb_part() {
     if [ "$part" = all ] || [ "$part" = "$1" ]; then
       case_t0=$SECONDS # the block's first case starts here, not at the previous part's shared setup
@@ -2469,8 +2469,21 @@ HK
     [ "$arc" != 2 ] || { n=$((n + 1)); bad=$((bad + 1)); note_case "overlap: $2 $3"; echo "FAIL ${FUNCNAME[0]}: '$2' or '$3' has no line in $1"; }
     return "$arc"
   }
-  ivals() { # <seq.log> <cmd-a> <cmd-b>: the two items' seq.log lines (S start, E end, command), a red's detail
-    awk -v a="$2" -v b="$3" '$0 ~ (" " a "[ ]*$") || $0 ~ (" " b "[ ]*$")' "$1" | tr '\n' ' '
+  ivals() { # <seq.log> <cmd-a> <cmd-b> [<cmd-c>]: the items' seq.log lines (S start, E end, command), a red's detail
+    awk -v a="$2" -v b="$3" -v c="${4:-}" '$0 ~ (" " a "[ ]*$") || $0 ~ (" " b "[ ]*$") || (c != "" && $0 ~ (" " c "[ ]*$"))' "$1" | tr '\n' ' '
+  }
+  # holder_of <seq.log> <cmd-a> <cmd-b>: sets HOLDER to the one of two items of one recipe whose start line comes first in the log — the
+  # one that took the recipe's mutex (an item's call starts only after it holds it). Two items launched back to back race for the mutex,
+  # so a case that needs the one that held it names it by this event, never by its place in the list. A command with no start line is a
+  # FAIL line and status 2, as in overlap.
+  holder_of() {
+    local arc=0
+    HOLDER=$(awk -v a="$2" -v b="$3" '
+      $1 == "S" && $0 ~ (" " a "[ ]*$") { if (f == "") f = a; sa = 1 }
+      $1 == "S" && $0 ~ (" " b "[ ]*$") { if (f == "") f = b; sb = 1 }
+      END { if (!sa || !sb) exit 2; print f }' "$1") || arc=$?
+    [ "$arc" != 2 ] || { n=$((n + 1)); bad=$((bad + 1)); note_case "holder_of: $2 $3"; echo "FAIL ${FUNCNAME[0]}: '$2' or '$3' has no start line in $1"; }
+    return "$arc"
   }
   if gb_part 9; then
   # The times rows are keyed by the item as written (its @FAKE_SLEEP env included), so each case's
@@ -2532,8 +2545,8 @@ JF
   else fail 'recipe mutant: without the mutex the two items of one recipe overlap' "the intervals did not cross: $(ivals "$t/fake-state/seq.log" vone vtwo)"; fi
   # The pack: a card goes to an item of another recipe while one of the recipe runs — the pack's pass-over, not the mutex (which holds
   # the exclusion by itself). Budget 10000, so the three items fit side by side but for the recipe's own rule: svone takes a card, svtwo
-  # (the same recipe) is left to a later turn, pk-b takes the other card beside svone. The mutant launches svtwo onto the second card, where
-  # it waits at the mutex with the card held, and pk-b starts only after svone ended.
+  # (the same recipe) is left to a later turn, pk-b takes the other card beside svone. The mutant launches svtwo onto the second card beside
+  # svone: the two race for the mutex, the loser waits at it with its card held, and pk-b starts only after the winner ended.
   rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case rv-pack "rv-solo@FAKE_SLEEP=4:svone	A	3090	4	$d" "rv-solo@FAKE_SLEEP=4:svtwo	B	a6000	4	$d" "pk-b@FAKE_SLEEP=3	B	a6000	3	$d" \
     -- rv-solo@FAKE_SLEEP=4:svone rv-solo@FAKE_SLEEP=4:svtwo pk-b@FAKE_SLEEP=3)
   printf '%s' "$rc" > "$t/rc-rv-pack"
@@ -2547,8 +2560,11 @@ JF
   rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=rv-nopackup steal_case rv-packm "rv-solo@FAKE_SLEEP=4:svone	A	3090	4	$d" "rv-solo@FAKE_SLEEP=4:svtwo	B	a6000	4	$d" "pk-b@FAKE_SLEEP=3	B	a6000	3	$d" \
     -- rv-solo@FAKE_SLEEP=4:svone rv-solo@FAKE_SLEEP=4:svtwo pk-b@FAKE_SLEEP=3)
   printf '%s' "$rc" > "$t/rc-rv-packm"
-  if ! overlap "$t/fake-state/seq.log" svone gen_pb && no_overlap "$t/fake-state/seq.log" svone svtwo; then pass 'recipe mutant: without the pass-over the second item holds a card and the other recipe'"'"'s item waits'
-  else fail 'recipe mutant: without the pass-over the second item holds a card and the other recipe'"'"'s item waits' "$(ivals "$t/fake-state/seq.log" svone gen_pb)"; fi
+  # The winner is the item whose call starts first (its place in the list decides nothing: both children start in one turn).
+  if holder_of "$t/fake-state/seq.log" svone svtwo; then
+    if ! overlap "$t/fake-state/seq.log" "$HOLDER" gen_pb && no_overlap "$t/fake-state/seq.log" svone svtwo; then pass 'recipe mutant: without the pass-over the second item holds a card and the other recipe'"'"'s item waits'
+    else fail 'recipe mutant: without the pass-over the second item holds a card and the other recipe'"'"'s item waits' "the one that held the mutex: $HOLDER; $(ivals "$t/fake-state/seq.log" svone svtwo gen_pb)"; fi
+  fi
   cp "$t/justfile.rv" "$t/justfile"
   cp "$t/resources.rv" "$t/tools/gate-batch-resources.tsv"
   fi
