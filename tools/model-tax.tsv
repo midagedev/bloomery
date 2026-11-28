@@ -297,6 +297,7 @@ crates/metal/src/bin/bloomery_serve_metal.rs	inkling2	2	PIN(2026-11-23) inkling2
 crates/metal/src/bin/generate_metal.rs	inkling2	4	PIN(2026-11-23) inkling2: Metal arch dispatch by program: the Metal bins open the one Metal architecture's session
 crates/metal/src/instance.rs	inkling2	2	PIN(2026-11-23) inkling2: Metal instance rows by program: the registry names each instance row
 crates/metal/src/kernels/conv_res.rs	inkling2	1	PIN(2026-11-23) inkling2: a Metal kernel module of the family, until the lift into crates/metal/src/arch/inkling2
+crates/metal/src/kernels/conv_tail.rs	inkling2	1	PIN(2026-11-28) inkling2: a Metal kernel module of the family, until the lift into crates/metal/src/arch/inkling2
 crates/metal/src/kernels/head_f32.rs	inkling2	1	PIN(2026-11-23) inkling2: a Metal kernel module of the family, until the lift into crates/metal/src/arch/inkling2
 crates/metal/src/kernels/header.rs	inkling2	12	PIN(2026-11-23) inkling2: the shader header names the family's kernels, until the lift into crates/metal/src/arch/inkling2
 crates/metal/src/kernels/ink2_pass.rs	inkling2	3	PIN(2026-11-23) inkling2: a Metal kernel module of the family, until the lift into crates/metal/src/arch/inkling2

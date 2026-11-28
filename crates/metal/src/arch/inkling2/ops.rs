@@ -14,16 +14,19 @@
 //!    pass's core visit;
 //! 2. the q path (q, relative and gate rows in one launch, the sink rows in
 //!    another) and the k and v paths, each normed on load by its gain;
-//! 3. the k and v short convs (a windowless visit's taps from its own rows),
-//!    then the clips, the value norm and the cache append;
+//! 3. the k and v short convs (a windowless visit's taps from its own rows)
+//!    and, in the same launch, the clips, the value norm and the cache append;
 //! 4. the rel-bias attention, its output gate, `wo` and the post-conv; at a
 //!    block boundary the stream row closes as a block and the post-conv's
-//!    output is the next row's stream, else it adds into the stream;
-//! 5. the FFN's mix, its loop message, its norm and the router, which leaves
-//!    its picks' ids and weights on the card;
+//!    output is the next row's stream, else the post-conv's launch adds its
+//!    output into the stream;
+//! 5. the FFN's mix, its loop message, and the router, which norms its input
+//!    (the experts' input too) and leaves its picks' ids and weights on the
+//!    card;
 //! 6. every pick's gate·up rows in one launch and its down rows in another,
 //!    each slot reading its expert's id there (the route weight folded into
-//!    the down's scale), their sum, the post-conv and its add.
+//!    the down's scale), then one launch of their sum, the post-conv and its
+//!    add into the stream.
 //!
 //! A pass the loop runs again ends by adding its blocks past its first and
 //! its stream into its own message bank, on the card, and the next pass
@@ -48,10 +51,11 @@ use crate::device::MetalDevice;
 use crate::encode::{ComputeEncoder, EncodeCount};
 use crate::fault::MetalFaultWord;
 use crate::kernels::{
-    BiasRowsParams, CombineParams, ConvResParams, HEAD_SIMD_GROUPS, HeadParams, Kernels, LoadNorm,
-    LoopControlParams, MatvecParams, Mode, NormRowsParams, Nvfp4Params, OutGateParams,
-    QkClipParams, RelFlashParams, ResMixParams, RouterSigmoidParams, SegParams, Segment,
-    SituParams, segments_for_window,
+    BiasRowsParams, CombineConvJoinParams, ConvResJoinParams, ConvResParams, HEAD_SIMD_GROUPS,
+    HeadParams, Kernels, KvConvParams, LoadNorm, LoopControlParams, MatvecParams, Mode,
+    Nvfp4Params, OutGateParams, QkClipConvParams, QkClipParams, RelFlashParams, ResMixParams,
+    RouterSigmoidNormParams, RouterSigmoidParams, SegParams, Segment, SituParams, TailConv,
+    segments_for_window,
 };
 use crate::stream::{MetalStream, Recording};
 
@@ -596,60 +600,50 @@ impl Walk<'_> {
         }
         // Hazard: the k and v rows and their taps, the convs' inputs.
         enc.memory_barrier();
-        // 3. The k and v convs, then the clips and the append.
+        // 3. The k and v convs run in the tail of the clips and the append,
+        // one launch.
         let rows = c.plane_rows(v.windowed);
-        enc.tag(Kind::ConvKv);
-        for (base, w, x, taps_buf, y) in [
-            (BASE_K, &lb.convs[0], &sc.k_raw, &sc.k_taps, &mut sc.k),
-            (BASE_V, &lb.convs[1], &sc.v_raw, &sc.v_taps, &mut sc.v),
-        ] {
-            k.conv_res(
-                enc,
-                ConvResParams {
-                    d: KV_ROWS,
-                    taps: c.taps,
-                    heads: if v.windowed { 0 } else { TAP_HEADS },
-                    rows: c.taps - 1,
-                    ch: CONV_CHANNELS,
-                    base,
-                    m: 1,
-                    pos,
-                    x: x.whole()?,
-                    w: w.whole()?,
-                    dyn_taps: (!v.windowed).then(|| taps_buf.whole()).transpose()?,
-                    y: y.whole_mut()?,
-                    ring: vb.ring.whole_mut()?,
-                    faults,
-                    layer,
-                },
-            )?;
-        }
-        // Hazard: the convs' k and v rows, which the clips norm and append.
-        enc.memory_barrier();
         enc.tag(Kind::QkClip);
         let (q, r) = sc
             .qrg
             .window_mut(Elems(0), Elems(Q_ROWS + REL_ROWS))?
             .split_at(Elems(Q_ROWS))?;
-        k.qk_clip_append(
+        k.qk_clip_conv_append(
             enc,
-            QkClipParams {
-                q,
-                k: sc.k.whole_mut()?,
-                v: sc.v.whole_mut()?,
-                r,
-                gq: lb.q_clip.whole()?,
-                gr: lb.rel_clip.whole()?,
-                cache_k: vb.cache_k.whole_mut()?,
-                cache_v: vb.cache_v.whole_mut()?,
-                ctx: rows,
-                pos: pos % rows as u32,
-                v_eps: EPS,
-                qk_thresh: c.qk_clip,
-                r_thresh: c.rel_clip,
-                tau: if v.windowed { 1.0 } else { tau(c, pos) },
-                faults,
-                layer,
+            QkClipConvParams {
+                clip: QkClipParams {
+                    q,
+                    k: sc.k.whole_mut()?,
+                    v: sc.v.whole_mut()?,
+                    r,
+                    gq: lb.q_clip.whole()?,
+                    gr: lb.rel_clip.whole()?,
+                    cache_k: vb.cache_k.whole_mut()?,
+                    cache_v: vb.cache_v.whole_mut()?,
+                    ctx: rows,
+                    pos: pos % rows as u32,
+                    v_eps: EPS,
+                    qk_thresh: c.qk_clip,
+                    r_thresh: c.rel_clip,
+                    tau: if v.windowed { 1.0 } else { tau(c, pos) },
+                    faults,
+                    layer,
+                },
+                conv: KvConvParams {
+                    k_raw: sc.k_raw.whole()?,
+                    v_raw: sc.v_raw.whole()?,
+                    wk: lb.convs[0].whole()?,
+                    wv: lb.convs[1].whole()?,
+                    dyn_k: (!v.windowed).then(|| sc.k_taps.whole()).transpose()?,
+                    dyn_v: (!v.windowed).then(|| sc.v_taps.whole()).transpose()?,
+                    taps: c.taps,
+                    ring: vb.ring.whole_mut()?,
+                    ring_rows: c.taps - 1,
+                    ch: CONV_CHANNELS,
+                    base_k: BASE_K,
+                    base_v: BASE_V,
+                    pos,
+                },
             },
         )?;
         // Hazard: the clipped q and relative rows and the cache's new row.
@@ -715,44 +709,52 @@ impl Walk<'_> {
         // At a boundary the stream row closes as a block and the post-conv's
         // output is the residual, the next row's stream.
         enc.tag(Kind::ConvAttn);
-        let y = if v.boundary {
-            sc.rows.window_mut(Elems(stream_at + n), Elems(n))?
-        } else {
-            sc.ac.whole_mut()?
-        };
-        k.conv_res(
-            enc,
-            ConvResParams {
-                d: n,
-                taps: c.taps,
-                heads: 0,
-                rows: c.taps - 1,
-                ch: CONV_CHANNELS,
-                base: BASE_ATTN,
-                m: 1,
-                pos,
-                x: sc.ao.whole()?,
-                w: lb.convs[2].whole()?,
-                dyn_taps: None,
-                y,
-                ring: vb.ring.whole_mut()?,
-                faults,
-                layer,
-            },
-        )?;
-        // Hazard: the post-conv's row, the stream's add (or, at a boundary,
-        // the new stream row the FFN's mix reads).
-        enc.memory_barrier();
-        if !v.boundary {
-            enc.tag(Kind::BiasAttn);
-            k.bias_rows(
+        if v.boundary {
+            // The stream row closes as a block and the post-conv's output is
+            // the residual, the next row's stream.
+            k.conv_res(
                 enc,
-                BiasRowsParams {
-                    rows: 1,
+                ConvResParams {
+                    d: n,
+                    taps: c.taps,
+                    heads: 0,
+                    rows: c.taps - 1,
+                    ch: CONV_CHANNELS,
+                    base: BASE_ATTN,
+                    m: 1,
+                    pos,
+                    x: sc.ao.whole()?,
+                    w: lb.convs[2].whole()?,
+                    dyn_taps: None,
+                    y: sc.rows.window_mut(Elems(stream_at + n), Elems(n))?,
+                    ring: vb.ring.whole_mut()?,
+                    faults,
+                    layer,
+                },
+            )?;
+            // Hazard: the post-conv's row, the new stream row the FFN's mix
+            // reads.
+            enc.memory_barrier();
+        } else {
+            // The post-conv's output adds into the stream in the same launch.
+            k.conv_res_join(
+                enc,
+                ConvResJoinParams {
                     cols: n,
-                    y: sc.rows.window_mut(Elems(stream_at), Elems(n))?,
-                    y_stride: n,
-                    bias: sc.ac.whole()?,
+                    x: sc.ao.whole()?,
+                    conv: TailConv {
+                        w: lb.convs[2].whole()?,
+                        taps: c.taps,
+                        ring: vb.ring.whole_mut()?,
+                        ring_rows: c.taps - 1,
+                        ch: CONV_CHANNELS,
+                        base: BASE_ATTN,
+                        pos,
+                    },
+                    y: sc.ac.whole_mut()?,
+                    stream: sc.rows.window_mut(Elems(stream_at), Elems(n))?,
+                    faults,
+                    layer,
                 },
             )?;
             // Hazard: the stream row, the FFN's mix's input.
@@ -809,41 +811,29 @@ impl Walk<'_> {
         } else {
             &sc.fmix
         };
-        enc.tag(Kind::Norm);
-        k.norm_rows(
-            enc,
-            NormRowsParams {
-                rows: 1,
-                cols: n,
-                x: ffn_in.whole()?,
-                x_stride: n,
-                gain: lb.ffn_norm.whole()?,
-                y: sc.fnorm.whole_mut()?,
-                y_stride: n,
-                eps: c.rms_eps,
-                fault: faults,
-                layer,
-            },
-        )?;
-        // Hazard: the normed row, the router's input.
-        enc.memory_barrier();
+        // The norm runs in the router's front: its row is the experts' input.
         enc.tag(Kind::Router);
-        k.router_sigmoid(
+        k.router_sigmoid_norm(
             enc,
-            RouterSigmoidParams {
-                k: n,
-                top_k: c.top_k,
-                rows: lb.router.whole()?,
-                x: sc.fnorm.whole()?,
-                bias: lb.router_bias.whole()?,
-                partials: sc.router_partials.whole_mut()?,
-                ticket: sc.ticket.whole_mut()?,
-                logits: sc.router_logits.whole_mut()?,
-                ids: sc.route_ids.whole_mut()?,
-                weights: sc.route_weights.whole_mut()?,
-                scale: c.route_scale,
-                faults,
-                layer,
+            RouterSigmoidNormParams {
+                router: RouterSigmoidParams {
+                    k: n,
+                    top_k: c.top_k,
+                    rows: lb.router.whole()?,
+                    x: ffn_in.whole()?,
+                    bias: lb.router_bias.whole()?,
+                    partials: sc.router_partials.whole_mut()?,
+                    ticket: sc.ticket.whole_mut()?,
+                    logits: sc.router_logits.whole_mut()?,
+                    ids: sc.route_ids.whole_mut()?,
+                    weights: sc.route_weights.whole_mut()?,
+                    scale: c.route_scale,
+                    faults,
+                    layer,
+                },
+                gain: lb.ffn_norm.whole()?,
+                normed: sc.fnorm.whole_mut()?,
+                eps: c.rms_eps,
             },
         )?;
         Ok(())
@@ -934,55 +924,29 @@ impl Walk<'_> {
         )?;
         // Hazard: the slots' weighted rows, the combine's input.
         enc.memory_barrier();
+        // The sum, the post-conv of it and the stream's add, one launch.
         enc.tag(Kind::Combine);
-        k.combine_rows(
+        k.combine_conv_join(
             enc,
-            CombineParams {
-                rows: 1,
-                per_row: slots,
+            CombineConvJoinParams {
                 cols: n,
+                slots,
                 y: sc.down.whole()?,
-                y_rows: slots,
                 y_stride: n,
-                inv: sc.slots.whole()?,
                 x: sc.moe.window_mut(Elems(vi * n), Elems(n))?,
-                x_stride: n,
-            },
-        )?;
-        // Hazard: the visit's expert sum, the post-conv's input.
-        enc.memory_barrier();
-        enc.tag(Kind::ConvFfn);
-        k.conv_res(
-            enc,
-            ConvResParams {
-                d: n,
-                taps: c.taps,
-                heads: 0,
-                rows: c.taps - 1,
-                ch: CONV_CHANNELS,
-                base: BASE_FFN,
-                m: 1,
-                pos,
-                x: win(&sc.moe, vi * n, n)?,
-                w: lb.convs[3].whole()?,
-                dyn_taps: None,
-                y: sc.moe_conv.whole_mut()?,
-                ring: visits[vi].ring.whole_mut()?,
+                conv: TailConv {
+                    w: lb.convs[3].whole()?,
+                    taps: c.taps,
+                    ring: visits[vi].ring.whole_mut()?,
+                    ring_rows: c.taps - 1,
+                    ch: CONV_CHANNELS,
+                    base: BASE_FFN,
+                    pos,
+                },
+                conv_out: sc.moe_conv.whole_mut()?,
+                stream: sc.rows.window_mut(Elems(banks * n), Elems(n))?,
                 faults,
                 layer,
-            },
-        )?;
-        // Hazard: the post-conv's row, the stream's add.
-        enc.memory_barrier();
-        enc.tag(Kind::BiasFfn);
-        k.bias_rows(
-            enc,
-            BiasRowsParams {
-                rows: 1,
-                cols: n,
-                y: sc.rows.window_mut(Elems(banks * n), Elems(n))?,
-                y_stride: n,
-                bias: sc.moe_conv.whole()?,
             },
         )?;
         // Hazard: the stream row, the next visit's (or the head's) input.

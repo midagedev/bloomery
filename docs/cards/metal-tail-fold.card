@@ -1,0 +1,37 @@
+# Inkling 2 Mini decode on the M4 Pro (Metal): the elementwise tails fold into their producers' launches (round metaltail): the
+# attention post-conv adds into the stream in its own launch (bias_attn gone, 40 visits), the expert sum + feed-forward post-conv + stream
+# add are one launch (combine, conv_ffn, bias_ffn -> combine_conv_join, 48 visits), the norm runs in the router's front (48), the key and
+# value convs run in the clip's tail (conv_kv gone, 48): groups 1004 -> 772, dispatches 1332 -> 1052, barriers 1003 -> 771 [measured:
+# the step's own `step encoded` line]. Every output bit is the unfolded program's (the gate's clauses hold each fold to its launches).
+#
+# Derivation of the band (step GPU 22.2 ms [measured, the q2 base arms]; the chain is 1003 dependent groups, the DRAM stream 11.7 ms, so a
+# removed group is a removed floor + its serial rounds, not bytes):
+#   F2 combine fold, measured alone by the interleaved 4-round A/B q2: gpu_us -1.75 % +-0.76 = -0.39 ms +-0.17 [measured].
+#   F1 + F3 + F4 from the --profile medians of the all-fold build against base (isolated, one command buffer a group): conv_attn 0.224
+#   vs 0.273 + 0.090 bias_attn (-0.139 ms), router 0.721 vs 0.608 + 0.236 norm (-0.123), qk_clip 0.532 vs 0.300 + 0.295 conv_kv (-0.063):
+#   -0.325 ms isolated [measured]. The in-step saving of F2 was 0.55 of its isolated drop (-0.39 of -0.71 ms), the isolated groups
+#   carrying a command buffer each; for the three folds the ratio is taken between 0.3 and 1.0 [derived]: -0.10..-0.33 ms.
+#   Sum: -0.39 +-0.17 plus -0.10..-0.33 = -0.32..-0.89 ms, centre -0.57 ms = -2.6 % of 22.2 ms [derived]. The band is this sum, not
+#   the CUDA precedent's: the lead's +3.5 % decode (+2.2..+4.3), taken from the profile-sum drops of all nine kinds, sits above it
+#   because the isolated profile overstates a small group's in-step cost (F2's measured -0.39 ms against -0.50 predicted).
+kind: ab
+question: is the Inkling 2 Mini decode step shorter by the four folds of the elementwise tails (groups 1004 -> 772) than by the unfolded
+  walk, on the M4 Pro, and by how much?
+term: gpu_us of the 32 host-fed steps (the step clock's card-busy span a token) @ generate_metal -n 40 --step-times 32, prompt "The
+  capital of France is" (5 ids, depth 5-45), Inkling-2-Mini-mlx4, M4 Pro, no --profile — (folded - base) / base, paired by round
+unit: %
+predict: -4.0..-1.4
+rounds: 6
+sd: 0.24 % from the q2 A/A twin of this round (base2 against base at 4 rounds: -0.13 % +-0.55 interval, so a run's sd = 0.55 / (3.182 *
+  sqrt(2/4)))
+condition: two binaries alternate round by round with the order rotated each round, arms new (this tree's target/release/generate_metal),
+  base (this tree's pre-edit build, main 69fb32a51, copied aside as generate_metal.base) and base2 (the A/A twin, the base binary again);
+  each launch under both Mac model locks (/tmp/bloomery-mac-model.lock and metal-timing.lock.d) after runprof-guarded.sh's precheck
+  with a swap-growth watch; the same prompt and -n for every arm; the --print-ids lists of the arms equal (the 40 generated ids), and the
+  new arm's `step encoded` line reads groups=772 dispatches=1052 barriers=771
+decide-in: the folds stand at the measured size: land them with the gate's clauses, report the gpu_us and period effects with their
+  intervals, and take the next latency term (res_mix 119 dispatches, wo -> conv_attn) into the same cost model
+decide-below: the effect is larger than -4.0 % (more than the isolated drops let it): the removed serial rounds of the dependent latency
+  cost more than modelled; re-derive every unit's demand against the step in the same unit before the next fold, and check ids equal
+decide-above: the effect is under -1.4 % (smaller gain): one of the three folds measured by isolation alone (F1, F3 or F4) lost its saving
+  in the step; run the per-fold arms (one binary per fold) before landing and drop any fold whose interval is not under -0.3 ms

@@ -1,4 +1,4 @@
-//! The pipelines of Inkling 2's kernels (`kernels/{res_mix,conv_res,qk_clip,
+//! The pipelines of Inkling 2's kernels (`kernels/{res_mix,conv_res,conv_tail,qk_clip,
 //! rel_flash,loop_control,out_gate,nvfp4,router_situ,situ,head_f32}.metal`),
 //! one row each. Their launches are the files of the same names beside this
 //! one; every shape they check is `inkling2_geom`'s.
@@ -13,7 +13,10 @@ use crate::library::{Library, Pipeline};
 pub(crate) struct Pipelines {
     pub(super) res_mix: Pipeline,
     pub(super) conv_res: Pipeline,
+    pub(super) conv_res_join: Pipeline,
+    pub(super) combine_conv_join: Pipeline,
     pub(super) qk_clip: Pipeline,
+    pub(super) qk_clip_conv: Pipeline,
     pub(super) loop_control: Pipeline,
     pub(super) loop_control_down: Pipeline,
     pub(super) out_gate: Pipeline,
@@ -23,6 +26,7 @@ pub(crate) struct Pipelines {
     pub(super) mxfp8_rows: Pipeline,
     pub(super) mxfp8_quads: Pipeline,
     pub(super) router_sigmoid: Pipeline,
+    pub(super) router_sigmoid_norm: Pipeline,
     pub(super) pair_situ: Pipeline,
     pub(super) head_f32: Pipeline,
     pub(super) rel_flash: Pipeline,
@@ -34,7 +38,10 @@ impl Pipelines {
         Ok(Self {
             res_mix: library.pipeline("res_mix_normed")?,
             conv_res: library.pipeline("conv_res")?,
+            conv_res_join: library.pipeline("conv_res_join")?,
+            combine_conv_join: library.pipeline("combine_conv_join")?,
             qk_clip: library.pipeline("qk_clip_append")?,
+            qk_clip_conv: library.pipeline("qk_clip_conv_append")?,
             loop_control: library.pipeline("loop_control")?,
             loop_control_down: library.pipeline("loop_control_down")?,
             out_gate: library.pipeline("out_gate_proj")?,
@@ -44,6 +51,7 @@ impl Pipelines {
             mxfp8_rows: library.pipeline("mxfp8_rows_gemv")?,
             mxfp8_quads: library.pipeline("mxfp8_quads_gemv")?,
             router_sigmoid: library.pipeline("router_sigmoid")?,
+            router_sigmoid_norm: library.pipeline("router_sigmoid_norm")?,
             pair_situ: library.pipeline("pair_situ_rows")?,
             head_f32: library.pipeline("head_logits_f32")?,
             rel_flash: library.pipeline("rel_flash_f16")?,

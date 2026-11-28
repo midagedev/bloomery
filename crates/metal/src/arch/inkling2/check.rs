@@ -830,9 +830,8 @@ impl Checked {
         for count in self.scratch_f32s() {
             s.add(f32s(count));
         }
-        // The router's ticket, its ids, the combine's identity map, the pick
-        // and the fault word.
-        for words in [1, 8, 8, 1, bloomery_device::fault::FAULT_WORDS] {
+        // The router's ticket, its ids, the pick and the fault word.
+        for words in [1, 8, 1, bloomery_device::fault::FAULT_WORDS] {
             s.add((words * 4) as u64);
         }
         Bytes {

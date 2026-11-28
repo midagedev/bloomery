@@ -17,20 +17,20 @@
 //! - [`Kind::Proj`]: the q, relative and gate rows in one launch, the sink
 //!   rows, the k and the v, and on a windowless visit the two dynamic-taps
 //!   projections: four dispatches, six on a windowless visit.
-//! - [`Kind::ConvKv`]: the k and v short convolutions, two dispatches.
-//! - [`Kind::QkClip`]: the clip epilogue and the cache append.
+//! - [`Kind::QkClip`]: the k and v short convolutions, the clip epilogue and
+//!   the cache append, one launch.
 //! - [`Kind::Flash`]: the rel-bias attention, two groups (the segment walk,
 //!   then the fold of its partials, a barrier the launch itself holds).
 //! - [`Kind::Gate`], [`Kind::Wo`], [`Kind::ConvAttn`]: the output gate, the
-//!   output projection and the attention's post-convolution; and
-//!   [`Kind::BiasAttn`], the stream's add of it, which a block boundary
-//!   skips (its post-convolution writes the next row itself).
+//!   output projection and the attention's post-convolution, which adds its
+//!   output into the stream in the same launch (a block boundary's writes the
+//!   next row itself).
 //! - [`Kind::FfnMix`], the feed-forward's mix, then on a message visit
-//!   [`Kind::LoopFfn`] (its controller: two groups), then [`Kind::Norm`] and
-//!   [`Kind::Router`].
-//! - [`Kind::GateUp`], [`Kind::Pair`], [`Kind::Down`], [`Kind::Combine`],
-//!   [`Kind::ConvFfn`], [`Kind::BiasFfn`]: the kept experts' rows, their
-//!   activation, their down rows, the sum, the post-convolution and its add.
+//!   [`Kind::LoopFfn`] (its controller: two groups), then [`Kind::Router`]
+//!   (the norm in its front).
+//! - [`Kind::GateUp`], [`Kind::Pair`], [`Kind::Down`], [`Kind::Combine`]: the
+//!   kept experts' rows, their activation, their down rows, and the sum, the
+//!   post-convolution of it and its add into the stream in one launch.
 //! - [`Kind::MsgEnd`], on the last core visit of a pass the loop runs again:
 //!   the pass's blocks added into its message bank.
 //!
@@ -88,51 +88,41 @@ pub enum Kind {
     LoopDown,
     LoopMerge,
     Proj,
-    ConvKv,
     QkClip,
     Flash,
     Gate,
     Wo,
     ConvAttn,
-    BiasAttn,
     FfnMix,
     LoopFfn,
-    Norm,
     Router,
     GateUp,
     Pair,
     Down,
     Combine,
-    ConvFfn,
-    BiasFfn,
     MsgEnd,
     HeadMix,
     Head,
 }
 
 /// Every kind, in the token's walk order: the order a profile's lines print.
-pub const KINDS: [Kind; 24] = [
+pub const KINDS: [Kind; 19] = [
     Kind::Mix,
     Kind::LoopDown,
     Kind::LoopMerge,
     Kind::Proj,
-    Kind::ConvKv,
     Kind::QkClip,
     Kind::Flash,
     Kind::Gate,
     Kind::Wo,
     Kind::ConvAttn,
-    Kind::BiasAttn,
     Kind::FfnMix,
     Kind::LoopFfn,
-    Kind::Norm,
     Kind::Router,
     Kind::GateUp,
     Kind::Pair,
     Kind::Down,
     Kind::Combine,
-    Kind::ConvFfn,
-    Kind::BiasFfn,
     Kind::MsgEnd,
     Kind::HeadMix,
     Kind::Head,
@@ -147,23 +137,18 @@ impl Kind {
             Kind::LoopDown => "loop_down",
             Kind::LoopMerge => "loop_merge",
             Kind::Proj => "proj",
-            Kind::ConvKv => "conv_kv",
             Kind::QkClip => "qk_clip",
             Kind::Flash => "flash",
             Kind::Gate => "gate",
             Kind::Wo => "wo",
             Kind::ConvAttn => "conv_attn",
-            Kind::BiasAttn => "bias_attn",
             Kind::FfnMix => "ffn_mix",
             Kind::LoopFfn => "loop_ffn",
-            Kind::Norm => "norm",
             Kind::Router => "router",
             Kind::GateUp => "gate_up",
             Kind::Pair => "pair",
             Kind::Down => "down",
             Kind::Combine => "combine",
-            Kind::ConvFfn => "conv_ffn",
-            Kind::BiasFfn => "bias_ffn",
             Kind::MsgEnd => "msg_end",
             Kind::HeadMix => "head_mix",
             Kind::Head => "head",
@@ -240,31 +225,19 @@ pub fn visit_groups(v: &Visit) -> Vec<Group> {
         out.push(g(Kind::LoopMerge, 3));
     }
     out.push(g(Kind::Proj, if v.windowed { 4 } else { 6 }));
-    out.push(g(Kind::ConvKv, 2));
     out.push(g(Kind::QkClip, 1));
     out.push(g(Kind::Flash, 1));
     out.push(g(Kind::Flash, 1));
     out.push(g(Kind::Gate, 1));
     out.push(g(Kind::Wo, 1));
     out.push(g(Kind::ConvAttn, 1));
-    if !v.boundary {
-        out.push(g(Kind::BiasAttn, 1));
-    }
     out.push(g(Kind::FfnMix, 1));
     if v.message {
         out.push(g(Kind::LoopFfn, 1));
         out.push(g(Kind::LoopFfn, 1));
     }
-    out.push(g(Kind::Norm, 1));
     out.push(g(Kind::Router, 1));
-    for kind in [
-        Kind::GateUp,
-        Kind::Pair,
-        Kind::Down,
-        Kind::Combine,
-        Kind::ConvFfn,
-        Kind::BiasFfn,
-    ] {
+    for kind in [Kind::GateUp, Kind::Pair, Kind::Down, Kind::Combine] {
         out.push(g(kind, 1));
     }
     if v.pass_end {
@@ -450,13 +423,15 @@ mod tests {
     }
 
     /// The groups and dispatches of one visit by its kind: a plain windowed
-    /// visit runs nineteen groups of twenty-three dispatches (the flash and
+    /// visit runs fourteen groups of seventeen dispatches (the flash and
     /// the projections' launch the odd ones: the flash is two groups, the
-    /// projections four dispatches); a block boundary skips the attention's
-    /// stream add; a windowless visit's projections are six dispatches; a
-    /// message visit adds the controllers' four groups and the message mix;
-    /// the stored layer 0 has no attention mix; a pass end adds its bank's
-    /// add. Mutant: the flash counted one group.
+    /// projections four dispatches); a block boundary's post-conv is the
+    /// next row's stream and adds into nothing, which the plain visit's
+    /// carries in the same launch, so the two count alike; a windowless
+    /// visit's projections are six dispatches; a message visit adds the
+    /// controllers' four groups and the message mix; the stored layer 0 has
+    /// no attention mix; a pass end adds its bank's add. Mutant: the flash
+    /// counted one group.
     #[test]
     fn one_visits_groups_by_kind() {
         let plain = Visit {
@@ -471,41 +446,41 @@ mod tests {
             let g = visit_groups(v);
             (g.len(), g.iter().map(|g| g.dispatches).sum::<u32>())
         };
-        assert_eq!(shape(&plain), (19, 23));
+        assert_eq!(shape(&plain), (14, 17));
         assert_eq!(
             shape(&Visit {
                 boundary: true,
                 ..plain
             }),
-            (18, 22)
+            (14, 17)
         );
         assert_eq!(
             shape(&Visit {
                 windowed: false,
                 ..plain
             }),
-            (19, 25)
+            (14, 19)
         );
         assert_eq!(
             shape(&Visit {
                 message: true,
                 ..plain
             }),
-            (23, 32)
+            (18, 26)
         );
         assert_eq!(
             shape(&Visit {
                 first: true,
                 ..plain
             }),
-            (18, 22)
+            (13, 16)
         );
         assert_eq!(
             shape(&Visit {
                 pass_end: true,
                 ..plain
             }),
-            (20, 24)
+            (15, 18)
         );
         let kinds: Vec<Kind> = visit_groups(&plain).iter().map(|g| g.kind).collect();
         assert_eq!(
@@ -521,7 +496,7 @@ mod tests {
 
     /// One decoded token's groups: the Mini's forty-eight visits and the
     /// head's three. Derived on paper from the walk's call sites (the e2e
-    /// gate's `k_count` holds the encoder to it): 1,004 groups, 1,332
+    /// gate's `k_count` holds the encoder to it): 772 groups, 1,052
     /// dispatches, a barrier after every group but the last. Mutant: a core
     /// pass counted once.
     #[test]
@@ -547,9 +522,9 @@ mod tests {
         assert_eq!(
             token_count(&spec),
             TokenCount {
-                groups: 1004,
-                dispatches: 1332,
-                barriers: 1003
+                groups: 772,
+                dispatches: 1052,
+                barriers: 771
             }
         );
         let groups = token_groups(&spec);

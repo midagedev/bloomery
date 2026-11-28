@@ -161,8 +161,8 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         clause: "qk_clip_rows",
         why: "the key rows take the query's per-channel gain",
         edits: &[(
-            "if (is_q) {\n                x[i] *= gq[base + lane + 32u * i];",
-            "if (true) {\n                x[i] *= gq[base + lane + 32u * i];",
+            "x[i] = k[h * BLOOMERY_INK2_HEAD + lane + 32u * i];",
+            "x[i] = k[h * BLOOMERY_INK2_HEAD + lane + 32u * i] * gq[h * BLOOMERY_INK2_HEAD + lane + 32u * i];",
             1,
         )],
     },
@@ -171,8 +171,8 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         clause: "qk_clip_rows",
         why: "the position factor scales the key rows as it does the query's",
         edits: &[(
-            "rowbuf[base + lane + 32u * i] = is_q ? x[i] * f * args.tau : x[i] * f;",
-            "rowbuf[base + lane + 32u * i] = x[i] * f * args.tau;",
+            "k[base + lane + 32u * i] = x[i] * f;",
+            "k[base + lane + 32u * i] = x[i] * f * args.tau;",
             1,
         )],
     },
@@ -186,13 +186,21 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         name: "qk_clip_key_pos_unchecked",
         clause: "qk_clip_faults",
         why: "a key append past the context is not refused",
-        edits: &[("if (!is_q && args.pos >= args.ctx) {", "if (false) {", 1)],
+        edits: &[(
+            "if (args.pos >= args.ctx) {\n        if (lane == 0u) {\n            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_POS);\n        }\n        for (uint i = 0u; i < 4u; ++i) {\n            k[base",
+            "if (false) {\n        if (lane == 0u) {\n            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_POS);\n        }\n        for (uint i = 0u; i < 4u; ++i) {\n            k[base",
+            1,
+        )],
     },
     Mutant {
         name: "qk_clip_value_pos_unchecked",
         clause: "qk_clip_faults",
         why: "a value append past the context is not refused",
-        edits: &[("if (args.pos >= args.ctx) {", "if (false) {", 1)],
+        edits: &[(
+            "if (args.pos >= args.ctx) {\n        if (lane == 0u) {\n            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_POS);\n        }\n        for (uint i = 0u; i < 4u; ++i) {\n            v[base",
+            "if (false) {\n        if (lane == 0u) {\n            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_POS);\n        }\n        for (uint i = 0u; i < 4u; ++i) {\n            v[base",
+            1,
+        )],
     },
     Mutant {
         name: "qk_clip_r_gain_dropped",
@@ -700,8 +708,18 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         clause: "router_sigmoid",
         why: "the score is the logit, not its sigmoid",
         edits: &[(
-            "const float score = 1.0f / (1.0f + exp(-simd_sum(acc)));",
-            "const float score = simd_sum(acc);",
+            "const float score = 1.0f / (1.0f + exp(-simd_sum(acc)));\n        if (lane == 0u) {\n            ticket_write(partials, sg, score);\n        }\n    }\n    situ_finish(partials, ticket, bias, logits, ids, weights, args, faults,",
+            "const float score = simd_sum(acc);\n        if (lane == 0u) {\n            ticket_write(partials, sg, score);\n        }\n    }\n    situ_finish(partials, ticket, bias, logits, ids, weights, args, faults,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "router_norm_score_linear",
+        clause: "router_sigmoid_norm",
+        why: "the folded router's score is the logit, not its sigmoid",
+        edits: &[(
+            "const float score = 1.0f / (1.0f + exp(-simd_sum(acc)));\n        if (lane == 0u) {\n            ticket_write(partials, sg, score);\n        }\n    }\n    situ_finish(partials, ticket, bias, logits, ids, weights, args.router, faults,",
+            "const float score = simd_sum(acc);\n        if (lane == 0u) {\n            ticket_write(partials, sg, score);\n        }\n    }\n    situ_finish(partials, ticket, bias, logits, ids, weights, args.router, faults,",
             1,
         )],
     },
@@ -849,6 +867,343 @@ pub const INK2_MUTANTS: &[Mutant] = &[
             "const bool refused = a.keys == 0u || a.keys > a.ctx;",
             "const bool refused = a.keys == 0u;",
             2,
+        )],
+    },
+    Mutant {
+        name: "combine_join_slots_reversed",
+        clause: "combine_conv_join",
+        why: "the slots are summed last to first: the sum's rounding moves",
+        edits: &[("acc += ys[s];", "acc += ys[TAIL_SLOTS - 1u - s];", 1)],
+    },
+    Mutant {
+        name: "combine_join_residual_dropped",
+        clause: "combine_conv_join",
+        why: "the visit's row is replaced by the slots' sum, not added to",
+        edits: &[("const float4 cur = xr + acc;", "const float4 cur = acc;", 1)],
+    },
+    Mutant {
+        name: "combine_join_row_unstored",
+        clause: "combine_conv_join",
+        why: "the visit's row keeps its old value: the loop message and the ring read a stale row",
+        edits: &[(
+            "*((device float4 *)x + f4) = cur;",
+            "*((device float4 *)x + f4) = xr;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "combine_join_ring_holds_raw",
+        clause: "combine_conv_join",
+        why: "the ring stores the row before the sum, not the conv's input",
+        edits: &[(
+            "*((device float4 *)conv_out + f4) = out;\n    *((device float4 *)(ring + (ulong)sc_slot(args.pos, args.ring_rows) * args.ch + at)) = cur;",
+            "*((device float4 *)conv_out + f4) = out;\n    *((device float4 *)(ring + (ulong)sc_slot(args.pos, args.ring_rows) * args.ch + at)) = xr;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "combine_join_stream_overwritten",
+        clause: "combine_conv_join",
+        why: "the stream takes the conv's output instead of adding it",
+        edits: &[(
+            "*((device float4 *)conv_out + f4) = out;\n    *((device float4 *)(ring + (ulong)sc_slot(args.pos, args.ring_rows) * args.ch + at)) = cur;\n    *((device float4 *)stream + f4) = sr + out;",
+            "*((device float4 *)conv_out + f4) = out;\n    *((device float4 *)(ring + (ulong)sc_slot(args.pos, args.ring_rows) * args.ch + at)) = cur;\n    *((device float4 *)stream + f4) = out;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "combine_join_slot_stride_is_cols",
+        clause: "combine_conv_join",
+        why: "a slot's row sits a row's width after the last: the stride's padding is read as data",
+        edits: &[(
+            "ys[s] = *((device const float4 *)(y + (ulong)s * args.y_stride) + f4);",
+            "ys[s] = *((device const float4 *)(y + (ulong)s * args.cols) + f4);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "combine_join_filter_shifted",
+        clause: "combine_conv_join",
+        why: "the filter is read one channel late",
+        edits: &[(
+            "const float4 xr = *((device const float4 *)x + f4);\n    const device float4 *wv = (device const float4 *)w + c;",
+            "const float4 xr = *((device const float4 *)x + f4);\n    const device float4 *wv = (device const float4 *)w + c + 1u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "combine_nan_unraised",
+        clause: "combine_conv_join",
+        why: "a conv output that is not finite raises nothing",
+        edits: &[(
+            "*((device float4 *)stream + f4) = sr + out;\n    if (!ok) {",
+            "*((device float4 *)stream + f4) = sr + out;\n    if (false) {",
+            2,
+        )],
+    },
+    Mutant {
+        name: "combine_nonfinite_passed",
+        clause: "combine_conv_join",
+        why: "a conv output that is infinite is written as it is, not as NaN",
+        edits: &[(
+            "const float4 out = select(float4(NAN), o, isfinite(o));",
+            "const float4 out = o;",
+            2,
+        )],
+    },
+    Mutant {
+        name: "combine_ring_slot_shifted",
+        clause: "combine_conv_join",
+        why: "the ring stores the input one slot ahead of its position",
+        edits: &[(
+            "sc_slot(args.pos, args.ring_rows)",
+            "sc_slot(args.pos + 1u, args.ring_rows)",
+            2,
+        )],
+    },
+    Mutant {
+        name: "combine_start_reads_ring",
+        clause: "combine_conv_join",
+        why: "a predecessor at the sequence's first positions is read from the ring, not zero",
+        edits: &[(
+            "if (back > pos) {\n        return float4(0.0f);",
+            "if (back >= pos) {\n        return float4(0.0f);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "combine_scale_dropped",
+        clause: "combine_conv_join",
+        why: "the conv's output is not scaled",
+        edits: &[(
+            "return (cur + conv_res_acc4(tap, p3, p2, p1, cur)) * scale;",
+            "return cur + conv_res_acc4(tap, p3, p2, p1, cur);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "conv_join_nan_unraised",
+        clause: "conv_res_join",
+        why: "a conv output that is not finite raises nothing",
+        edits: &[(
+            "*((device float4 *)stream + f4) = sr + out;\n    if (!ok) {",
+            "*((device float4 *)stream + f4) = sr + out;\n    if (false) {",
+            2,
+        )],
+    },
+    Mutant {
+        name: "conv_join_nonfinite_passed",
+        clause: "conv_res_join",
+        why: "a conv output that is infinite is written as it is, not as NaN",
+        edits: &[(
+            "const float4 out = select(float4(NAN), o, isfinite(o));",
+            "const float4 out = o;",
+            2,
+        )],
+    },
+    Mutant {
+        name: "conv_join_ring_slot_shifted",
+        clause: "conv_res_join",
+        why: "the ring stores the input one slot ahead of its position",
+        edits: &[(
+            "sc_slot(args.pos, args.ring_rows)",
+            "sc_slot(args.pos + 1u, args.ring_rows)",
+            2,
+        )],
+    },
+    Mutant {
+        name: "conv_join_start_reads_ring",
+        clause: "conv_res_join",
+        why: "a predecessor at the sequence's first positions is read from the ring, not zero",
+        edits: &[(
+            "if (back > pos) {\n        return float4(0.0f);",
+            "if (back >= pos) {\n        return float4(0.0f);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "conv_join_scale_dropped",
+        clause: "conv_res_join",
+        why: "the conv's output is not scaled",
+        edits: &[(
+            "return (cur + conv_res_acc4(tap, p3, p2, p1, cur)) * scale;",
+            "return cur + conv_res_acc4(tap, p3, p2, p1, cur);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "conv_join_input_scaled",
+        clause: "conv_res_join",
+        why: "the conv's input is read a part in a thousand large",
+        edits: &[(
+            "const float4 cur = *((device const float4 *)x + f4);",
+            "const float4 cur = *((device const float4 *)x + f4) * 1.0009765625f;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "conv_join_stream_not_added",
+        clause: "conv_res_join",
+        why: "the stream keeps its value: the post-conv's output never joins it",
+        edits: &[(
+            "*((device float4 *)y + f4) = out;\n    *((device float4 *)(ring + (ulong)sc_slot(args.pos, args.ring_rows) * args.ch + at)) = cur;\n    *((device float4 *)stream + f4) = sr + out;",
+            "*((device float4 *)y + f4) = out;\n    *((device float4 *)(ring + (ulong)sc_slot(args.pos, args.ring_rows) * args.ch + at)) = cur;\n    *((device float4 *)stream + f4) = sr;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "qk_clip_conv_ring_unstored",
+        clause: "qk_clip_conv_append",
+        why: "the ring takes no input of this token: the next token reads zeros",
+        edits: &[(
+            "ring[(ulong)sc_slot(a.pos, a.ring_rows) * a.ch + at[i]] = cur[i];",
+            "ring[(ulong)sc_slot(a.pos, a.ring_rows) * a.ch + at[i]] = 0.0f;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "qk_clip_conv_dyn_lag_reversed",
+        clause: "qk_clip_conv_append",
+        why: "the dynamic taps' first lag pairs the oldest input",
+        edits: &[(
+            "acc = fma(dy.x, cur, acc);",
+            "acc = fma(dy.w, cur, acc);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "qk_clip_conv_dynamic_unused",
+        clause: "qk_clip_conv_append",
+        why: "a windowless visit runs its convs without the dynamic taps",
+        edits: &[(
+            "const bool dynamic = a.heads > 0u;",
+            "const bool dynamic = false;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "qk_clip_conv_value_base_is_key",
+        clause: "qk_clip_conv_append",
+        why: "the value conv reads and writes the key conv's channels of the ring",
+        edits: &[(
+            "qk_clip_conv_row(v_raw, wv, dyn_v, ring, args.base_v, h, lane, args, faults, x);",
+            "qk_clip_conv_row(v_raw, wv, dyn_v, ring, args.base_k, h, lane, args, faults, x);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "qk_clip_conv_nan_unraised",
+        clause: "qk_clip_conv_append",
+        why: "a conv output that is not finite raises nothing",
+        edits: &[(
+            "if (!ok) {\n        raise(faults, a.clip.layer, BLOOMERY_FAULT_SITE_LINEAR_CONV);",
+            "if (false) {\n        raise(faults, a.clip.layer, BLOOMERY_FAULT_SITE_LINEAR_CONV);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "qk_clip_conv_plane_position",
+        clause: "qk_clip_conv_append",
+        why: "the convs take the plane's append position for the sequence's: a wrapped plane moves the ring",
+        edits: &[
+            (
+                "conv_res_past(ring, a.ring_rows, a.ch, at[i], a.pos, 3u)",
+                "conv_res_past(ring, a.ring_rows, a.ch, at[i], a.clip.pos, 3u)",
+                1,
+            ),
+            (
+                "conv_res_past(ring, a.ring_rows, a.ch, at[i], a.pos, 2u)",
+                "conv_res_past(ring, a.ring_rows, a.ch, at[i], a.clip.pos, 2u)",
+                1,
+            ),
+            (
+                "conv_res_past(ring, a.ring_rows, a.ch, at[i], a.pos, 1u)",
+                "conv_res_past(ring, a.ring_rows, a.ch, at[i], a.clip.pos, 1u)",
+                1,
+            ),
+            (
+                "ring[(ulong)sc_slot(a.pos, a.ring_rows) * a.ch + at[i]] = cur[i];",
+                "ring[(ulong)sc_slot(a.clip.pos, a.ring_rows) * a.ch + at[i]] = cur[i];",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "qk_clip_conv_start_reads_ring",
+        clause: "qk_clip_conv_append",
+        why: "a predecessor at the sequence's first positions is read from the ring, not zero",
+        edits: &[(
+            "if (back > pos) {\n        return 0.0f;",
+            "if (back >= pos) {\n        return 0.0f;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "qk_clip_conv_dyn_scale_dropped",
+        clause: "qk_clip_conv_append",
+        why: "a windowless conv's output is not scaled",
+        edits: &[("return (cur + acc) * scale;", "return cur + acc;", 1)],
+    },
+    Mutant {
+        name: "router_norm_gain_dropped",
+        clause: "router_sigmoid_norm",
+        why: "the norm's gain is one: the normed row and the scores skip it",
+        edits: &[(
+            "norm_rows_value(norm_rows_load4(x, f4), norm_rows_load4(gain, f4), scale)",
+            "norm_rows_value(norm_rows_load4(x, f4), float4(1.0f), scale)",
+            1,
+        )],
+    },
+    Mutant {
+        name: "router_norm_eps_dropped",
+        clause: "router_sigmoid_norm",
+        why: "the norm's epsilon is zero",
+        edits: &[(
+            "rms_scale(total, SI_K, args.eps)",
+            "rms_scale(total, SI_K, 0.0f)",
+            1,
+        )],
+    },
+    Mutant {
+        name: "router_norm_row_unstored",
+        clause: "router_sigmoid_norm",
+        why: "no threadgroup stores the normed row: the experts read the sentinel",
+        edits: &[(
+            "if (tg == 0u) {\n            *((device float4 *)normed + f4) = value;",
+            "if (tg == 9999u) {\n            *((device float4 *)normed + f4) = value;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "router_norm_unusable_unraised",
+        clause: "router_sigmoid_norm",
+        why: "a row whose sum of squares the norm cannot take raises nothing",
+        edits: &[("if (!usable && tg == 0u && tid == 0u) {", "if (false) {", 1)],
+    },
+    Mutant {
+        name: "router_norm_overflow_unraised",
+        clause: "router_sigmoid_norm",
+        why: "a normed value that is not finite raises nothing",
+        edits: &[("if (usable && bad && tg == 0u) {", "if (false) {", 1)],
+    },
+    Mutant {
+        name: "router_norm_dot_reads_raw_row",
+        clause: "router_sigmoid_norm",
+        why: "the scores' dots take the input before its norm",
+        edits: &[(
+            "const float4 xv = tg_x[lane + SI_LANES * i];",
+            "const float4 xv = router_load4(x, lane + SI_LANES * i);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "router_norm_dot_copy_scaled",
+        clause: "router_sigmoid_norm",
+        why: "the row the dots read is a part in a thousand large: the scores move, the stored row does not",
+        edits: &[(
+            "bad = bad || !all(isfinite(value));\n        tg_x[f4] = value;",
+            "bad = bad || !all(isfinite(value));\n        tg_x[f4] = value * 1.0009765625f;",
+            1,
         )],
     },
 ];

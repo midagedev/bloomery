@@ -57,6 +57,20 @@ pub struct RouterSigmoidParams<'w> {
     pub layer: u32,
 }
 
+/// One router launch with the feed-forward's norm in front of it: the router's
+/// own parameters, whose `x` is the row as it is (not normed), the norm's gain
+/// and epsilon, and the row the norm writes (the experts' input).
+pub struct RouterSigmoidNormParams<'w> {
+    /// The router: `x` is the input before the norm.
+    pub router: RouterSigmoidParams<'w>,
+    /// The norm's gain, `k`, 16-byte aligned.
+    pub gain: Window<'w, f32, MetalDevice>,
+    /// The normed row, `k`, 16-byte aligned: written by the launch.
+    pub normed: WindowMut<'w, f32, MetalDevice>,
+    /// The norm's epsilon, finite and positive.
+    pub eps: f32,
+}
+
 /// One situ combine launch over `n` values.
 pub struct SituParams<'w> {
     /// Values.
@@ -81,6 +95,56 @@ fn refuse(detail: impl Into<String>) -> DeviceError {
     range(WHAT, detail)
 }
 
+/// The router's shape and windows, refused by name.
+fn check_router(p: &RouterSigmoidParams<'_>) -> Result<(), DeviceError> {
+    router_holds(p.k).map_err(|e| refuse(e.to_string()))?;
+    if p.k != HIDDEN {
+        return Err(refuse(format!("hidden {}, the kernel reads {HIDDEN}", p.k)));
+    }
+    if !(1..=TOP_K).contains(&p.top_k) {
+        return Err(refuse(format!(
+            "top-k is {}, the kernel takes 1 to {TOP_K}",
+            p.top_k
+        )));
+    }
+    if !p.scale.is_finite() {
+        return Err(refuse(format!("route scale {} is not finite", p.scale)));
+    }
+    check_window_len(WHAT, "rows", p.rows.len(), EXPERTS * p.k)?;
+    check_window_len(WHAT, "x", p.x.len(), p.k)?;
+    check_window_len(WHAT, "bias", p.bias.len(), EXPERTS)?;
+    check_window_len(WHAT, "partials", p.partials.len(), EXPERTS)?;
+    check_window_len(WHAT, "ticket", p.ticket.len(), 1)?;
+    check_window_len(WHAT, "logits", p.logits.len(), EXPERTS)?;
+    check_window_len(WHAT, "ids", p.ids.len(), p.top_k)?;
+    check_window_len(WHAT, "weights", p.weights.len(), p.top_k)?;
+    for (name, start) in [
+        ("rows", p.rows.byte_range()?.start.get()),
+        ("x", p.x.byte_range()?.start.get()),
+    ] {
+        check_weights_align(WHAT, name, start, WeightAlign::Float4)?;
+    }
+    Ok(())
+}
+
+/// The router's argument words: top-k, the layer and the route scale.
+fn router_words(p: &RouterSigmoidParams<'_>) -> Result<[[u8; 4]; 3], DeviceError> {
+    Ok([word(WHAT, "top-k", p.top_k)?, p.layer, p.scale.to_bits()].map(u32::to_ne_bytes))
+}
+
+/// Bind the router's partials, ticket and outputs, in the order both entries
+/// take them.
+fn bind_selection(
+    slot: &mut Bindings<'_, '_>,
+    p: &RouterSigmoidParams<'_>,
+) -> Result<(), DeviceError> {
+    slot.set(Binding::of_mut(&p.partials)?)?;
+    slot.set(Binding::of_mut(&p.ticket)?)?;
+    slot.set(Binding::of_mut(&p.logits)?)?;
+    slot.set(Binding::of_mut(&p.ids)?)?;
+    slot.set(Binding::of_mut(&p.weights)?)
+}
+
 impl Kernels {
     /// Encode the router: one dispatch, which also selects (the last
     /// threadgroup). The shape and every window are checked first; a refused
@@ -91,47 +155,57 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: RouterSigmoidParams<'_>,
     ) -> Result<(), DeviceError> {
-        router_holds(p.k).map_err(|e| refuse(e.to_string()))?;
-        if p.k != HIDDEN {
-            return Err(refuse(format!("hidden {}, the kernel reads {HIDDEN}", p.k)));
-        }
-        if !(1..=TOP_K).contains(&p.top_k) {
-            return Err(refuse(format!(
-                "top-k is {}, the kernel takes 1 to {TOP_K}",
-                p.top_k
-            )));
-        }
-        if !p.scale.is_finite() {
-            return Err(refuse(format!("route scale {} is not finite", p.scale)));
-        }
-        check_window_len(WHAT, "rows", p.rows.len(), EXPERTS * p.k)?;
-        check_window_len(WHAT, "x", p.x.len(), p.k)?;
-        check_window_len(WHAT, "bias", p.bias.len(), EXPERTS)?;
-        check_window_len(WHAT, "partials", p.partials.len(), EXPERTS)?;
-        check_window_len(WHAT, "ticket", p.ticket.len(), 1)?;
-        check_window_len(WHAT, "logits", p.logits.len(), EXPERTS)?;
-        check_window_len(WHAT, "ids", p.ids.len(), p.top_k)?;
-        check_window_len(WHAT, "weights", p.weights.len(), p.top_k)?;
-        for (name, start) in [
-            ("rows", p.rows.byte_range()?.start.get()),
-            ("x", p.x.byte_range()?.start.get()),
-        ] {
-            check_weights_align(WHAT, name, start, WeightAlign::Float4)?;
-        }
-        let args =
-            [word(WHAT, "top-k", p.top_k)?, p.layer, p.scale.to_bits()].map(u32::to_ne_bytes);
+        check_router(&p)?;
+        let args = router_words(&p)?;
         encoder.set_pipeline(&self.ink2.router_sigmoid);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.rows)?)?;
         slot.set(Binding::of(&p.x)?)?;
         slot.set(Binding::of(&p.bias)?)?;
-        slot.set(Binding::of_mut(&p.partials)?)?;
-        slot.set(Binding::of_mut(&p.ticket)?)?;
-        slot.set(Binding::of_mut(&p.logits)?)?;
-        slot.set(Binding::of_mut(&p.ids)?)?;
-        slot.set(Binding::of_mut(&p.weights)?)?;
+        bind_selection(&mut slot, &p)?;
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.set(p.faults.binding())?;
+        slot.dispatch_groups(EXPERTS / ROUTER_ROWS_PER_GROUP, 1, ROUTER_THREADS)
+    }
+
+    /// Encode the router with the feed-forward's norm in front of it: one
+    /// dispatch, which norms the row in every threadgroup, stores it, and also
+    /// selects. The shape and every window are checked first; a refused launch
+    /// encodes nothing.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn router_sigmoid_norm(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: RouterSigmoidNormParams<'_>,
+    ) -> Result<(), DeviceError> {
+        let r = &p.router;
+        check_router(r)?;
+        if !(p.eps.is_finite() && p.eps > 0.0) {
+            return Err(refuse(format!(
+                "norm epsilon {} is not finite and positive",
+                p.eps
+            )));
+        }
+        check_window_len(WHAT, "gain", p.gain.len(), r.k)?;
+        check_window_len(WHAT, "normed", p.normed.len(), r.k)?;
+        for (name, start) in [
+            ("gain", p.gain.byte_range()?.start.get()),
+            ("normed", p.normed.byte_range()?.start.get()),
+        ] {
+            check_weights_align(WHAT, name, start, WeightAlign::Float4)?;
+        }
+        let words = router_words(r)?;
+        let args = [words[0], words[1], words[2], p.eps.to_bits().to_ne_bytes()];
+        encoder.set_pipeline(&self.ink2.router_sigmoid_norm);
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&r.rows)?)?;
+        slot.set(Binding::of(&r.x)?)?;
+        slot.set(Binding::of(&p.gain)?)?;
+        slot.set(Binding::of_mut(&p.normed)?)?;
+        slot.set(Binding::of(&r.bias)?)?;
+        bind_selection(&mut slot, r)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.set(r.faults.binding())?;
         slot.dispatch_groups(EXPERTS / ROUTER_ROWS_PER_GROUP, 1, ROUTER_THREADS)
     }
 

@@ -125,6 +125,8 @@ mod clauses_sites;
 mod clauses_situ;
 #[path = "clauses_synth.rs"]
 mod clauses_synth;
+#[path = "clauses_tail_fold.rs"]
+mod clauses_tail_fold;
 #[path = "clauses_tensor.rs"]
 mod clauses_tensor;
 #[path = "clauses_window.rs"]
@@ -1246,6 +1248,7 @@ fn clause_table<'a>(
             .chain(clauses_res_mix::table(ctx))
             .chain(clauses_conv_res::table(ctx))
             .chain(clauses_qk_clip::table(ctx))
+            .chain(clauses_tail_fold::table(ctx))
             .chain(clauses_loop_control::table(ctx))
             .chain(clauses_nvfp4::table(ctx))
             .chain(clauses_situ::table(ctx))

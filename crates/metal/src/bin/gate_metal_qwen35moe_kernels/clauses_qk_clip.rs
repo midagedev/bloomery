@@ -21,26 +21,26 @@ use super::common::{self, LAYER};
 use super::ink2::{self, U};
 use super::{ClauseRun, Harness};
 
-const QK_THRESH: f32 = 22.627_417;
-const R_THRESH: f32 = 8.0;
-const V_EPS: f32 = 1.0e-6;
-const CTX: usize = 7;
+pub(super) const QK_THRESH: f32 = 22.627_417;
+pub(super) const R_THRESH: f32 = 8.0;
+pub(super) const V_EPS: f32 = 1.0e-6;
+pub(super) const CTX: usize = 7;
 /// What a plane holds before the launch: no value of a row.
-const PLANE_FILL: u16 = 0x5555;
+pub(super) const PLANE_FILL: u16 = 0x5555;
 
-struct Rows {
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    r: Vec<f32>,
-    gq: Vec<f32>,
-    gr: Vec<f32>,
+pub(super) struct Rows {
+    pub(super) q: Vec<f32>,
+    pub(super) k: Vec<f32>,
+    pub(super) v: Vec<f32>,
+    pub(super) r: Vec<f32>,
+    pub(super) gq: Vec<f32>,
+    pub(super) gr: Vec<f32>,
 }
 
 /// Rows whose amplitudes cycle, so some clip and some do not: a query or key
 /// row of amplitude 4 has norm near 27 over the threshold 22.6, one of 2 near
 /// 13.
-fn rows(seed: u64) -> Rows {
+pub(super) fn rows(seed: u64) -> Rows {
     let amp = [0.2f32, 0.5, 1.0, 2.0, 4.0];
     let pick = |n: usize, width: usize, seed: u64, amps: &[f32]| -> Vec<f32> {
         (0..n)

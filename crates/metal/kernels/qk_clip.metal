@@ -68,6 +68,147 @@ inline ushort qk_clip_half(float value, device atomic_uint *faults, uint layer) 
     return bits;
 }
 
+// A query row (one SIMD group): the head's scale row, the clip, then the token's
+// `tau`.
+inline void qk_clip_query_row(device float *q,
+                              device const float *gq,
+                              uint h,
+                              uint lane,
+                              constant QkClipArgs &args,
+                              device atomic_uint *faults)
+{
+    const uint base = h * BLOOMERY_INK2_HEAD;
+    float x[4];
+    float acc = 0.f;
+    for (uint i = 0u; i < 4u; ++i) {
+        x[i] = q[base + lane + 32u * i];
+        x[i] *= gq[base + lane + 32u * i];
+        acc = fma(x[i], x[i], acc);
+    }
+    const float f = qk_clip_factor(sqrt(simd_sum(acc)), args.qk_thresh);
+    if (!isfinite(f)) {
+        if (lane == 0u) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_VALUE);
+        }
+        for (uint i = 0u; i < 4u; ++i) {
+            q[base + lane + 32u * i] = NAN;
+        }
+        return;
+    }
+    for (uint i = 0u; i < 4u; ++i) {
+        q[base + lane + 32u * i] = x[i] * f * args.tau;
+    }
+}
+
+// A key row (one SIMD group) from its four values `x` (lane + 32 i of the
+// head's row): the clip, the write back and the f16 append.
+inline void qk_clip_key_row(thread float *x,
+                            device float *k,
+                            device ushort *cache_k,
+                            uint h,
+                            uint lane,
+                            constant QkClipArgs &args,
+                            device atomic_uint *faults)
+{
+    const uint base = h * BLOOMERY_INK2_HEAD;
+    if (args.pos >= args.ctx) {
+        if (lane == 0u) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_POS);
+        }
+        for (uint i = 0u; i < 4u; ++i) {
+            k[base + lane + 32u * i] = NAN;
+        }
+        return;
+    }
+    float acc = 0.f;
+    for (uint i = 0u; i < 4u; ++i) {
+        acc = fma(x[i], x[i], acc);
+    }
+    const float f = qk_clip_factor(sqrt(simd_sum(acc)), args.qk_thresh);
+    if (!isfinite(f)) {
+        if (lane == 0u) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_VALUE);
+        }
+        for (uint i = 0u; i < 4u; ++i) {
+            k[base + lane + 32u * i] = NAN;
+        }
+        return;
+    }
+    for (uint i = 0u; i < 4u; ++i) {
+        k[base + lane + 32u * i] = x[i] * f;
+    }
+    device ushort *at = cache_k + (h * args.ctx + args.pos) * BLOOMERY_INK2_HEAD + lane;
+    for (uint i = 0u; i < 4u; ++i) {
+        at[32u * i] = qk_clip_half(x[i] * f, faults, args.layer);
+    }
+}
+
+// A value row (one SIMD group) from its four values `x`: a gainless RMS norm,
+// no clip, then the append.
+inline void qk_clip_value_row(thread float *x,
+                              device float *v,
+                              device ushort *cache_v,
+                              uint h,
+                              uint lane,
+                              constant QkClipArgs &args,
+                              device atomic_uint *faults)
+{
+    const uint base = h * BLOOMERY_INK2_HEAD;
+    if (args.pos >= args.ctx) {
+        if (lane == 0u) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_POS);
+        }
+        for (uint i = 0u; i < 4u; ++i) {
+            v[base + lane + 32u * i] = NAN;
+        }
+        return;
+    }
+    float acc = 0.f;
+    for (uint i = 0u; i < 4u; ++i) {
+        acc = fma(x[i], x[i], acc);
+    }
+    const float sq = simd_sum(acc);
+    const float scale = rms_scale(sq, BLOOMERY_INK2_HEAD, args.v_eps);
+    if (!rms_usable(sq, scale)) {
+        if (lane == 0u) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_VALUE);
+        }
+        for (uint i = 0u; i < 4u; ++i) {
+            v[base + lane + 32u * i] = NAN;
+        }
+        return;
+    }
+    device ushort *at = cache_v + (h * args.ctx + args.pos) * BLOOMERY_INK2_HEAD + lane;
+    for (uint i = 0u; i < 4u; ++i) {
+        x[i] *= scale;
+        v[base + lane + 32u * i] = x[i];
+        at[32u * i] = qk_clip_half(x[i], faults, args.layer);
+    }
+}
+
+// A relative row (one SIMD group): a BLOOMERY_INK2_REL-wide row, its lanes'
+// low lanes the row's own values.
+inline void qk_clip_rel_row(device float *r,
+                            device const float *gr,
+                            uint h,
+                            uint lane,
+                            constant QkClipArgs &args,
+                            device atomic_uint *faults)
+{
+    const uint base = h * BLOOMERY_INK2_REL;
+    const bool mine = lane < BLOOMERY_INK2_REL;
+    float x = mine ? r[base + lane] * gr[base + lane] : 0.0f;
+    const float f = qk_clip_factor(sqrt(simd_sum(mine ? x * x : 0.0f)), args.r_thresh);
+    if (!isfinite(f)) {
+        if (lane == 0u) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_VALUE);
+        }
+    }
+    if (mine) {
+        r[base + lane] = isfinite(f) ? x * f * args.tau : NAN;
+    }
+}
+
 kernel void qk_clip_append(device float *q [[buffer(0)]],
                            device float *k [[buffer(1)]],
                            device float *v [[buffer(2)]],
@@ -91,106 +232,147 @@ kernel void qk_clip_append(device float *q [[buffer(0)]],
     if (gw >= 2u * (heads + kv)) {
         return;
     }
-
-    // The query heads, then the key heads. `is_q` is SIMD-group-uniform.
-    if (gw < heads + kv) {
-        const bool is_q = gw < heads;
-        const uint h = is_q ? gw : gw - heads;
-        const uint base = h * BLOOMERY_INK2_HEAD;
-        device float *rowbuf = is_q ? q : k;
-        if (!is_q && args.pos >= args.ctx) {
-            if (lane == 0u) {
-                raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_POS);
-            }
-            for (uint i = 0u; i < 4u; ++i) {
-                rowbuf[base + lane + 32u * i] = NAN;
-            }
-            return;
-        }
-        float x[4];
-        float acc = 0.f;
-        for (uint i = 0u; i < 4u; ++i) {
-            x[i] = rowbuf[base + lane + 32u * i];
-            if (is_q) {
-                x[i] *= gq[base + lane + 32u * i];
-            }
-            acc = fma(x[i], x[i], acc);
-        }
-        const float f = qk_clip_factor(sqrt(simd_sum(acc)), args.qk_thresh);
-        if (!isfinite(f)) {
-            if (lane == 0u) {
-                raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_VALUE);
-            }
-            for (uint i = 0u; i < 4u; ++i) {
-                rowbuf[base + lane + 32u * i] = NAN;
-            }
-            return;
-        }
-        for (uint i = 0u; i < 4u; ++i) {
-            rowbuf[base + lane + 32u * i] = is_q ? x[i] * f * args.tau : x[i] * f;
-        }
-        if (is_q) {
-            return; // the query rows append nothing
-        }
-        device ushort *at = cache_k + (h * args.ctx + args.pos) * BLOOMERY_INK2_HEAD + lane;
-        for (uint i = 0u; i < 4u; ++i) {
-            at[32u * i] = qk_clip_half(x[i] * f, faults, args.layer);
-        }
+    if (gw < heads) {
+        qk_clip_query_row(q, gq, gw, lane, args, faults);
         return;
     }
-
-    // The value heads: a gainless RMS norm, no clip, then the append.
+    if (gw < heads + kv) {
+        const uint h = gw - heads;
+        float x[4];
+        for (uint i = 0u; i < 4u; ++i) {
+            x[i] = k[h * BLOOMERY_INK2_HEAD + lane + 32u * i];
+        }
+        qk_clip_key_row(x, k, cache_k, h, lane, args, faults);
+        return;
+    }
     if (gw < heads + 2u * kv) {
         const uint h = gw - heads - kv;
-        const uint base = h * BLOOMERY_INK2_HEAD;
-        if (args.pos >= args.ctx) {
-            if (lane == 0u) {
-                raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_POS);
-            }
-            for (uint i = 0u; i < 4u; ++i) {
-                v[base + lane + 32u * i] = NAN;
-            }
-            return;
-        }
         float x[4];
-        float acc = 0.f;
         for (uint i = 0u; i < 4u; ++i) {
-            x[i] = v[base + lane + 32u * i];
-            acc = fma(x[i], x[i], acc);
+            x[i] = v[h * BLOOMERY_INK2_HEAD + lane + 32u * i];
         }
-        const float sq = simd_sum(acc);
-        const float scale = rms_scale(sq, BLOOMERY_INK2_HEAD, args.v_eps);
-        if (!rms_usable(sq, scale)) {
-            if (lane == 0u) {
-                raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_VALUE);
-            }
-            for (uint i = 0u; i < 4u; ++i) {
-                v[base + lane + 32u * i] = NAN;
-            }
-            return;
-        }
-        device ushort *at = cache_v + (h * args.ctx + args.pos) * BLOOMERY_INK2_HEAD + lane;
-        for (uint i = 0u; i < 4u; ++i) {
-            x[i] *= scale;
-            v[base + lane + 32u * i] = x[i];
-            at[32u * i] = qk_clip_half(x[i], faults, args.layer);
-        }
+        qk_clip_value_row(x, v, cache_v, h, lane, args, faults);
         return;
     }
+    qk_clip_rel_row(r, gr, gw - heads - 2u * kv, lane, args, faults);
+}
 
-    // The relative heads: a BLOOMERY_INK2_REL-wide row, its lanes' low
-    // lanes the row's own values.
-    const uint h = gw - heads - 2u * kv;
-    const uint base = h * BLOOMERY_INK2_REL;
-    const bool mine = lane < BLOOMERY_INK2_REL;
-    float x = mine ? r[base + lane] * gr[base + lane] : 0.0f;
-    const float f = qk_clip_factor(sqrt(simd_sum(mine ? x * x : 0.0f)), args.r_thresh);
-    if (!isfinite(f)) {
-        if (lane == 0u) {
-            raise(faults, args.layer, BLOOMERY_FAULT_SITE_CACHE_VALUE);
-        }
+// The same launch with the key and value short convs run in its tail: a key or
+// value row's SIMD group is one head (128 channels, the head's dynamic taps
+// all its own), so it reads the projection's raw row, the filter, the ring's
+// three predecessors and the head's taps, runs the conv on each of its four
+// values (conv_res_four, conv_res_four_dyn: conv_res's rule at one token), stores
+// the raw input into the ring after its reads, and goes on to the clip or the
+// norm of the conv's output as qk_clip_append does of the conv's row. The conv's
+// row itself is never stored: the clip rewrote it in place.
+//
+// A conv output that is not finite raises the linear-conv site, as conv_res's
+// does, and goes on into the clip or the norm as it is: a row with a value that
+// is not finite has a sum of squares that is not, and both raise the
+// cache-value site and write a NaN row whether the value was NaN or infinite,
+// which is what conv_res's NaN gave them. The position past the plane is still
+// raised after the conv ran (the unfolded pair's order).
+struct QkClipConvArgs {
+    QkClipArgs clip;
+    uint ring_rows;  // the conv ring's rows
+    uint ch;         // the ring's row width
+    uint base_k;     // the k conv's first channel in the ring's rows
+    uint base_v;     // the v conv's first channel
+    uint heads;      // the dynamic taps' heads: 0 a static conv, else BLOOMERY_INK2_KV
+    uint pos;        // this token's position in the sequence (the conv's, not the plane's)
+    float scale;     // the conv's output scale
+};
+
+static_assert(sizeof(QkClipConvArgs) == 56, "QkClipConvArgs is 56 bytes: the host packs fourteen words");
+
+// The conv of one key or value head's four values per lane: x receives the four
+// outputs (NaN where one is not finite).
+inline void qk_clip_conv_row(device const float *raw,
+                             device const float *w,
+                             device const float *dyn,
+                             device float *ring,
+                             uint base,
+                             uint h,
+                             uint lane,
+                             constant QkClipConvArgs &a,
+                             device atomic_uint *faults,
+                             thread float *x)
+{
+    float cur[4];
+    float4 tap[4];
+    float p3[4];
+    float p2[4];
+    float p1[4];
+    uint at[4];
+    for (uint i = 0u; i < 4u; ++i) {
+        const uint c = h * BLOOMERY_INK2_HEAD + lane + 32u * i;
+        at[i] = base + c;
+        cur[i] = raw[c];
+        tap[i] = *((device const float4 *)w + c);
+        p3[i] = conv_res_past(ring, a.ring_rows, a.ch, at[i], a.pos, 3u);
+        p2[i] = conv_res_past(ring, a.ring_rows, a.ch, at[i], a.pos, 2u);
+        p1[i] = conv_res_past(ring, a.ring_rows, a.ch, at[i], a.pos, 1u);
     }
-    if (mine) {
-        r[base + lane] = isfinite(f) ? x * f * args.tau : NAN;
+    const bool dynamic = a.heads > 0u;
+    const float4 dy = dynamic ? *((device const float4 *)dyn + h) : float4(0.0f);
+    bool ok = true;
+    for (uint i = 0u; i < 4u; ++i) {
+        const float out = dynamic
+            ? conv_res_four_dyn(tap[i], dy, p3[i], p2[i], p1[i], cur[i], a.scale)
+            : conv_res_four(tap[i], p3[i], p2[i], p1[i], cur[i], a.scale);
+        ok = ok && isfinite(out);
+        x[i] = out;
+        ring[(ulong)sc_slot(a.pos, a.ring_rows) * a.ch + at[i]] = cur[i];
     }
+    if (!ok) {
+        raise(faults, a.clip.layer, BLOOMERY_FAULT_SITE_LINEAR_CONV);
+    }
+}
+
+kernel void qk_clip_conv_append(device float *q [[buffer(0)]],
+                                device float *k [[buffer(1)]],
+                                device float *v [[buffer(2)]],
+                                device float *r [[buffer(3)]],
+                                device const float *gq [[buffer(4)]],
+                                device const float *gr [[buffer(5)]],
+                                device ushort *cache_k [[buffer(6)]],
+                                device ushort *cache_v [[buffer(7)]],
+                                constant QkClipConvArgs &args [[buffer(8)]],
+                                device atomic_uint *faults [[buffer(9)]],
+                                device const float *k_raw [[buffer(10)]],
+                                device const float *v_raw [[buffer(11)]],
+                                device const float *wk [[buffer(12)]],
+                                device const float *wv [[buffer(13)]],
+                                device const float *dyn_k [[buffer(14)]],
+                                device const float *dyn_v [[buffer(15)]],
+                                device float *ring [[buffer(16)]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint3 group [[threadgroup_position_in_grid]])
+{
+    const uint heads = BLOOMERY_INK2_Q;
+    const uint kv = BLOOMERY_INK2_KV;
+    const uint gw = group.x * 8u + sg;
+    if (gw >= 2u * (heads + kv)) {
+        return;
+    }
+    if (gw < heads) {
+        qk_clip_query_row(q, gq, gw, lane, args.clip, faults);
+        return;
+    }
+    if (gw < heads + kv) {
+        const uint h = gw - heads;
+        float x[4];
+        qk_clip_conv_row(k_raw, wk, dyn_k, ring, args.base_k, h, lane, args, faults, x);
+        qk_clip_key_row(x, k, cache_k, h, lane, args.clip, faults);
+        return;
+    }
+    if (gw < heads + 2u * kv) {
+        const uint h = gw - heads - kv;
+        float x[4];
+        qk_clip_conv_row(v_raw, wv, dyn_v, ring, args.base_v, h, lane, args, faults, x);
+        qk_clip_value_row(x, v, cache_v, h, lane, args.clip, faults);
+        return;
+    }
+    qk_clip_rel_row(r, gr, gw - heads - 2u * kv, lane, args.clip, faults);
 }

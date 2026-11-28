@@ -46,6 +46,7 @@ mod gemm;
 use crate::geometry;
 use inkling2::Pipelines as Ink2Pipelines;
 mod conv_res;
+mod conv_tail;
 mod head;
 mod head_f32;
 mod headnorm;
@@ -80,6 +81,7 @@ pub use attention::{
 pub use attention::{AttnLayer, segments_for_window};
 pub use bias::BiasRowsParams;
 pub use conv_res::{ConvResParams, conv_scale};
+pub use conv_tail::{CombineConvJoinParams, ConvResJoinParams, TailConv};
 pub use delta::DeltaParams;
 pub use delta::DeltaRowStrides;
 pub use delta::DeltaRowsParams;
@@ -126,7 +128,7 @@ pub use norm::{HiddenRow, MtpJoinParams};
 pub use norm::{NormAddNextParams, NormAddRowsParams, NormNextParams};
 pub use nvfp4::{Nvfp4Params, NvfpLayout};
 pub use out_gate::OutGateParams;
-pub use qk_clip::QkClipParams;
+pub use qk_clip::{KvConvParams, QkClipConvParams, QkClipParams};
 pub use rel_flash::{RelFlashParams, rel_partials_len};
 pub use res_mix::ResMixParams;
 pub use routed::{
@@ -134,7 +136,7 @@ pub use routed::{
     RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, SwigluRowsParams, TABLE_THREADS,
     route_table_words, route_tiles,
 };
-pub use router_situ::{RouterSigmoidParams, SituParams};
+pub use router_situ::{RouterSigmoidNormParams, RouterSigmoidParams, SituParams};
 pub use seg::{SegParams, Segment};
 pub use shortconv::{ShortConvRowsParams, ShortConvStepParams};
 pub use shortconv_geom::MAX_SLOTS as SHORTCONV_MAX_SLOTS;

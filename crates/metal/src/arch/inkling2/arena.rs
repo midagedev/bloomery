@@ -128,8 +128,6 @@ pub struct Scratch {
     pub logits: MetalBuffer<f32>,
     pub ticket: MetalBuffer<u32>,
     pub route_ids: MetalBuffer<u32>,
-    /// The identity map the combine reads its slots through.
-    pub slots: MetalBuffer<u32>,
     pub step_id: MetalBuffer<u32>,
 }
 
@@ -560,7 +558,6 @@ impl Arena {
             logits: next()?,
             ticket: filled(alloc, &[0u32])?,
             route_ids: alloc.buffer(Elems(8))?,
-            slots: filled(alloc, &(0..8u32).collect::<Vec<_>>())?,
             step_id: alloc.buffer(Elems(1))?,
         };
         let output_query = globals.pop().expect("two globals");

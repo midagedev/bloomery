@@ -126,6 +126,56 @@ static void situ_pick(device uint *ids,
     }
 }
 
+// Everything after the rows' dots: the ticket publishes each SIMD group's
+// score, the last threadgroup reads every row's score back, packs the
+// selection keys (the score plus the row's bias), flags the rows that are
+// not finite and selects. Both entries end here.
+static void situ_finish(device coherent(device) float *partials,
+                        device atomic_uint *ticket,
+                        device const float *bias,
+                        device float *logits,
+                        device uint *ids,
+                        device float *weights,
+                        constant SigmoidArgs &args,
+                        device atomic_uint *faults,
+                        uint groups,
+                        uint tid,
+                        uint lane,
+                        uint sg_in_tg,
+                        threadgroup uint &last_flag,
+                        threadgroup float *tg_score,
+                        threadgroup ulong *tg_keys,
+                        threadgroup uint *tg_bad)
+{
+    ticket_is_last(ticket, groups, tid, last_flag);
+    if (last_flag != 1u) {
+        return;
+    }
+    ticket_acquire();
+    // Every thread reads its rows' scores back — the values one lane wrote
+    // each, so every score is the bits it was — packs the selection keys
+    // (the score plus the row's bias) and flags the rows that are not
+    // finite.
+    uint mine_bad = 0u;
+    for (uint row = tid; row < SI_EXPERTS; row += SI_THREADS) {
+        const float score = ticket_load(partials, row);
+        logits[row] = score;
+        tg_score[row] = score;
+        const float sel = score + bias[row];
+        mine_bad |= isfinite(score) && isfinite(sel) ? 0u : 1u;
+        tg_keys[row] = argmax_key(sel, row);
+    }
+    mine_bad = simd_max(mine_bad);
+    if (lane == 0u) {
+        tg_bad[sg_in_tg] = mine_bad;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_in_tg != 0u) {
+        return;
+    }
+    situ_pick(ids, weights, ticket, faults, args, lane, tg_score, tg_keys, tg_bad);
+}
+
 kernel void router_sigmoid(device const float *rows [[buffer(0)]],
                            device const float *x [[buffer(1)]],
                            device const float *bias [[buffer(2)]],
@@ -169,32 +219,113 @@ kernel void router_sigmoid(device const float *rows [[buffer(0)]],
             ticket_write(partials, sg, score);
         }
     }
+    situ_finish(partials, ticket, bias, logits, ids, weights, args, faults, groups, tid, lane,
+                sg_in_tg, last_flag, tg_score, tg_keys, tg_bad);
+}
 
-    ticket_is_last(ticket, groups, tid, last_flag);
-    if (last_flag != 1u) {
-        return;
+// The router with the feed-forward's norm in front of it: every threadgroup
+// norms the input itself (norm_rows' own sums, the same threads, loops and
+// SIMD-group tree, so every copy is bit-equal) and keeps the normed row in
+// threadgroup memory for its rows' dots; threadgroup 0 also stores it, the
+// experts' input. The norm raises the norm site as norm_rows does (a row it
+// cannot take is NaN, and the scores of NaN then raise the router's own site).
+// The rows' weights are loaded before the norm's sums so their latency runs
+// under it.
+struct SigmoidNormArgs {
+    SigmoidArgs router;
+    float eps;  // the norm's epsilon
+};
+
+static_assert(sizeof(SigmoidNormArgs) == 16, "SigmoidNormArgs is 16 bytes: the host packs four words");
+static_assert(NORM_ROWS_THREADS == SI_THREADS, "the norm's threads are the router's");
+
+kernel void router_sigmoid_norm(device const float *rows [[buffer(0)]],
+                                device const float *x [[buffer(1)]],
+                                device const float *gain [[buffer(2)]],
+                                device float *normed [[buffer(3)]],
+                                device const float *bias [[buffer(4)]],
+                                device coherent(device) float *partials [[buffer(5)]],
+                                device atomic_uint *ticket [[buffer(6)]],
+                                device float *logits [[buffer(7)]],
+                                device uint *ids [[buffer(8)]],
+                                device float *weights [[buffer(9)]],
+                                constant SigmoidNormArgs &args [[buffer(10)]],
+                                device atomic_uint *faults [[buffer(11)]],
+                                uint tg [[threadgroup_position_in_grid]],
+                                uint tid [[thread_position_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]],
+                                uint sg_in_tg [[simdgroup_index_in_threadgroup]],
+                                uint groups [[threadgroups_per_grid]])
+{
+    threadgroup uint last_flag = 0u;
+    threadgroup float tg_score[SI_EXPERTS];
+    threadgroup ulong tg_keys[SI_EXPERTS];
+    threadgroup uint tg_bad[SI_SG];
+    threadgroup float tg_sums[SI_SG];
+    threadgroup float4 tg_x[SI_K / 4u];
+
+    // The row's weights, loaded first.
+    const uint sg = tg * SI_SG + sg_in_tg;
+    float4 wv[SI_FLOAT4S];
+    if (sg < SI_EXPERTS) {
+        device const float *row = rows + (ulong)sg * (ulong)SI_K;
+        for (uint i = 0u; i < SI_FLOAT4S; ++i) {
+            wv[i] = router_load4(row, lane + SI_LANES * i);
+        }
     }
-    ticket_acquire();
-    // Every thread reads its rows' scores back — the values one lane wrote
-    // each, so every score is the bits it was — packs the selection keys
-    // (the score plus the row's bias) and flags the rows that are not
-    // finite.
-    uint mine_bad = 0u;
-    for (uint row = tid; row < SI_EXPERTS; row += SI_THREADS) {
-        const float score = ticket_load(partials, row);
-        logits[row] = score;
-        tg_score[row] = score;
-        const float sel = score + bias[row];
-        mine_bad |= isfinite(score) && isfinite(sel) ? 0u : 1u;
-        tg_keys[row] = argmax_key(sel, row);
+
+    // norm_rows' sums and value, line for line.
+    const uint f4s = SI_K / 4u;
+    float sum_sq = 0.f;
+    for (uint f4 = tid; f4 < f4s; f4 += SI_THREADS) {
+        float4 xv = norm_rows_load4(x, f4);
+        sum_sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
     }
-    mine_bad = simd_max(mine_bad);
+    sum_sq = simd_sum(sum_sq);
     if (lane == 0u) {
-        tg_bad[sg_in_tg] = mine_bad;
+        tg_sums[sg_in_tg] = sum_sq;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg_in_tg != 0u) {
-        return;
+    float total = 0.f;
+    for (uint g = 0u; g < SI_SG; ++g) {
+        total += tg_sums[g];
     }
-    situ_pick(ids, weights, ticket, faults, args, lane, tg_score, tg_keys, tg_bad);
+    const float scale = rms_scale(total, SI_K, args.eps);
+    const bool usable = rms_usable(total, scale);
+    if (!usable && tg == 0u && tid == 0u) {
+        norm_rows_raise(faults, args.router.layer);
+    }
+    bool bad = false;
+    for (uint f4 = tid; f4 < f4s; f4 += SI_THREADS) {
+        const float4 value = usable
+            ? norm_rows_value(norm_rows_load4(x, f4), norm_rows_load4(gain, f4), scale)
+            : float4(NAN);
+        bad = bad || !all(isfinite(value));
+        tg_x[f4] = value;
+        if (tg == 0u) {
+            *((device float4 *)normed + f4) = value;
+        }
+    }
+    if (usable && bad && tg == 0u) {
+        norm_rows_raise(faults, args.router.layer);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg < SI_EXPERTS) {
+        float acc = 0.f;
+        for (uint i = 0u; i < SI_FLOAT4S; ++i) {
+            const float4 w = wv[i];
+            const float4 xv = tg_x[lane + SI_LANES * i];
+            acc += w.x * xv.x;
+            acc += w.y * xv.y;
+            acc += w.z * xv.z;
+            acc += w.w * xv.w;
+        }
+        const float score = 1.0f / (1.0f + exp(-simd_sum(acc)));
+        if (lane == 0u) {
+            ticket_write(partials, sg, score);
+        }
+    }
+    situ_finish(partials, ticket, bias, logits, ids, weights, args.router, faults, groups, tid,
+                lane, sg_in_tg, last_flag, tg_score, tg_keys, tg_bad);
 }

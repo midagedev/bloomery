@@ -246,6 +246,7 @@ fn main() {
         "res_mix",
         "loop_control",
         "conv_res",
+        "conv_tail",
         "qk_clip",
         "rel_flash",
         "router_situ",

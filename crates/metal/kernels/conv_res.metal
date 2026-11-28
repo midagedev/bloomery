@@ -103,6 +103,62 @@ inline float conv_res_tap(device const float *x,
     return ring[sc_slot(pos0 - before, rows) * ch + base + c];
 }
 
+// The decode token's conv, for the entries that run it in the tail of the
+// launch that makes its input (conv_tail.metal, qk_clip.metal): a four-tap
+// static filter (and, on a windowless k or v conv, a head's four dynamic
+// taps), token 0 of a call of one, so the oldest static tap pairs the input
+// three positions back and the newest the current one. One owner of the rule
+// beside `conv_res` for those entries; the clauses hold each of them to
+// `conv_res`'s bits.
+
+// The ring's input `back` positions before position `pos`, channel `at` of the
+// ring's rows of `ch`: zero before the sequence's start, whatever the ring holds.
+inline float conv_res_past(device const float *ring, uint rows, uint ch, uint at, uint pos, uint back)
+{
+    if (back > pos) {
+        return 0.0f;
+    }
+    return ring[(ulong)sc_slot(pos - back, rows) * ch + at];
+}
+
+// The same for four channels from `at`, a multiple of 4 on a 16-byte boundary.
+inline float4 conv_res_past4(device const float *ring, uint rows, uint ch, uint at, uint pos, uint back)
+{
+    if (back > pos) {
+        return float4(0.0f);
+    }
+    return *((device const float4 *)(ring + (ulong)sc_slot(pos - back, rows) * ch + at));
+}
+
+// The static taps oldest first: the first product rounds alone, the rest fuse
+// ascending. `tap` is the channel's four filter taps, `p3`, `p2`, `p1` its
+// inputs three, two and one positions back and `cur` its input now.
+inline float conv_res_acc4(float4 tap, float p3, float p2, float p1, float cur)
+{
+    float acc = tap.x * p3;
+    acc = fma(tap.y, p2, acc);
+    acc = fma(tap.z, p1, acc);
+    return fma(tap.w, cur, acc);
+}
+
+// One channel's output of a static conv: the residual cur-first, the scale last.
+inline float conv_res_four(float4 tap, float p3, float p2, float p1, float cur, float scale)
+{
+    return (cur + conv_res_acc4(tap, p3, p2, p1, cur)) * scale;
+}
+
+// One channel's output of a conv with dynamic taps: after the static taps,
+// `dy` (its head's four taps, lag 0 the current input) fuse in lag order.
+inline float conv_res_four_dyn(float4 tap, float4 dy, float p3, float p2, float p1, float cur, float scale)
+{
+    float acc = conv_res_acc4(tap, p3, p2, p1, cur);
+    acc = fma(dy.x, cur, acc);
+    acc = fma(dy.y, p1, acc);
+    acc = fma(dy.z, p2, acc);
+    acc = fma(dy.w, p3, acc);
+    return (cur + acc) * scale;
+}
+
 kernel void conv_res(device const float *x [[buffer(0)]],
                      device const float *w [[buffer(1)]],
                      device const float *dyn [[buffer(2)]],
