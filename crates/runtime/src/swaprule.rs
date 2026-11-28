@@ -26,7 +26,11 @@
 //! pinned seed experts ([`SwapRule::new_pinned`]) stay on the card through
 //! both: they are never a victim. A layer's away experts
 //! ([`SwapRule::new_placed`]) run on another device for the rule's life: never
-//! admitted, never a victim, never in its card set.
+//! admitted, never a victim, never in its card set. A rule built
+//! [`SwapRule::with_lend`] lends them: its planning passes admit an away expert
+//! like any other off the card, and an away expert on the card is a victim
+//! like any resident, going back to its device; a prompt call's pick and the
+//! opening relayout leave it where it is, off the card.
 //!
 //! One pass is driven as `observe`* → [`SwapRule::end_pass`] →
 //! [`SwapRule::plan`] at the boundary it ends at; anything else is refused by
@@ -555,6 +559,9 @@ pub struct SwapRule {
     pinned: Vec<usize>,
     /// `layer * experts + id`: the expert is away ([`SwapRule::new_placed`]).
     away: Vec<bool>,
+    /// The away experts may be admitted by a planning pass and evicted back
+    /// ([`SwapRule::with_lend`]).
+    lend: bool,
     /// `layer * experts + id`.
     slot: Vec<Slot>,
     /// `stream * layers * experts + layer * experts + id`: each stream's own
@@ -612,6 +619,7 @@ impl PartialEq for SwapRule {
             && self.capacity == o.capacity
             && self.pinned == o.pinned
             && self.away == o.away
+            && self.lend == o.lend
             && self.slot == o.slot
             && self.heat == o.heat
             && self.live == o.live
@@ -845,6 +853,7 @@ impl SwapRule {
             capacity: capacity.to_vec(),
             pinned: pinned.to_vec(),
             away: is_away,
+            lend: false,
             slot,
             heat: vec![0.0; layers * e],
             live: vec![true],
@@ -866,6 +875,35 @@ impl SwapRule {
             pairs: Vec::with_capacity(most),
             flips: Vec::with_capacity(most.min(params.cap)),
         })
+    }
+
+    /// The rule lending its away experts: each is an ordinary expert off the
+    /// card to a planning pass, which may admit it, and an ordinary resident
+    /// once admitted, which may be its victim, a reset taking it off the card
+    /// again. A prompt call's pick ([`SwapRule::call_pick`]) and the opening
+    /// relayout ([`SwapRule::open`]) never admit one. Refused by name: a
+    /// rule that is not as built (a pass ended, a flip in flight, a row
+    /// observed).
+    pub fn with_lend(mut self) -> Result<Self, SwapRuleError> {
+        if self.passes != 0 || self.pass_rows != 0 || !self.pending.is_empty() {
+            return Err(SwapRuleError::Shape {
+                what: "a rule is made to lend before any pass or flip",
+                value: usize::try_from(self.passes).unwrap_or(usize::MAX),
+            });
+        }
+        self.lend = true;
+        for (s, &away) in self.slot.iter_mut().zip(&self.away) {
+            if away {
+                *s = Slot::Off;
+            }
+        }
+        Ok(self)
+    }
+
+    /// Whether this rule lends its away experts ([`SwapRule::with_lend`]).
+    #[must_use]
+    pub fn lends(&self) -> bool {
+        self.lend
     }
 
     /// The rule with `layers` routed by no pass: layers a pass never
@@ -1137,8 +1175,10 @@ impl SwapRule {
     /// A new seed, `order[l]` layer `l`'s ranking (its first the most
     /// wanted): each layer keeps its pinned experts, the first of its seed
     /// list, and ranks after them `order[l]`'s experts that are neither pinned
-    /// nor away, in order. The card set stays until [`SwapRule::reset`],
-    /// which returns to the new seed. Refused by name, the rule unchanged: an
+    /// nor away, in order; a rule that lends ([`SwapRule::with_lend`]) ranks
+    /// its away experts too, and a seed that names one puts it on the card.
+    /// The card set stays until [`SwapRule::reset`], which returns to the new
+    /// seed. Refused by name, the rule unchanged: an
     /// order of another length, an expert past the experts or named twice in
     /// a layer's order, and a layer whose new list names fewer experts than
     /// its card slots.
@@ -1164,7 +1204,7 @@ impl SwapRule {
                 if std::mem::replace(&mut named[id as usize], true) {
                     return Err(SwapRuleError::SeedDuplicate { layer, id });
                 }
-                if rank[i] == UNRANKED && !self.away[i] {
+                if rank[i] == UNRANKED && (!self.away[i] || self.lend) {
                     rank[i] = next;
                     next += 1;
                 }
@@ -1540,9 +1580,11 @@ impl SwapRule {
             vict.clear();
             let slots = &self.slot[layer * e..(layer + 1) * e];
             let ranks = &self.rank[layer * e..(layer + 1) * e];
+            let away = &self.away[layer * e..(layer + 1) * e];
             let layer_counts = &counts[layer * e..(layer + 1) * e];
             for (((&s, &c), &r), id) in slots.iter().zip(layer_counts).zip(ranks).zip(0u32..) {
                 match s {
+                    Slot::Off if away[id as usize] => {}
                     Slot::Off => cand.push((c, r, id)),
                     Slot::Live => vict.push((c, r, id)),
                     Slot::Pinned | Slot::Away | Slot::Filling | Slot::Leaving => {}
@@ -1612,6 +1654,7 @@ impl SwapRule {
         }
         flips.clear();
         let slots = &self.slot[layer * e..(layer + 1) * e];
+        let away = &self.away[layer * e..(layer + 1) * e];
         // (count, pool resident, id), wanted order first.
         let mut ranked: Vec<(u32, bool, u32)> = slots
             .iter()
@@ -1619,7 +1662,7 @@ impl SwapRule {
             .zip(0u32..)
             .filter_map(|((&s, &c), id)| match s {
                 Slot::Live => Some((c, true, id)),
-                Slot::Off if c >= floor => Some((c, false, id)),
+                Slot::Off if c >= floor && !away[id as usize] => Some((c, false, id)),
                 _ => None,
             })
             .collect();
@@ -1699,9 +1742,10 @@ impl SwapRule {
 
     /// Layer `layer`'s `k` coldest residents in the order a planning pass
     /// evicts in — the live streams' blended heat, fewest uses first, then
-    /// the lower id — pinned, away and in-flight experts never one, exactly
-    /// the victims [`SwapRule::plan`] ranks. The blend is the planning
-    /// pass's own; the rule does not move. Refused by name: a layer past the
+    /// the lower id — pinned and in-flight experts never one, nor an away
+    /// expert unless the rule lends ([`SwapRule::with_lend`]) and has admitted
+    /// it, exactly the victims [`SwapRule::plan`] ranks. The blend is the
+    /// planning pass's own; the rule does not move. Refused by name: a layer past the
     /// rule's, and `k` past the layer's live, unpinned residents.
     pub fn coldest(&mut self, layer: usize, k: usize) -> Result<Vec<u32>, SwapRuleError> {
         self.check_layer(layer)?;
@@ -1846,7 +1890,7 @@ impl SwapRule {
             let (cap, pin) = (self.capacity[layer], self.pinned[layer]);
             for i in layer * e..(layer + 1) * e {
                 let r = self.rank[i] as usize;
-                if self.away[i] {
+                if self.away[i] && !self.lend {
                     self.slot[i] = Slot::Away;
                 } else if r < pin {
                     self.slot[i] = Slot::Pinned;
@@ -2657,6 +2701,83 @@ mod tests {
                 .unwrap_err(),
             SwapRuleError::Shape { .. }
         ));
+    }
+
+    /// A rule that lends its away experts admits one in a planning pass and
+    /// takes it off the card again as an ordinary victim, never admits one in
+    /// the opening relayout or a call's pick, and returns to the seed with it
+    /// off the card. Mutants: `with_lend` leaving the experts `Away` — the
+    /// planning pass admits none; the call's pick and the relayout dropping
+    /// the away filter — both admit 6; `reseed` or `reset` keeping the away
+    /// filter under a lend — the seed names 6 and the card set lacks it.
+    #[test]
+    fn a_lending_rule_admits_an_away_expert_in_a_plan_only() {
+        let seed: [&[u32]; 1] = [&[0, 1, 2, 3]];
+        let shape = Shape {
+            experts: 8,
+            top_k: 1,
+            max_rows: 1,
+        };
+        let lending = || {
+            SwapRule::new_placed(SwapParams::mid(0), shape, &seed, &[3], &[1], &[&[6]])
+                .unwrap()
+                .with_lend()
+                .unwrap()
+        };
+        let mut r = lending();
+        assert!(r.lends());
+        let trace = [repeat(6, 12), repeat(7, 40), repeat(5, 40)].concat();
+        let (_, flips) = replay(&mut r, &trace);
+        let admitted = flips.iter().position(|f| f.admit == 6);
+        let evicted = flips.iter().position(|f| f.evict == 6);
+        assert!(
+            admitted.is_some(),
+            "6 is away and the only routed expert: a planning pass lends it"
+        );
+        assert!(
+            evicted > admitted,
+            "6 went cold on the card: it is a victim like any resident, after its admit"
+        );
+
+        let mut r = lending();
+        let counts = [0, 0, 0, 0, 0, 0, 9, 0];
+        assert_eq!(
+            r.open(&counts, usize::MAX).unwrap(),
+            [],
+            "the opening relayout leaves an away expert off the card"
+        );
+        let mut picks = Vec::new();
+        r.call_pick(0, &counts, 3, 1, &mut picks).unwrap();
+        assert_eq!(picks, [], "so does a call's pick");
+
+        let mut r = lending();
+        replay(&mut r, &repeat(6, 12));
+        r.reset();
+        assert_eq!(r, lending(), "a reset takes 6 off the card, still lent");
+        assert_ne!(r, placed_not_lending(&seed, shape));
+
+        let mut started = lending();
+        replay(&mut started, &repeat(6, 1));
+        assert!(matches!(
+            started.with_lend(),
+            Err(SwapRuleError::Shape { .. })
+        ));
+
+        // A seed names a lent expert: after the reset it is on the card, in
+        // the place of the seed's last; a rule that does not lend leaves 6
+        // unranked and away.
+        let mut r = lending();
+        r.reseed(&[&[0, 1, 6]]).unwrap();
+        r.reset();
+        assert_eq!(r.live(0).unwrap().collect::<Vec<_>>(), [0, 1, 6]);
+        let mut r = placed_not_lending(&seed, shape);
+        r.reseed(&[&[0, 1, 6, 2]]).unwrap();
+        r.reset();
+        assert_eq!(r.live(0).unwrap().collect::<Vec<_>>(), [0, 1, 2]);
+    }
+
+    fn placed_not_lending(seed: &[&[u32]; 1], shape: Shape) -> SwapRule {
+        SwapRule::new_placed(SwapParams::mid(0), shape, seed, &[3], &[1], &[&[6]]).unwrap()
     }
 
     #[test]

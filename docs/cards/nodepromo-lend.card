@@ -1,0 +1,22 @@
+# DeepSeek-V4.1-Flash bq3km on ws (RTX 5090 + 252 GiB host) with the Spark's GB10 as the expert tier node over RDMA (listed pass, graph per
+# service), residency pool on: the same binary with BLOOMERY_NODE_LEND=1 (a hot node-homed expert is lent into the stage card pool and demoted back
+# by the pool's own rule) against BLOOMERY_NODE_LEND=0 (node experts frozen out of the pool, today's behaviour).
+# [derived 2026-11-27, /root/agents/specs/nodepromo/design.md section 3, inv2/rdmaprice/price.out] frozen node arm 72 (S2) .. 79 (S1) tok/s; promoted
+# 81.9 (S1) .. 82.0 (S2) at node share f .232, 86.6 / 88.4 at f .406. Gain over frozen = 82.0/72 = +13.9 % (S2) .. 81.9/79 = +3.7 % (S1), band
+# +3.5..+14. The lower edge is S1's; it stands only if E0 (rdmaprice) reads card-only near 2.8 ms, else the band is the S2 end and +14 is the centre.
+# What the run does NOT price: the first-promotion staging burst (up to 24 cold flips, design.md section 8.2): rounds are the warm replay rows r2..r6.
+kind: ab
+question: does lending a hot node-homed expert into the stage card pool shorten the warm V4.1 decode step of ws + the Spark's GB10 tier (node 3,201 experts, RDMA, graph)?
+term: tg tok/s of the warm replay rows (r2..r6) @ n=128, prose D=512, ctx 16384, RTX 5090 + host 252 GiB + the Spark's GB10 node, (BLOOMERY_NODE_LEND=1 - BLOOMERY_NODE_LEND=0) / BLOOMERY_NODE_LEND=0
+unit: %
+predict: +3.5..+14
+rounds: 5
+sd: 0.6 % AGENTS.md 「Know the ruler」 default, same-binary lever arms
+condition: one release-tree bloomery-serve built from this tree, tier_server of the same commit restarted before each load; the two arms differ only in
+  env=BLOOMERY_NODE_LEND=1|0 on top of BLOOMERY_TIER_LINK=rdma,BLOOMERY_TIER_NODES=10.42.0.2:19000,BLOOMERY_CARD_BUDGET=53866M, DEPTH_SERVE_PLACE=bp,
+  DEPTH_SERVE_CTX=16384, DEPTH_SERVE_N=128, BLOOMERY_RESIDENCY on in both arms; the lend arm must show node trips a step below the frozen arm in the
+  step stamps (BLOOMERY_STEP_STATS=1 on a look before the timed rounds) and residency pass records with landed > 0; rows with [cold] or majflt on the
+  warm replays are marked, not dropped; no compute process on the 5090 but ours, the Spark's yc-* containers idle
+decide-in: make BLOOMERY_NODE_LEND default on for a node tier (one registry row plus levers-direct line), then price Cols verify on the promoted pool
+decide-below: below +3.5, read the residency pass records of the lend arm (late, wait_us, landed) and majflt before any model change; late flips or major faults mean the staging burst, not the pool, is the term (prefetch the node's hot ids at the load); none of them means the node share of off-card picks is under the paper's f and the gain is smaller than priced
+decide-above: above +14, the frozen arm pays more than S2 for the node trips; re-read the node leg from the stamps and move the paper to S1's unit system

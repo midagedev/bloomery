@@ -809,6 +809,60 @@ pub unsafe fn advise_huge(_addr: *mut libc::c_void, _len: usize) -> Result<(), O
     })
 }
 
+/// The most bytes one `madvise(MADV_WILLNEED)` of [`advise_willneed`] asks for: the read-ahead window
+/// the kernel defaults to (128 KiB). A call reads at most the larger of the window and the device's
+/// I/O size and drops the rest without a word (a 1 MiB call read 512 KiB on a drive whose I/O size is
+/// 512 KiB), so a longer span is asked for in calls of this size, each of which only queues its reads.
+const WILLNEED_CHUNK: usize = 128 << 10;
+
+/// Queue the pages `span` touches for reading into the page cache, ahead of the reads that will need
+/// them: `madvise(MADV_WILLNEED)` over those whole pages, in calls of at most 128 KiB. The bytes the
+/// calls covered. The advice reads and writes no byte any borrow of `span` sees and maps no page, so
+/// it needs no more of the caller than a live slice; a page of the range that is in no mapping is
+/// the kernel's refusal (`ENOMEM`), which names the call, the address and length it refused and the
+/// span's length. Both platforms have the advice.
+pub fn advise_willneed(span: &[u8]) -> Result<u64, OsError> {
+    if span.is_empty() {
+        return Ok(0);
+    }
+    let page = usize::try_from(page_bytes()?).map_err(|_| {
+        OsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the base page does not fit usize",
+        ))
+    })?;
+    let head = span.as_ptr().addr() % page;
+    let start = span.as_ptr().wrapping_sub(head);
+    let len = (head + span.len()).div_ceil(page) * page;
+    let mut at = 0;
+    while at < len {
+        let n = (len - at).min(WILLNEED_CHUNK);
+        // SAFETY: MADV_WILLNEED reads and writes no memory of ours; a range in no mapping is
+        // refused by the kernel, never touched.
+        let rc = unsafe {
+            libc::madvise(
+                start.wrapping_add(at).cast_mut().cast(),
+                n,
+                libc::MADV_WILLNEED,
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            return Err(OsError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "madvise(MADV_WILLNEED) of {n} bytes at {:#x} (the span: {} bytes at {:#x}): {e}",
+                    start.addr() + at,
+                    span.len(),
+                    span.as_ptr().addr()
+                ),
+            )));
+        }
+        at += n;
+    }
+    Ok(len as u64)
+}
+
 /// The huge page [`advise_huge_within`] asks for.
 const HUGE_PAGE: usize = 2 << 20;
 
@@ -1252,6 +1306,75 @@ mod tests {
             matches!(&got, Err(OsError::Unsupported { call }) if *call == "madvise(MADV_HUGEPAGE)"),
             "{got:?}"
         );
+    }
+
+    /// The read-ahead advice queues a dropped file's pages: after the page cache let go of a mapped
+    /// file's clean pages, the advice over its mapping brings every page back (the bytes it covers
+    /// are whole pages over the span, in calls of at most [`super::WILLNEED_CHUNK`]), and an empty
+    /// span is none.
+    #[test]
+    fn willneed_brings_a_dropped_files_pages_back() {
+        assert_eq!(super::advise_willneed(&[]).expect("an empty span"), 0);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let p = scratch("willneed");
+            let len = 5 * (1 << 20) + 123;
+            std::fs::write(&p, vec![7u8; len]).expect("the file is written");
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&p)
+                .expect("the file opens");
+            file.sync_all().expect("the pages are written out");
+            let fd = file.as_raw_fd();
+            // SAFETY: a read-only shared mapping of the open file over its length; it is unmapped
+            // below, after the last use of `span`.
+            let map = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            assert_ne!(map, libc::MAP_FAILED, "{}", std::io::Error::last_os_error());
+            let pages = len.div_ceil(4096);
+            let resident = |vec: &mut Vec<u8>| {
+                vec.clear();
+                vec.resize(pages, 0);
+                // SAFETY: the mapping above holds `len` bytes, and `vec` a byte a page of them.
+                unsafe { super::mincore(map.cast(), len, vec) }.expect("the pages are counted");
+                vec.iter().filter(|b| **b & 1 == 1).count()
+            };
+            let mut vec = Vec::new();
+            super::fadvise_dontneed(fd, 0, 0).expect("the clean pages drop");
+            let before = resident(&mut vec);
+            assert!(
+                before < pages,
+                "the cache dropped no page of the file ({before} of {pages} resident): this \
+                 filesystem keeps its pages, so the advice has nothing to bring back"
+            );
+            // SAFETY: the whole mapping, live until the unmap below.
+            let span = unsafe { std::slice::from_raw_parts(map.cast::<u8>().cast_const(), len) };
+            let covered = super::advise_willneed(span).expect("the advice is taken");
+            assert_eq!(covered, (pages * 4096) as u64, "whole pages over the span");
+            let t0 = std::time::Instant::now();
+            let mut now = resident(&mut vec);
+            while now < pages && t0.elapsed() < std::time::Duration::from_secs(10) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                now = resident(&mut vec);
+            }
+            // SAFETY: `map` and `len` are the mapping above; `span` is not used past this point.
+            unsafe { libc::munmap(map, len) };
+            let _ = std::fs::remove_file(&p);
+            assert_eq!(
+                now, pages,
+                "the advice queued the file's pages: {before} resident before, {now} of {pages} after"
+            );
+        }
     }
 
     /// The resident pages of a span are counted, a byte a page.

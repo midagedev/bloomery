@@ -209,6 +209,7 @@ use super::xstream::{LandBatch, LandRows, land_batch_size};
 use super::{Drain, drain_within, poll_drained};
 use crate::GpuError;
 use crate::graph::{mem_batch, op_write};
+use crate::tensor::DeviceTensor;
 
 // The ring's size and the shared state keep their paths here, where
 // `wide38`'s queue floor and the engine watchdog name them.
@@ -285,6 +286,18 @@ impl Residency {
         }
     }
 }
+
+/// The lend lever (`BLOOMERY_NODE_LEND`): `1` lets the machine lend the
+/// experts homed on a tier to the stage card (`0`, unset: they run where the
+/// load put them for the machine's life). A lent expert is an ordinary
+/// resident the rule may admit and evict; its bytes come from the host's file
+/// like any admit's, the tier keeps its own, and an eviction gives the expert
+/// back to its tier slot ([`SlotMap::lend`]). A machine over a map whose tier
+/// holds experts and has no card copy of its places ([`SlotMap::tier_places`])
+/// refuses to lend by name. The lever registry parses it
+/// (`bloomery_levers::node_lend`); a load hands the machine the bool as
+/// [`MachineCfg::lend`].
+pub use bloomery_levers::NODE_LEND;
 
 // ----------------------------------------------------------------- source
 
@@ -439,6 +452,18 @@ pub trait SwapSource: Send + Sync {
     fn open_read(&self, layer: usize, id: u32) -> Result<(), GpuError> {
         let _ = (layer, id);
         Ok(())
+    }
+
+    /// Layer `layer`'s expert `id` is about to be read through
+    /// [`SwapSource::source`] by a lane thread: queue what that read will need
+    /// from the drive (a read-ahead hint over the bytes its parts read) and
+    /// return the bytes hinted. A hint only: it reads no part, changes
+    /// nothing a flip's landing depends on, and a source may hint less or
+    /// nothing. Called from the machine's hint thread, one expert at a time,
+    /// beside the lane's own reads. Nothing hinted by default.
+    fn advise(&self, layer: usize, id: u32) -> Result<u64, GpuError> {
+        let _ = (layer, id);
+        Ok(0)
     }
 
     /// The lane that opened layer `layer`'s expert `id`
@@ -2011,6 +2036,9 @@ pub struct MachineCfg {
     /// the bound must be longer than the longest pass plus one expert's
     /// preparation and staging.
     pub deadline: Duration,
+    /// The machine lends the experts homed on a tier to the stage card
+    /// ([`NODE_LEND`]); `false` leaves them where the load put them.
+    pub lend: bool,
 }
 
 /// The machine's view of a load's map ([`SwapMachine::new`]): per layer, the
@@ -2087,6 +2115,16 @@ pub struct SwapMachine {
     end_us: u64,
     ops: Vec<sys::CUstreamBatchMemOpParams>,
     changed: Vec<(usize, u32, u32)>,
+    /// The machine lends the experts homed on a tier to the stage card
+    /// ([`MachineCfg::lend`]).
+    lend: bool,
+    /// Per tier: the card copy of its view the machine writes as an expert
+    /// is lent or comes home ([`SlotMap::tier_places`]); `None` for a tier no
+    /// reader made one for.
+    tier_views: Vec<Option<Arc<DeviceTensor<u32>>>>,
+    /// The words queued for the tiers' copies: (layer, id, tier, entry),
+    /// written with the card's ([`SwapMachine::write_changed`]).
+    tier_changed: Vec<(usize, u32, usize, u32)>,
     /// The error that broke the machine, named in every later refusal.
     broken: Option<String>,
     /// The experts `host_serves` found not host-resident since a report
@@ -2212,6 +2250,8 @@ impl SwapMachine {
             ));
         }
         let layout = SwapMachine::layout(slots, &cfg.pinned, cfg.params.spares)?;
+        let lend = cfg.lend;
+        let tier_views = SwapMachine::lend_tables(slots, lend)?;
         let mut unrouted = Vec::with_capacity(cfg.unrouted.len());
         for &l in &cfg.unrouted {
             let cap = match layers.contains(&l) {
@@ -2243,7 +2283,7 @@ impl SwapMachine {
                 HostSite::Load,
             )?;
         }
-        let rule = SwapMachine::rule_of(&layout, &cfg, n_expert, &unrouted)?;
+        let rule = SwapMachine::rule_of(&layout, &cfg, n_expert, &unrouted, lend)?;
         let events = (0..layers.len() * cfg.params.spares)
             .map(|_| ctx.new_event_with_flags(None))
             .collect::<Result<Vec<_>, _>>()?;
@@ -2266,8 +2306,9 @@ impl SwapMachine {
             .collect::<Result<Vec<_>, _>>()?;
         let land = LandRows::new(ctx, layers.len(), n_expert)?;
         // The lane starts last: from here the machine's drop owns it, and
-        // nothing can fail between.
-        let (shared, lane) = lane::start(ctx, source, slot_bytes, cfg.deadline, layers.end)?;
+        // nothing can fail between. A lending machine's lane also starts the
+        // threads that hint the expert reads it issues.
+        let (shared, lane) = lane::start(ctx, source, slot_bytes, cfg.deadline, layers.end, lend)?;
         let mut m = SwapMachine {
             rule,
             ledger,
@@ -2295,6 +2336,9 @@ impl SwapMachine {
             kept: KeptRows::prefix(0),
             ops: Vec::with_capacity(BATCH_OPS),
             changed: Vec::new(),
+            lend,
+            tier_views,
+            tier_changed: Vec::new(),
             broken: None,
             unresident,
             faulted,
@@ -2405,6 +2449,7 @@ impl SwapMachine {
         cfg: &MachineCfg,
         n_expert: usize,
         unrouted: &[usize],
+        lend: bool,
     ) -> Result<SwapRule, GpuError> {
         // The seed lists past the live experts hold the ranks a fill's slots take; the card
         // set stays the first `capacity` of them.
@@ -2428,7 +2473,38 @@ impl SwapMachine {
         };
         SwapRule::new_placed(cfg.params, shape, &seed, &capacity, &layout.pinned, &away)
             .and_then(|r| r.with_unrouted(unrouted))
+            .and_then(|r| if lend { r.with_lend() } else { Ok(r) })
             .map_err(|e| rule_err("SwapMachine::new", e))
+    }
+
+    /// The card copies of the tiers' views a lending machine writes
+    /// ([`SlotMap::tier_copies`]), one per tier the map names; none when it
+    /// does not lend. Refused by name: a lending machine over a tier that
+    /// holds experts in some layer and has no copy: the handoff would still
+    /// read those experts' places as the tier's.
+    fn lend_tables(
+        slots: &SlotMap,
+        lend: bool,
+    ) -> Result<Vec<Option<Arc<DeviceTensor<u32>>>>, GpuError> {
+        if !lend {
+            return Ok(Vec::new());
+        }
+        let views = slots.tier_copies();
+        for (tier, view) in views.iter().enumerate() {
+            let homed = slots
+                .layers()
+                .any(|l| slots.on_tier_of(tier, l).is_ok_and(|k| k > 0));
+            if homed && view.is_none() {
+                return Err(GpuError::shape(
+                    "SwapMachine::new",
+                    format!(
+                        "{NODE_LEND}=1 over tier {tier}, which holds experts and has no card \
+                         copy of its places: the machine writes that copy as an expert is lent"
+                    ),
+                ));
+            }
+        }
+        Ok(views)
     }
 
     /// The staging window word: the lane copies while it is nonzero (a due
@@ -2834,7 +2910,11 @@ impl SwapMachine {
         (report.window_us, report.lane_span_us) = self.landing_span(&landing, start);
         // The flips' copies have landed in their slots: a victim the host
         // does not serve from resident pages goes all the same.
-        for f in &landing {
+        let lend = self.lend;
+        for f in landing
+            .iter()
+            .filter(|f| !lent(slots, lend, f.layer, f.victim))
+        {
             send_on(
                 &*self.shared.source,
                 &self.rereads,
@@ -3083,6 +3163,7 @@ impl SwapMachine {
             stream.wait(&self.events[f.event])?;
             self.changed.push((f.layer, f.admit, f.slot));
             self.changed.push((f.layer, f.victim, HOST));
+            self.queue_tier_words(slots, f.layer, Some(f.admit), Some(f.victim))?;
         }
         self.write_changed(stream)?;
         for f in landing {
@@ -3095,7 +3176,7 @@ impl SwapMachine {
                     ),
                 ));
             };
-            slots.admit(f.layer, f.admit, Slot::Card(f.slot))?;
+            admit_card(slots, self.lend, f.layer, f.admit, f.slot)?;
             let row = self.ledger.row_mut(f.layer);
             row[f.slot as usize] = SlotState::Live(f.admit);
             row[freed as usize] = SlotState::Spare;
@@ -3142,7 +3223,9 @@ impl SwapMachine {
             .ok_or_else(|| GpuError::protocol(WHAT, "more flips in flight than spares"))?;
         self.event_job[event] = self.jobs_issued;
         self.event_at[event] = b;
-        let bytes = self.copy_into(slots, l, f.admit, spare, Some(f.evict), Gate::Boundary)?;
+        // A victim lent from a tier goes home, not to the host: nothing to prepare.
+        let victim = Some(f.evict).filter(|&v| !lent(slots, self.lend, l, v));
+        let bytes = self.copy_into(slots, l, f.admit, spare, victim, Gate::Boundary)?;
         self.events[event].record(&self.copy)?;
         self.ledger.row_mut(l)[spare as usize] = SlotState::Filling {
             e: f.admit,
@@ -3168,13 +3251,11 @@ impl SwapMachine {
         gate: Gate,
     ) -> Result<u64, GpuError> {
         const WHAT: &str = "SwapMachine::copy_into";
-        if slots.slot(l, id) != Some(Slot::Host) {
+        let at = slots.slot(l, id);
+        if at != Some(Slot::Host) && !(self.lend && matches!(at, Some(Slot::Tier { .. }))) {
             return Err(GpuError::protocol(
                 WHAT,
-                format!(
-                    "layer {l}: expert {id} to the card, which the map has on {:?}",
-                    slots.slot(l, id)
-                ),
+                format!("layer {l}: expert {id} to the card, which the map has on {at:?}"),
             ));
         }
         // Every copy waits on the copy stream for its staging. Behind a
@@ -3223,6 +3304,11 @@ impl SwapMachine {
             ticket,
             stamp: gate == Gate::Waited,
         };
+        // A lent expert's bytes are in no resident page: the kernel queues them
+        // under the lane's earlier jobs while the lane reads them one at a time.
+        if self.lend && matches!(at, Some(Slot::Tier { .. })) {
+            self.lane.advise(&self.shared, l, id);
+        }
         let d = self.lane.send(job, WHAT)?;
         self.jobs_issued += 1;
         self.shared
@@ -3321,8 +3407,83 @@ impl SwapMachine {
         let r = self.write_words(&changed, stream);
         if r.is_err() {
             self.changed = changed;
+            return r;
         }
-        r
+        self.write_tier_words(stream)
+    }
+
+    /// The queued words of the tiers' copies onto them on `stream`, in stream
+    /// order and behind the card's own ([`SwapMachine::write_changed`]): the
+    /// tier's place of a lent expert is [`HOST`], and of one come home its
+    /// slot. None counted as moved.
+    fn write_tier_words(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine::write_tier_words";
+        if self.tier_changed.is_empty() {
+            return Ok(());
+        }
+        let words = std::mem::take(&mut self.tier_changed);
+        let (n, start) = (self.n_expert, self.layers.start);
+        for chunk in words.chunks(BATCH_OPS) {
+            self.ops.clear();
+            for &(l, id, tier, entry) in chunk {
+                let Some(Some(table)) = self.tier_views.get(tier) else {
+                    return Err(GpuError::protocol(
+                        WHAT,
+                        format!("layer {l} expert {id}: tier {tier} has no card copy to write"),
+                    ));
+                };
+                let word = (l - start) * n + id as usize;
+                self.ops.push(op_write(
+                    table.buf().cu_deviceptr() + 4 * word as u64,
+                    entry,
+                ));
+            }
+            // SAFETY: each word is a (layer, expert) of the machine's, inside
+            // its tier's copy (a tensor of the map's rows, which `lend_tables`
+            // took a share of and the machine keeps allocated).
+            unsafe { mem_batch(stream, &mut self.ops, "swap: the tier's map words")? };
+        }
+        Ok(())
+    }
+
+    /// Queue the tiers' copies' words for a move of layer `layer`'s experts
+    /// `admit` onto the stage card and `victim` off it, read from `slots`
+    /// before the move: an admit homed on a tier is lent, its place there
+    /// [`HOST`]; a victim lent goes home, its place its tier slot. The moves
+    /// themselves are [`admit_card`] and [`SlotMap::evict`]. A machine that
+    /// does not lend queues nothing; a lent victim the map has no tier home
+    /// for is refused by name, since its tier word could not be written back.
+    fn queue_tier_words(
+        &mut self,
+        slots: &SlotMap,
+        layer: usize,
+        admit: Option<u32>,
+        victim: Option<u32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "SwapMachine::queue_tier_words";
+        if !self.lend {
+            return Ok(());
+        }
+        if let Some(a) = admit
+            && let Some(Slot::Tier { tier, .. }) = slots.slot(layer, a)
+        {
+            self.tier_changed.push((layer, a, tier, HOST));
+        }
+        if let Some(v) = victim
+            && slots.is_lent(layer, v)
+        {
+            let Some(Slot::Tier { tier, slot }) = slots.home(layer, v) else {
+                return Err(GpuError::protocol(
+                    WHAT,
+                    format!(
+                        "layer {layer}: expert {v} is lent and the map has no tier slot it came \
+                         from"
+                    ),
+                ));
+            };
+            self.tier_changed.push((layer, v, tier, slot));
+        }
+        Ok(())
     }
 
     /// `words` onto the card's copy on `stream`, in stream order: each
@@ -3461,15 +3622,19 @@ impl SwapMachine {
                 .filter(|&id| matches!(slots.slot(l, id), Some(Slot::Card(_))))
                 .collect();
             for &id in live.iter().filter(|id| !seed.contains(id)) {
-                self.shared.source.prepare_victim(l, id)?;
-                send_on(
-                    &*self.shared.source,
-                    &self.rereads,
-                    (&mut self.unresident, &mut self.faulted),
-                    l,
-                    id,
-                    HostSite::Reset,
-                )?;
+                // An expert lent from a tier goes home, not to the host.
+                if !lent(slots, self.lend, l, id) {
+                    self.shared.source.prepare_victim(l, id)?;
+                    send_on(
+                        &*self.shared.source,
+                        &self.rereads,
+                        (&mut self.unresident, &mut self.faulted),
+                        l,
+                        id,
+                        HostSite::Reset,
+                    )?;
+                }
+                self.queue_tier_words(slots, l, None, Some(id))?;
                 if let Slot::Card(s) = slots.evict(l, id)? {
                     self.ledger.row_mut(l)[s as usize] = SlotState::Spare;
                 }
@@ -3538,7 +3703,8 @@ impl SwapMachine {
     ) -> Result<(), GpuError> {
         const WHAT: &str = "SwapMachine::reset";
         for &(l, id, spare) in placed {
-            slots.admit(l, id, Slot::Card(spare))?;
+            self.queue_tier_words(slots, l, Some(id), None)?;
+            admit_card(slots, self.lend, l, id, spare)?;
             self.ledger.row_mut(l)[spare as usize] = SlotState::Live(id);
             self.changed.push((l, id, spare));
             report.dropped_bytes += self.shared.source.release_host(l, id)?;
@@ -3786,7 +3952,8 @@ impl SwapMachine {
             .zip(&freed)
             .map(|(&(e, from), &to)| (e, from, to))
             .collect();
-        for &v in victims {
+        let lend = self.lend;
+        for &v in victims.iter().filter(|&&v| !lent(slots, lend, layer, v)) {
             send_on(
                 &*self.shared.source,
                 &self.rereads,
@@ -3798,6 +3965,7 @@ impl SwapMachine {
         }
         for &v in victims {
             let s = slot_of(v)?;
+            self.queue_tier_words(slots, layer, None, Some(v))?;
             match slots.evict(layer, v)? {
                 Slot::Card(at) if at == s => {}
                 at => {
@@ -3842,16 +4010,27 @@ impl SwapMachine {
         stream.wait(&self.events[event])?;
         let mut words = Vec::with_capacity(moves.len());
         for &(id, from, to) in &moves {
-            match slots.evict(layer, id)? {
-                Slot::Card(at) if at == from => {}
-                at => {
+            if lent(slots, self.lend, layer, id) {
+                // Still lent, in another slot.
+                let at = slots.relocate(layer, id, to)?;
+                if at != from {
                     return Err(GpuError::protocol(
                         WHAT,
-                        format!("layer {layer}: expert {id} left the slot {at:?}, not {from}"),
+                        format!("layer {layer}: expert {id} left the slot {at}, not {from}"),
                     ));
                 }
+            } else {
+                match slots.evict(layer, id)? {
+                    Slot::Card(at) if at == from => {}
+                    at => {
+                        return Err(GpuError::protocol(
+                            WHAT,
+                            format!("layer {layer}: expert {id} left the slot {at:?}, not {from}"),
+                        ));
+                    }
+                }
+                slots.admit(layer, id, Slot::Card(to))?;
             }
-            slots.admit(layer, id, Slot::Card(to))?;
             self.ledger.row_mut(layer)[to as usize] = SlotState::Live(id);
             words.push((layer, id, to));
         }
@@ -4379,6 +4558,10 @@ impl SwapMachine {
                     ),
                 ));
             }
+            // A victim lent from a tier goes home: the host does not serve it.
+            if lent(slots, self.lend, layer, f.evict) {
+                continue;
+            }
             let served = host_serves(
                 &*self.shared.source,
                 &self.rereads,
@@ -4494,8 +4677,9 @@ impl SwapMachine {
         self.rule.settle(&moves).map_err(|e| rule_err(WHAT, e))?;
         for (f, &s) in picks.iter().zip(&to) {
             self.ledger.to_landing(layer, s, f.evict, f.admit, i)?;
+            self.queue_tier_words(slots, layer, Some(f.admit), Some(f.evict))?;
             slots.evict(layer, f.evict)?;
-            slots.admit(layer, f.admit, Slot::Card(s))?;
+            admit_card(slots, self.lend, layer, f.admit, s)?;
             self.changed.push((layer, f.evict, HOST));
             self.changed.push((layer, f.admit, s));
         }
@@ -4679,7 +4863,8 @@ impl SwapMachine {
         self.drain_copies(WHAT)?;
         self.refuse_staging_failure(WHAT, None)?;
         for &(l, v, s) in &back {
-            slots.admit(l, v, Slot::Card(s))?;
+            self.queue_tier_words(slots, l, Some(v), None)?;
+            admit_card(slots, self.lend, l, v, s)?;
             self.ledger.row_mut(l)[s as usize] = SlotState::Live(v);
             self.changed.push((l, v, s));
         }
@@ -4907,7 +5092,8 @@ impl SwapMachine {
         }
         let back = std::mem::take(&mut self.ret.back);
         for &(l, v, s) in &back {
-            slots.admit(l, v, Slot::Card(s))?;
+            self.queue_tier_words(slots, l, Some(v), None)?;
+            admit_card(slots, self.lend, l, v, s)?;
             self.ledger.row_mut(l)[s as usize] = SlotState::Live(v);
             self.changed.push((l, v, s));
         }
@@ -5151,6 +5337,32 @@ fn rule_err(what: &'static str, e: runtime::swaprule::SwapRuleError) -> GpuError
         what,
         source: Box::new(e),
     }
+}
+
+/// Layer `layer`'s expert `id` onto stage card slot `slot` of `slots`: an
+/// expert the host computes is admitted; one homed on a tier is lent
+/// ([`SlotMap::lend`]) by a machine that lends (`lend`), and refused by name
+/// by one that does not ([`SlotMap::admit`] takes only an expert the host
+/// computes). The words of the tiers' copies are
+/// [`SwapMachine::queue_tier_words`]'s.
+fn admit_card(
+    slots: &mut SlotMap,
+    lend: bool,
+    layer: usize,
+    id: u32,
+    slot: u32,
+) -> Result<(), GpuError> {
+    match slots.slot(layer, id) {
+        Some(Slot::Tier { .. }) if lend => slots.lend(layer, id, slot).map(drop),
+        _ => slots.admit(layer, id, Slot::Card(slot)),
+    }
+}
+
+/// Layer `layer`'s expert `id` is lent to the stage card: only a machine that
+/// lends (`lend`) has any, so one that does not never reads the map's lent
+/// entries.
+fn lent(slots: &SlotMap, lend: bool, layer: usize, id: u32) -> bool {
+    lend && slots.is_lent(layer, id)
 }
 
 /// The machine's one decision whether the host serves layer `layer`'s

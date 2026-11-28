@@ -35,6 +35,7 @@ pub const MTP_DRAFT: &str = "BLOOMERY_MTP_DRAFT";
 pub const MTP_WINDOWS: &str = "BLOOMERY_MTP_WINDOWS";
 pub const MTP_WIDTH: &str = "BLOOMERY_MTP_WIDTH";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
+pub const NODE_LEND: &str = "BLOOMERY_NODE_LEND";
 pub const METAL_BREADCRUMB: &str = "BLOOMERY_METAL_BREADCRUMB";
 pub const METAL_MX8: &str = "BLOOMERY_METAL_MX8";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
@@ -1136,6 +1137,30 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               census` record's `picks`, `card`, `promote_bytes` and `demote_bytes` read the hit \
               rate and the bytes the machine moved over a span. \
               Every other binary refuses it set, by name.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: NODE_LEND,
+        class: Class::A,
+        kind: Kind::Flag,
+        default: Unset::Is("0"),
+        doc: "Adaptive residency (`BLOOMERY_RESIDENCY=mid-…`): `1` lets the residency rule \
+              admit an expert homed on a tier card or a node into the stage card's churn pool \
+              like any expert off the card (a lend) and evict it back to its tier slot like \
+              any resident; `0` keeps tier experts where the plan put them for the machine's \
+              life. A lent expert's bytes are staged from the host's own file like any \
+              admit's, the tier keeps its copy and is never read or written, and the card's \
+              handoff stops sending the expert to the tier the pass it lands in and sends it \
+              again the pass it is evicted in (the tier's place word of the expert is the \
+              machine's to write). A prompt call's pick never lends. A load whose tier \
+              experts have no card copy of their places refuses it set, by name, and \
+              every binary that opens no residency machine ignores it. Read where a placed \
+              load builds its residency machine (`bloomery_levers::node_lend`), below every \
+              binary's `main`; the machine takes it as a bool in its config, and spawns the \
+              read-ahead threads of a lend only when it is `1`.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

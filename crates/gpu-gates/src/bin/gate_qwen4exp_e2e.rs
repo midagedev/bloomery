@@ -4562,6 +4562,7 @@ mod gate {
             max_rows: ROWS,
             unrouted: Vec::new(),
             deadline: Duration::from_secs(10),
+            lend: false,
         };
         let swapped = tier.start_swap(
             gpu.context(),

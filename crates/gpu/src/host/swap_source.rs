@@ -58,12 +58,12 @@ use std::time::Duration;
 
 use bloomery_levers::ChurnHosting;
 use cuda_core::{CudaContext, CudaStream, sys};
-use gguf::Split;
 use gguf::quant::GgmlType;
+use gguf::{Gguf, Split};
 use model::arch::names::routed_stacks;
 use model::placement::host_lock::{HostFile, HostSet, expert_runs};
 use model::placement::{ModelTensor, ModelTensors, Plan};
-use model::r8file::R8Pair;
+use model::r8file::{R8Pair, Sidecar};
 use runtime::swaprule::KeptRows;
 
 use super::HostExperts;
@@ -1205,11 +1205,7 @@ impl FileSwap {
     /// lane's open read (the file's bytes), else the file's.
     fn run(&self, layer: usize, id: u32, t: &ModelTensor, per: usize) -> Result<&[u8], GpuError> {
         const WHAT: &str = "FileSwap::source";
-        let side = self
-            .pair
-            .source()
-            .sidecar()
-            .filter(|side| side.file_bytes(&t.name).is_some());
+        let side = self.sidecar_of(t);
         // A part the sidecar does not hold, of an id the arena's slot holds
         // filled under the lane's open read: the slot's bytes, which are the
         // file's. The sidecar's bytes are not the arena's, so its parts read
@@ -1229,6 +1225,45 @@ impl FileSwap {
             }
             return Ok(bytes);
         }
+        self.mapped_run(layer, id, t, per, side)
+    }
+
+    /// The sidecar that holds stack `t`, when the pair reads one that does.
+    fn sidecar_of(&self, t: &ModelTensor) -> Option<&Arc<Sidecar>> {
+        self.pair
+            .source()
+            .sidecar()
+            .filter(|side| side.file_bytes(&t.name).is_some())
+    }
+
+    /// Whether stack `t`'s runs, whose sidecar is `side` ([`FileSwap::sidecar_of`]),
+    /// are read from a file's own mapping (the sidecar's or the split's shard's),
+    /// whose pages the page cache reads ahead, not from a resident copy.
+    fn file_mapped(&self, t: &ModelTensor, side: Option<&Arc<Sidecar>>) -> bool {
+        match side {
+            Some(side) => side.is_mapped(),
+            None => {
+                let split = self.pair.source().split();
+                split
+                    .find(&t.name)
+                    .and_then(|(s, _)| split.shard(s))
+                    .is_some_and(Gguf::file_backed)
+            }
+        }
+    }
+
+    /// The `per` bytes of layer `layer`'s expert `id` in stack `t` as the
+    /// host's mapping holds them: the r8 sidecar's run when it holds the
+    /// stack (`side`, [`FileSwap::sidecar_of`]), else the file's.
+    fn mapped_run<'a>(
+        &'a self,
+        layer: usize,
+        id: u32,
+        t: &ModelTensor,
+        per: usize,
+        side: Option<&'a Arc<Sidecar>>,
+    ) -> Result<&'a [u8], GpuError> {
+        const WHAT: &str = "FileSwap::source";
         let Some(side) = side else {
             return self.file_run(WHAT, layer, id, t, per);
         };
@@ -1312,6 +1347,31 @@ impl SwapSource for FileSwap {
                 ),
             )),
         }
+    }
+
+    /// The read-ahead hint of a lent expert (`SwapSource::advise`): each run
+    /// `source` will read from a file's own mapping is handed to the page
+    /// cache ([`os::advise_willneed`]); a run in a resident copy, one the
+    /// arena serves and a plane the host splits by rows are not hinted.
+    fn advise(&self, layer: usize, id: u32) -> Result<u64, GpuError> {
+        const WHAT: &str = "FileSwap::advise";
+        let p = self.layer(layer, WHAT)?;
+        let mut hinted = 0;
+        for (&per, &(stack, plane)) in p.parts.iter().zip(&p.of) {
+            let t = &p.tensors[stack];
+            let run = match plane {
+                Plane::Whole => per,
+                Plane::Codes if t.ty == GgmlType::NVFP4 => file_part(t, self.experts),
+                _ => continue,
+            };
+            let side = self.sidecar_of(t);
+            if self.tier_serving(layer, id).is_some() || !self.file_mapped(t, side) {
+                continue;
+            }
+            let bytes = self.mapped_run(layer, id, t, run, side)?;
+            hinted += os::advise_willneed(bytes).map_err(|e| GpuError::plan(WHAT, e))?;
+        }
+        Ok(hinted)
     }
 
     /// An id the arena serves is open on the tier while a lane reads it
