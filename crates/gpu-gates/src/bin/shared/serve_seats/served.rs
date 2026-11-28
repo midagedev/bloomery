@@ -464,7 +464,7 @@ where
     /// its ids fed to the slot's context, and no draft leaves the call as it is.
     #[allow(
         dead_code,
-        reason = "the qwen3 seat's prompt call reads it; the V4.1 binary that includes this file serves no such seat"
+        reason = "the seat whose prompt call a draft can take reads it; a binary that includes this file and serves no such seat reads it nowhere"
     )]
     pub fn takes_prompt_call(&self) -> bool {
         self.dspark.is_some()
