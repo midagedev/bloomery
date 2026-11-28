@@ -60,7 +60,7 @@ use super::{
     MSG_K, MSG_Q, MSG_V, Placed, WHAT, conv_scale, head_logits, layer_card_stacks, q8_site,
     tap_widths,
 };
-use crate::arch::hybrid::{Site, WideCx, project_wide};
+use crate::arch::hybrid::{Site, WideCx, project_wide_on};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs};
 use crate::attn_res_step::AttnResStepKernels;
 use crate::card_leg::{LegStacks, RouteIo};
@@ -68,6 +68,7 @@ use crate::card_slots::{CardAcc, CardSlotKernels};
 use crate::draft_taps::{DraftTaps, TapRowsSink};
 use crate::fault::FaultSink;
 use crate::gemm::{GemmKernels, GemmRoute, RouteSet};
+use crate::graph::Branch;
 use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::host::placed::{PlacedHost, PlacedSide};
@@ -107,6 +108,21 @@ use rows::StepMix;
 const CALL: &str = "inkling2 prompt pass";
 /// The message mix's rows: q, ffn, k and v.
 const MSGS: usize = 4;
+
+/// Rows up to which a pass is a few-block grid on every launch (a wide GEMM's grid is a block a
+/// row tile and a column tile): the 170-SM card is mostly idle, so a visit's sibling projections
+/// run on side streams, each launch's latency under the longest one's instead of in a chain.
+const SMALL_ROWS: usize = 32;
+
+/// Rows up to which a pass's controllers run the step's pair instead of the rows form
+/// ([`crate::loop_control`]: a block a row, bit-identical to the rows form, gate clauses 5 and 6): the
+/// rows form's down launch is one block a module on one SM, the step's pair re-reads each weight
+/// a row, so it wins to 16 rows and loses by 32.
+const STEP_CTRL_ROWS: usize = 16;
+
+/// Side streams a small pass's sibling projections fork onto: a visit's widest call has six sites (eight
+/// with the draft's taps); the first, and any past these, run on the engine stream.
+const SIDE_STREAMS: usize = 5;
 
 /// The prompt pass's shape for `hp` over `file`'s site types ([`place::pass_shape`]).
 pub(super) fn shape_of(hp: &Hparams, file: &Split) -> Result<PassShape, GpuError> {
@@ -338,6 +354,8 @@ pub(super) struct Pass {
     k: PassKernels,
     b: Bufs,
     forced: Option<PassForced>,
+    /// The side streams of a small pass's sibling projections ([`SMALL_ROWS`]).
+    branches: Vec<Branch>,
 }
 
 impl Pass {
@@ -382,6 +400,9 @@ impl Pass {
             },
             b,
             forced: None,
+            branches: (0..SIDE_STREAMS)
+                .map(|_| Branch::new(gpu.stream_handle()))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -687,6 +708,7 @@ impl Body {
             k: pk,
             b,
             forced,
+            branches,
             ..
         } = pass
             .as_mut()
@@ -710,6 +732,11 @@ impl Body {
             b,
             forced,
             verify,
+            branches: if m <= SMALL_ROWS {
+                &mut branches[..]
+            } else {
+                &mut []
+            },
             draft: draft.as_mut(),
             d: *d,
             m,
@@ -986,6 +1013,8 @@ struct RowWalk<'a> {
     forced: Option<(&'a PassForced, usize)>,
     /// A verify's own buffers; none on a prompt pass.
     verify: Option<&'a mut rows::VerifyBufs>,
+    /// The side streams the sibling projections fork onto; empty past [`SMALL_ROWS`] rows.
+    branches: &'a mut [Branch],
     /// A block draft's taps ([`GpuModel::set_draft_taps`]), laid as the step's walk lays them;
     /// none on a load with no taps set (a placed one carries none).
     draft: Option<&'a mut DraftTaps>,
@@ -1360,7 +1389,7 @@ impl<'a> RowWalk<'a> {
                 };
                 let [y0, y1, y2] = &mut *xn;
                 let modules = [args(0)?, args(1)?, args(2)?];
-                if self.verify.is_some() {
+                if self.verify.is_some() || m <= STEP_CTRL_ROWS {
                     // The step's pair at the rows (rows.rs): a block one row's.
                     k.ctrl.enqueue_attn(stream, modules, h, [y0, y1, y2])?;
                 } else {
@@ -1481,11 +1510,39 @@ impl<'a> RowWalk<'a> {
             if n_in == 1 {
                 qs.extend(ks);
                 qs.extend(vs);
-                project_wide(&wc, (wide_n, dense), slot, &normed[0], &mut qs)?;
+                project_wide_on(
+                    &wc,
+                    (wide_n, dense),
+                    slot,
+                    &normed[0],
+                    &mut qs,
+                    &mut *self.branches,
+                )?;
             } else {
-                project_wide(&wc, (wide_n, dense), slot, &normed[0], &mut qs)?;
-                project_wide(&wc, (wide_n, dense), slot, &normed[1], &mut ks)?;
-                project_wide(&wc, (wide_n, dense), slot, &normed[2], &mut vs)?;
+                project_wide_on(
+                    &wc,
+                    (wide_n, dense),
+                    slot,
+                    &normed[0],
+                    &mut qs,
+                    &mut *self.branches,
+                )?;
+                project_wide_on(
+                    &wc,
+                    (wide_n, dense),
+                    slot,
+                    &normed[1],
+                    &mut ks,
+                    &mut *self.branches,
+                )?;
+                project_wide_on(
+                    &wc,
+                    (wide_n, dense),
+                    slot,
+                    &normed[2],
+                    &mut vs,
+                    &mut *self.branches,
+                )?;
             }
         }
         // The k and v short convs over the rows on the visit's ring.
@@ -1616,12 +1673,13 @@ impl<'a> RowWalk<'a> {
         if self.verify.is_some() {
             site::gemv(gpu, &k.g32, (layer.o.ty, w, &layer.o.name), gated, m, o)?;
         } else {
-            project_wide(
+            project_wide_on(
                 &wc,
                 (wide_q, dense),
                 slot,
                 gated,
                 &mut [(&layer.o, n, &mut *o)],
+                &mut *self.branches,
             )?;
         }
         k.conv.enqueue(
@@ -1707,7 +1765,7 @@ impl<'a> RowWalk<'a> {
                 };
                 // A verify the step's pair at the rows (rows.rs), a block one row's; the pass's the
                 // rows form.
-                if self.verify.is_some() {
+                if self.verify.is_some() || m <= STEP_CTRL_ROWS {
                     k.ctrl.enqueue(stream, control, h, moe)?;
                 } else {
                     k.ctrl.enqueue_rows(stream, control, h, moe)?;

@@ -99,7 +99,7 @@ use crate::token_major::TokenMajor;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
 use chain::site::list;
-use cuda_core::{DeviceBuffer, DeviceCopy};
+use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
 use gguf::quant::GgmlType;
 use model::placement::kernels;
 
@@ -1413,7 +1413,49 @@ pub fn gemm(
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    gemm_into(gpu, k, site, rows, x, table, m, SiteOut::Cells(y.into())).map(drop)
+    gemm_into(
+        gpu.stream(),
+        gpu,
+        k,
+        site,
+        rows,
+        x,
+        table,
+        m,
+        SiteOut::Cells(y.into()),
+    )
+    .map(drop)
+}
+
+/// [`gemm`] enqueued on `stream`, a branch of the engine stream: the caller has made `x` and `y`
+/// ready there and joins the branch before the engine stream reads `y`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "[`gemm`]'s arguments and the stream (rust-quality R8)"
+)]
+pub fn gemm_on(
+    stream: &CudaStream,
+    gpu: &Gpu,
+    k: &WideKernels<'_>,
+    site: (SiteTy, &Weights, SiteWeight<'_>),
+    rows: usize,
+    x: &WideIn<'_>,
+    table: (&GemmRoute, GemmInput),
+    m: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    gemm_into(
+        stream,
+        gpu,
+        k,
+        site,
+        rows,
+        x,
+        table,
+        m,
+        SiteOut::Cells(y.into()),
+    )
+    .map(drop)
 }
 
 /// Where [`gemm_into`] writes a site's product: its cells, or, as a gated
@@ -1444,6 +1486,7 @@ enum SiteOut<'a> {
     reason = "one site's kernels, weight, rows, inputs, table, column rule, width and output (rust-quality R8)"
 )]
 fn gemm_into(
+    stream: &CudaStream,
     gpu: &Gpu,
     k: &WideKernels<'_>,
     (ty, w, src): (SiteTy, &Weights, SiteWeight<'_>),
@@ -1474,7 +1517,6 @@ fn gemm_into(
             }
         };
     }
-    let stream = gpu.stream();
     let name = src.name();
     let missing = |form: &'static str| {
         GpuError::shape(
@@ -1862,7 +1904,17 @@ fn wide_by_name(
 ) -> Result<bool, GpuError> {
     let ty = resident_type(w, "site::resident_gemm", src.name())?;
     let table = (route, GemmInput::PerSlot);
-    gemm_into(gpu, k, (ty, w, src), rows, x, table, m, SiteOut::Cells(y))
+    gemm_into(
+        gpu.stream(),
+        gpu,
+        k,
+        (ty, w, src),
+        rows,
+        x,
+        table,
+        m,
+        SiteOut::Cells(y),
+    )
 }
 
 /// Whether a site of type `ty` copies its input's `form` on the dense MMA
@@ -2166,7 +2218,7 @@ pub fn gated(
                 act,
                 fault,
             };
-            gemm_into(gpu, k, blk.at(blk.up), blk.ff, x, table, m, y)?
+            gemm_into(gpu.stream(), gpu, k, blk.at(blk.up), blk.ff, x, table, m, y)?
         }
         _ => false,
     };

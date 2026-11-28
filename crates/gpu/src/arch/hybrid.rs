@@ -30,6 +30,7 @@ use crate::flash::PlaneAppend;
 use crate::flash_gqa::{FlashGqaKernels, GROUP, GqaArgs, HEAD, partials_ms_len, partials_v_len};
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs};
 use crate::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
+use crate::graph::Branch;
 use crate::head::Head;
 use crate::linear::out_gate::{OutGateArgs, OutGateKernels};
 use crate::mamba2::{Mamba2Kernels, Mamba2Scratch, StepArgs};
@@ -1361,10 +1362,27 @@ pub fn wide_acts_at<'s>(
 /// one-expert table.
 pub fn project_wide(
     cx: &WideCx<'_>,
+    acts: (&mut WideActs, &GemmRoute),
+    layer: usize,
+    x: &DeviceBuffer<f32>,
+    sites: &mut [(&Site, usize, &mut DeviceBuffer<f32>)],
+) -> Result<(), GpuError> {
+    project_wide_on(cx, acts, layer, x, sites, &mut [])
+}
+
+/// [`project_wide`] with the sites after the first enqueued each on its own of `branches` and the
+/// rest, past the branches' count, on the engine stream: the sites read the one quantized input and
+/// write their own outputs, so they run side by side after the quantize, and the engine stream
+/// waits for every one before it returns. The bits are the serial call's (a site's GEMM is its
+/// own launch whatever stream it is on); the time of a small-grid call is its longest site, not
+/// their sum. No `branches` is the serial call.
+pub fn project_wide_on(
+    cx: &WideCx<'_>,
     (acts, route): (&mut WideActs, &GemmRoute),
     layer: usize,
     x: &DeviceBuffer<f32>,
     sites: &mut [(&Site, usize, &mut DeviceBuffer<f32>)],
+    branches: &mut [Branch],
 ) -> Result<(), GpuError> {
     let Some(k) = sites.first().map(|s| s.0.k) else {
         return Ok(());
@@ -1381,7 +1399,29 @@ pub fn project_wide(
     let tys: Vec<SiteTy> = sites.iter().map(|s| s.0.ty).collect();
     acts.quantize(cx.gpu, &cx.wk, cx.gpu.layer_sink(layer)?, x, cx.m, &tys)?;
     let input = acts.input(x);
-    for (s, rows, y) in sites.iter_mut() {
+    let (mut forks, mut here) = (Vec::new(), Vec::new());
+    let mut spare = branches.iter_mut();
+    for (i, (s, rows, y)) in sites.iter_mut().enumerate() {
+        let side = if i == 0 { None } else { spare.next() };
+        let Some(branch) = side else {
+            here.push((s, rows, y));
+            continue;
+        };
+        let fork = branch.fork()?;
+        site::gemm_on(
+            fork.stream(),
+            cx.gpu,
+            &cx.wk,
+            (s.ty, cx.w, SiteWeight::Resident(&s.name)),
+            *rows,
+            &input,
+            (route, GemmInput::PerSlot),
+            cx.m,
+            y,
+        )?;
+        forks.push(fork);
+    }
+    for (s, rows, y) in here {
         site::gemm(
             cx.gpu,
             &cx.wk,
@@ -1392,6 +1432,9 @@ pub fn project_wide(
             cx.m,
             y,
         )?;
+    }
+    for fork in forks {
+        fork.join()?;
     }
     Ok(())
 }
