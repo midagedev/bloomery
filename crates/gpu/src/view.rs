@@ -281,6 +281,65 @@ impl<'x, 's, 'a, A, B, Y> Elem2<'x, 's, 'a, A, B, Y> {
     }
 }
 
+/// [`Elem2`] with a third input, for the one sum `(a[i] + b[i]) + c[i]`: `a[i]`, `b[i]` and `c[i]` in,
+/// `y[i]` out. [`sum`](Elem3::sum) runs the access; it takes no index.
+#[must_use]
+pub(crate) struct Elem3<'x, 's, 'a> {
+    a: *const f32,
+    b: *const f32,
+    c: *const f32,
+    y: *mut f32,
+    i: usize,
+    _x: PhantomData<&'x [f32]>,
+    _y: PhantomData<&'s mut DisjointSlice<'a, f32>>,
+}
+
+impl<'x, 's, 'a> Elem3<'x, 's, 'a> {
+    /// # Safety
+    ///
+    /// [`Elem::new`]'s three clauses, with (a) reading `a.len() >= n`,
+    /// `b.len() >= n`, `c.len() >= n` and `y.len() >= n`.
+    #[inline(always)]
+    pub(crate) unsafe fn new(
+        a: &'x [f32],
+        b: &'x [f32],
+        c: &'x [f32],
+        y: &'s mut DisjointSlice<'a, f32>,
+        i: usize,
+    ) -> Elem3<'x, 's, 'a> {
+        Elem3 {
+            a: a.as_ptr(),
+            b: b.as_ptr(),
+            c: c.as_ptr(),
+            y: y.as_mut_ptr(),
+            i,
+            _x: PhantomData,
+            _y: PhantomData,
+        }
+    }
+
+    /// `y[i] = (a[i] + b[i]) + c[i]`: the three loads in that order, the two
+    /// adds in that order, one store, and no other check.
+    ///
+    /// Sound for every `Elem3` safe code can name, as [`Elem2::map`] is: only
+    /// [`new`](Self::new) builds one, its contract puts `i` inside all four
+    /// buffers and gives `y[i]` to this thread alone, the view holds `y`'s
+    /// mutable borrow, and `sum` consumes it.
+    #[inline(always)]
+    pub(crate) fn sum(self) {
+        // SAFETY: `i < n`, inside all four buffers, and `y[i]` is this
+        // thread's alone (the doc above).
+        unsafe {
+            let (va, vb, vc) = (
+                *self.a.add(self.i),
+                *self.b.add(self.i),
+                *self.c.add(self.i),
+            );
+            *self.y.add(self.i) = (va + vb) + vc;
+        }
+    }
+}
+
 /// The calling thread's own value pair of an interleaved rope launch: flat
 /// index `i` is pair `d / 2` of column `col = i / npairs` (`d = 2 · (i %
 /// npairs)`), whose values are `src[col · nd + d]` and the next, turned by

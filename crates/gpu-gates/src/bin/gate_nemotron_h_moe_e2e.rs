@@ -396,6 +396,10 @@ mod gate {
             ("q3k_quantize_q8_1_relu_sqr".into(), 2 * moe),
             ("relu_sqr".into(), 0),
             ("weighted_sum".into(), moe),
+            // The residual add of a Mamba or attention layer is one `add`; a MoE layer's output
+            // (delta + shared expert's down, then the residual) is one `add3`.
+            ("add".into(), mamba + attn),
+            ("add3".into(), moe),
             ("embed_rows_q8_0".into(), 1),
         ];
         let mut routers: BTreeMap<usize, usize> = BTreeMap::new();

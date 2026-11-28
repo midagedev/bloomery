@@ -1,0 +1,30 @@
+# Round boltfold, P2: the same one-trace profile as P1 (docs/cards/boltfold-p1.card) on the binary that carries H1 (the MoE layer's two output adds as one add3, 40 launches
+# fewer) and F1 (the shared expert's chain on a Branch stream beside the router and the routed chain). P1 measured, on the base: 900 nodes, one stream, replay wall 5,252.1 us =
+# kernel sum 5,089.7 + gaps 162.7, `add` slot 13 20.3 us a step, shared chain B 480.9 us a step (12.02 us a layer) against the routed chain's 36.26 us a layer (B/A 0.33).
+# Derived replay wall of the new tree: 5,252.1 - H1 (20.3 us of kernel + 40 x 0.18 us of gap - ~1 us for the third operand's read = 26.5 us) - the part of B the second stream
+# hides. B is 480.9 us a step at most (no contention). A hidden share of 25..75 % of it (the fork and join edges cost the rest; B's gemvs contend with A's up and down gemvs for
+# HBM, and run free under the router and the latent down, grids of 60..124 and 32 blocks on 170 SMs) gives 120..361 us, so the wall is 5,252.1 - 26.5 - (120..361) = 4,864..5,106 us.
+# READ AFTER THE RUN (2026-11-28 10:04 KST, sit-p2.log; base and new in one lease, 79 s): wall 5,253.3 us (base, 900 nodes, 1 stream) -> 4,923.8 us (new, 860 nodes, 2 streams) = in the
+# predicted band 4,864..5,106; decide-in. Two conditions below were wrong on paper and are struck here, not hidden: (1) "the `add` class 88 launches and an `add3` class of 40" counted the
+# 40 add3 twice: the new binary runs 48 `add` + 40 `add3` = 88 add-class launches (the base's 128 less 40). (2) "the kernel sum 5,040..5,110 us" assumed the kernels keep their
+# durations: the new trace's kernel sum is 5,318.3 us because two streams overlap and stretch each other (router 508.0 -> 662.4, iq2_xxs_gemv_sel 882.3 -> 932.1, q8_0_gemv 953.5 -> 965.6,
+# relu quantize 108.8 -> 130.3); the wall, not the sum, is the term, and the stretch is the contention the paper priced as the 25..75 % of B the second stream does not hide (63 % hid).
+kind: profile
+question: does the shared expert's chain run beside the routed chain in the captured Bolt step (two streams in a replay, 860 nodes), and how much of the base's 5,252.1 us
+  replay wall do the add3 fold and the fork take off?
+term: the replay wall (first kernel start to last kernel end of one graph replay, median over the replays after the first two) of the new tree's bloomery-serve (nsys
+  cuda-graph-trace=node, serving defaults, whole-card Bolt 24GB file, D=512 prose ids, n=128, temperature 0, RTX 5090 at 600 W), read against the base's 5,252.1 us from the same
+  tooling and conditions (p1.md)
+unit: us
+predict: 4864..5106
+condition: one lease through tools/ref/lease-hold.sh --card, under the LEAD-TIMING-HOLD, the card idle (apps-before empty), ComfyUI not running; the new binary's sha256 recorded in
+  the log; the replay size must read 860 (858..862: the base's 900 less one add per MoE layer) on at least 100 replays; streams in a replay = 2; the `add` class 88 launches
+  and an `add3` class of 40; the kernel sum 5,040..5,110 us (base 5,089.7 less slot 13's 20.3 us, plus ~1 us); nsys adds a few percent to a wall, so only the ratio to the base's
+  5,252.1 us from the same tooling is read
+decide-in: 4,864..5,106 us with two streams: the fork is in the graph and hides part of B as the paper says; the same-lease A/B (depth-serve base vs new, D=512, n=256) is the next
+  run, its card band derived from this wall (effect = 5,252.1 / wall - 1)
+decide-below: below 4,864 us: more than B's 75 % hidden on top of H1, which the ceiling (H1 26.5 + B 480.9 = 507 us, wall 4,745) allows only to 4,745: read the kernel sum and the
+  node count first (a missing launch would make a fast wrong step), then the gates, before any claim
+decide-above: above 5,106 us, or one stream in the replay: the fork hides under 25 % of B or is not in the graph. One stream: print each layer's `fork` at load (forks_apart of the
+  file's widths) and the Branch's capture dependencies before anything else. Two streams: read the per-kernel start times of one layer in the sqlite (where B's three kernels
+  start relative to the router and the latent down) and move the fork point (before the router, after the latent down) with a P3 trace; no A/B before the wall moves

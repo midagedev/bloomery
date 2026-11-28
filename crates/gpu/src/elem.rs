@@ -31,7 +31,7 @@ use crate::gelu::gelu_tanh_dev;
 use crate::hybrid::HOST;
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
-use crate::view::{Apply, Elem, Elem2, RopePair};
+use crate::view::{Apply, Elem, Elem2, Elem3, RopePair};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
@@ -1911,6 +1911,29 @@ mod elem_kernels {
         e.map(|av, bv| av + bv);
     }
 
+    /// `y[i] = (a[i] + b[i]) + c[i]`, elementwise over `n` values — exact;
+    /// the two adds are the two `add` launches it replaces, in their order
+    /// (`a + b`, then that sum + `c`), so the bits are theirs.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (a.len() >= n, b.len() >= n, c.len() >= n, y.len() >= n)
+    )]
+    pub fn add3(a: &[f32], b: &[f32], c: &[f32], n: u32, mut y: DisjointSlice<f32>) {
+        let i = thread::index_1d().get();
+        if i >= n as usize {
+            return;
+        }
+        // SAFETY: the `requires` above were launcher-checked, `n` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
+        // guard, and the launch is `domain = 1` with the contract's exact 1-D
+        // block.
+        let e = unsafe { Elem3::new(a, b, c, &mut y, i) };
+        e.sum();
+    }
+
     /// The routed-expert combine, one thread per (token, output value):
     /// `y[t*rows + d] = Σ_e w[t*n_exp + e] · down[(t*n_exp + e)*rows + d]`,
     /// token-major `[rows, n_exp, m]` down-projections with `[n_exp, m]`
@@ -3451,6 +3474,37 @@ impl ElemKernels {
             .module
             .prepare_add(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
         self.module.add(stream, &prep, a, b, n, y)?;
+        Ok(())
+    }
+
+    /// Enqueue `y = (a + b) + c` over `n` values (flat): the bits of
+    /// [`Self::enqueue_add`] of `a` and `b` followed by [`Self::enqueue_add`]
+    /// of that sum and `c`, in one launch. Exact. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_add3(
+        &self,
+        stream: &CudaStream,
+        (a, b, c): (&DeviceBuffer<f32>, &DeviceBuffer<f32>, &DeviceBuffer<f32>),
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        if n == 0 || a.len() < n || b.len() < n || c.len() < n || y.len() < n {
+            return Err(GpuError::shape(
+                "enqueue_add3",
+                format!(
+                    "n={n}, a.len() {}, b.len() {}, c.len() {}, y.len() {}",
+                    a.len(),
+                    b.len(),
+                    c.len(),
+                    y.len()
+                ),
+            ));
+        }
+        let n = launch_u32("enqueue_add3", "n", n)?;
+        let prep = self
+            .module
+            .prepare_add3(LaunchConfig1D::new(n.div_ceil(256), 256, 0))?;
+        self.module.add3(stream, &prep, a, b, c, n, y)?;
         Ok(())
     }
 

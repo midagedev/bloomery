@@ -25,19 +25,25 @@
 //! 7. the shared expert on the normed row: up (IQ2_XXS, `hidden → 5376`), the
 //!    squared ReLU, down (:336-341), each a one-expert `iq2_xxs_gemv_sel`; a
 //!    file whose shared expert is Q8_0 or NVFP4 runs it as a dense site instead;
-//! 8. `moe_out + shared` (:344), then the residual add (:243).
+//! 8. `moe_out + shared` (:344), then the residual add (:243) — one three-input add,
+//!    `(moe_out + shared) + residual`.
+//!
+//! The step enqueues the shared expert's chain (7) first, on a second stream beside the router
+//! and the routed chain (2-6) where the layer's q8_1 forms are apart ([`moe_core`]); the output
+//! add (8) waits for both.
 //!
 //! The expert count and width are the layer's own (its router's rows, its
 //! stacks' shape), so one body runs every (count, width) pair of the file.
 
 use super::router::{RouteOut, Routers};
-use crate::arch::hybrid::{self, Acts, Cx, Names, Site, residual};
+use crate::arch::hybrid::{self, Acts, Cx, Names, Site};
 use crate::card_leg::{LegShape, Relu2Bufs, Relu2Leg, Relu2Run, Relu2Stacks};
+use crate::graph::Forked;
 use crate::kquant::SelDown;
 use crate::quant_sel::QuantSelKernels;
 use crate::site::SiteTy;
 use crate::weights::{DevWeight, Weights};
-use crate::{DeviceTensor, GpuError};
+use crate::{Branch, DeviceTensor, GpuError};
 use chain::arch::nemotron_h_moe::plan::MoePlan;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::{GgmlType, Split};
@@ -162,6 +168,10 @@ pub(super) struct MoeLayer {
     fp4: bool,
     /// The shared expert's two projections.
     pub(super) shared: Shared,
+    /// Whether the shared expert's chain may run on the branch stream beside the routed
+    /// chain ([`moe_core`]): an IQ2_XXS stack, whose q8_1 forms are apart from the routed
+    /// chain's ([`forks_apart`]).
+    pub(super) fork: bool,
     pub(super) route: RouteOut,
 }
 
@@ -211,8 +221,6 @@ pub(super) struct MoeScratch {
     pub(super) sh_up: DeviceBuffer<f32>,
     pub(super) sh_relu: DeviceBuffer<f32>,
     pub(super) sh: DeviceBuffer<f32>,
-    /// `moe_out + shared`, the layer's delta.
-    pub(super) sum: DeviceBuffer<f32>,
     /// The one id of a one-expert stack (the shared expert's).
     pub(super) zero_id: DeviceBuffer<u32>,
     /// The relu² form's buffers for one token, one an expert width of the
@@ -242,7 +250,6 @@ impl MoeScratch {
             sh_up: z(sh.shared_ff)?,
             sh_relu: z(sh.shared_ff)?,
             sh: z(hidden)?,
-            sum: z(hidden)?,
             zero_id: DeviceBuffer::zeroed(stream, 1)?,
             relu2: relu2
                 .iter()
@@ -260,7 +267,6 @@ impl MoeScratch {
             &self.sh_up,
             &self.sh_relu,
             &self.sh,
-            &self.sum,
         ]
         .iter()
         .map(|b| b.num_bytes())
@@ -456,6 +462,8 @@ impl MoeLayer {
                 .file
                 .find(&p.up_exps)
                 .is_some_and(|(_, t)| kernels::card_planes_runs(t.ty));
+        let fork = matches!(shared, Shared::Sel { .. })
+            && forks_apart((width, ff, hidden, shf, hp.top_k_max()));
         let layer = MoeLayer {
             router,
             bias: names.planned_vector(&p.bias, n)?,
@@ -469,6 +477,7 @@ impl MoeLayer {
             form,
             fp4,
             shared,
+            fork,
             route,
             norm: names.planned_vector(&p.norm, hidden)?,
         };
@@ -664,6 +673,16 @@ fn forms_of(
     forms
 }
 
+/// Whether the shared expert's q8_1 forms and the routed chain's are different buffers, so the
+/// two chains can run on two streams (`widths` as for [`forms_of`]). [`Acts`] keys a form by
+/// `(values, columns)` alone: a file whose experts' width is the hidden or the shared width, or
+/// whose slots' squared ReLU has the shared form's shape, has the chains write one buffer.
+fn forks_apart(widths: (usize, usize, usize, usize, usize)) -> bool {
+    let routed = forms_of((1, false), widths);
+    let shared = forms_of((0, true), widths);
+    !routed.iter().any(|form| shared.contains(form))
+}
+
 /// A card stack's name, or the refusal of a layer that holds no expert on
 /// the card (a placed load's walks skip such a layer's card slots).
 fn stack_name(name: &Option<String>) -> Result<&str, GpuError> {
@@ -680,14 +699,15 @@ fn no_card_stack() -> GpuError {
 
 /// `y = W · col` for the one-expert IQ2_XXS stack `name` of `rows` rows: the
 /// shared expert's projections, each `iq2_xxs_gemv_sel` over the stack as its
-/// expert 0.
+/// expert 0, enqueued on `stream`.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the launch's stack, activation, id and output, and the layer it raises in"
+    reason = "the launch's stack, activation, id and output, the stream it runs on and the layer it raises in"
 )]
 pub(super) fn one_expert(
     cx: &Cx<'_>,
     k: &MoeKernels,
+    stream: &CudaStream,
     l: usize,
     name: &str,
     rows: usize,
@@ -702,59 +722,95 @@ pub(super) fn one_expert(
         n_slots: 1,
         rows_per_expert: rows,
     };
-    k.iq.enqueue_gemv_sel(
-        cx.gpu.stream(),
-        GgmlType::IQ2_XXS,
-        &a,
-        cx.gpu.layer_sink(l)?,
-        y,
-    )
+    k.iq.enqueue_gemv_sel(stream, GgmlType::IQ2_XXS, &a, cx.gpu.layer_sink(l)?, y)
 }
 
-/// A MoE layer's input side: the norm of `src` (the fused norm +
-/// quantize where the shared expert is an IQ2_XXS stack), the shared expert's up, the router and,
-/// where the file has a latent, the latent down into `s.lat`.
-///
-/// The shared expert's up runs here, before the experts' quantize, because it consumes the norm's
-/// `(hidden, 1)` q8_1 form and [`Acts`] keys forms by `(k, m)` alone: the experts' width may equal
-/// the hidden, making the norm's and the experts' forms one buffer. A file whose shared expert is
-/// a dense site has no such form, and the plain norm writes the row alone.
+/// A MoE layer's input side: the norm of `src` into `t.buf.xn` — the fused norm +
+/// quantize where the shared expert is an IQ2_XXS stack, which leaves the row's `(hidden, 1)`
+/// q8_1 form the shared up and the latent down read; a dense site's plain norm writes the row alone.
 pub(super) fn moe_in(
+    cx: &Cx<'_>,
+    (l, m): (usize, &MoeLayer),
+    (t, acts): (&mut hybrid::Scratch, &mut Acts),
+    src: &DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let gpu = cx.gpu;
+    match &m.shared {
+        Shared::Sel { .. } => gpu.fused().enqueue_norm_quant(
+            gpu.stream(),
+            src,
+            cx.f32(&m.norm)?,
+            cx.sh.eps,
+            acts.q8_1_at(cx.what, cx.sh.hidden, 1)?,
+            &mut t.buf.xn,
+            gpu.layer_sink(l)?,
+        ),
+        Shared::Site { .. } => hybrid::norm(cx, &m.norm, src, &mut t.buf.xn),
+    }
+}
+
+/// The shared expert's chain on the normed row, enqueued on `stream`: the up, the squared
+/// ReLU (inside the quantize for an IQ2_XXS stack) and the down, into `s.sh`. A dense site's
+/// projections take no stream and run on the main stream, so `stream` is the main stream there.
+fn shared_chain(
+    cx: &Cx<'_>,
+    (k, sh): (&MoeKernels, MoeShape),
+    (l, m): (usize, &MoeLayer),
+    (t, s, acts): (&hybrid::Scratch, &mut MoeScratch, &mut Acts),
+    stream: &CudaStream,
+) -> Result<(), GpuError> {
+    let (gpu, what) = (cx.gpu, cx.what);
+    let hidden = cx.sh.hidden;
+    match &m.shared {
+        Shared::Sel { up, down } => {
+            let act = acts.q8_1_at(what, hidden, 1)?;
+            one_expert(
+                cx,
+                k,
+                stream,
+                l,
+                up,
+                sh.shared_ff,
+                act,
+                &s.zero_id,
+                &mut s.sh_up,
+            )?;
+            let act = acts.q8_1_at(what, sh.shared_ff, 1)?;
+            gpu.enqueue_quantize_q8_1_relu_sqr_on(stream, &s.sh_up, act, gpu.layer_sink(l)?)?;
+            one_expert(cx, k, stream, l, down, hidden, act, &s.zero_id, &mut s.sh)
+        }
+        Shared::Site { up, down } => {
+            up.project(&cx.gqa(), acts, l, &t.buf.xn, &mut s.sh_up)?;
+            gpu.elem()
+                .enqueue_relu_sqr(stream, &s.sh_up, sh.shared_ff, &mut s.sh_relu)?;
+            down.project(&cx.gqa(), acts, l, &s.sh_relu, &mut s.sh)
+        }
+    }
+}
+
+/// A MoE layer's middle: the shared expert's chain, the router, the latent down where the
+/// file has a latent, the card's slots over the latent (or the normed row itself where the file
+/// has no latent), their weighted sum, and the latent up into `t.buf.delta` — the layer's delta,
+/// which [`moe_out`] reads back by the same match.
+///
+/// The shared expert's chain reads the norm's `(hidden, 1)` form and writes buffers and a form of
+/// its own, so it shares nothing with the routed chain where the layer's forms are apart
+/// (`m.fork`): it then runs on `branch`, forked right after the norm and joined before the output
+/// add, beside the router and the experts. Elsewhere it runs on the main stream ahead of them:
+/// [`Acts`] keys forms by `(k, m)` alone, and the experts' width may equal the hidden or the
+/// shared width, making two chains' forms one buffer, which the chain's order then keeps whole.
+pub(super) fn moe_core(
     cx: &Cx<'_>,
     (k, sh): (&MoeKernels, MoeShape),
     (l, m): (usize, &mut MoeLayer),
     (t, s, acts): (&mut hybrid::Scratch, &mut MoeScratch, &mut Acts),
-    src: &DeviceBuffer<f32>,
+    branch: &mut Branch,
 ) -> Result<(), GpuError> {
     let (gpu, what) = (cx.gpu, cx.what);
     let stream = gpu.stream();
-    let hidden = cx.sh.hidden;
-    let fault = gpu.layer_sink(l)?;
-    match &m.shared {
-        Shared::Sel { .. } => {
-            gpu.fused().enqueue_norm_quant(
-                stream,
-                src,
-                cx.f32(&m.norm)?,
-                cx.sh.eps,
-                acts.q8_1_at(what, hidden, 1)?,
-                &mut t.buf.xn,
-                fault,
-            )?;
-        }
-        Shared::Site { .. } => {
-            hybrid::norm(cx, &m.norm, src, &mut t.buf.xn)?;
-        }
-    }
-    match &m.shared {
-        Shared::Sel { up, .. } => {
-            let act = acts.q8_1_at(what, hidden, 1)?;
-            one_expert(cx, k, l, up, sh.shared_ff, act, &s.zero_id, &mut s.sh_up)?;
-        }
-        Shared::Site { up, .. } => {
-            up.project(&cx.gqa(), acts, l, &t.buf.xn, &mut s.sh_up)?;
-        }
-    }
+    let fork = if m.fork { Some(branch.fork()?) } else { None };
+    let side = fork.as_ref().map_or(stream, Forked::stream);
+    shared_chain(cx, (k, sh), (l, &*m), (&*t, &mut *s, &mut *acts), side)?;
     k.routers.enqueue(
         stream,
         cx.w.f32_tensor(what, &m.router)?,
@@ -762,26 +818,10 @@ pub(super) fn moe_in(
         cx.f32(&m.bias)?,
         sh.scale,
         &mut m.route,
-        fault,
+        gpu.layer_sink(l)?,
     )?;
     if let Some(site) = &m.latent_down {
         site.project(&cx.gqa(), acts, l, &t.buf.xn, &mut s.lat)?;
-    }
-    Ok(())
-}
-
-/// A MoE layer's middle: the card's slots over the latent (or the
-/// normed row itself where the file has no latent), their weighted sum, and the latent up into
-/// `t.buf.delta` — the layer's delta, which [`moe_out`] reads back by the same match.
-pub(super) fn moe_core(
-    cx: &Cx<'_>,
-    (k, sh): (&MoeKernels, MoeShape),
-    (l, m): (usize, &mut MoeLayer),
-    (t, s, acts): (&mut hybrid::Scratch, &mut MoeScratch, &mut Acts),
-) -> Result<(), GpuError> {
-    let gpu = cx.gpu;
-    let stream = gpu.stream();
-    if m.latent_down.is_some() {
         let (lat, slots) = s.lat_and_slots();
         card_slots(cx, (k, sh), (l, &*m), (lat, m.route.ids()), (slots, acts))?;
     } else {
@@ -808,42 +848,41 @@ pub(super) fn moe_core(
     if let Some(site) = &m.latent_up {
         site.project(&cx.gqa(), acts, l, &s.moe, &mut t.buf.delta)?;
     }
+    if let Some(fork) = fork {
+        fork.join()?;
+    }
     Ok(())
 }
 
-/// A MoE layer's output side: the shared expert's squared ReLU and
-/// down, their sum with the routed delta, and the residual add of `src` into `dst`.
+/// A MoE layer's output side: [`layer_out`] of the layer's delta (the latent up's output, or
+/// the experts' sum itself where the file has no latent) and the shared expert's down, with the
+/// residual `src`, into `dst`.
 pub(super) fn moe_out(
     cx: &Cx<'_>,
-    (k, sh): (&MoeKernels, MoeShape),
-    (l, m): (usize, &mut MoeLayer),
-    (t, s, acts): (&mut hybrid::Scratch, &mut MoeScratch, &mut Acts),
+    m: &MoeLayer,
+    (t, s): (&hybrid::Scratch, &MoeScratch),
     (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
 ) -> Result<(), GpuError> {
-    let (gpu, what) = (cx.gpu, cx.what);
-    let stream = gpu.stream();
-    let hidden = cx.sh.hidden;
-    // The layer's delta: the latent up's output, or the experts' sum itself
-    // where the file has no latent.
     let delta: &DeviceBuffer<f32> = match &m.latent_up {
         Some(_) => &t.buf.delta,
         None => &s.moe,
     };
-    match &m.shared {
-        Shared::Sel { down, .. } => {
-            let act = acts.q8_1_at(what, sh.shared_ff, 1)?;
-            gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.sh_up, act, l)?;
-            one_expert(cx, k, l, down, hidden, act, &s.zero_id, &mut s.sh)?;
-        }
-        Shared::Site { down, .. } => {
-            gpu.elem()
-                .enqueue_relu_sqr(stream, &s.sh_up, sh.shared_ff, &mut s.sh_relu)?;
-            down.project(&cx.gqa(), acts, l, &s.sh_relu, &mut s.sh)?;
-        }
-    }
-    gpu.elem()
-        .enqueue_add(stream, delta, &s.sh, hidden, &mut s.sum)?;
-    residual(cx, src, &s.sum, dst)
+    layer_out(cx, (delta, &s.sh), src, dst)
+}
+
+/// The layer's output row: `dst = (delta + sh) + src`, the routed delta plus the shared
+/// expert's down, then the residual `src` — one launch, the bits of the add of `delta` and
+/// `sh` followed by the residual add (a float sum commutes, so `src + (delta + sh)` is the
+/// same value).
+pub(super) fn layer_out(
+    cx: &Cx<'_>,
+    (delta, sh): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
+    src: &DeviceBuffer<f32>,
+    dst: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    cx.gpu
+        .elem()
+        .enqueue_add3(cx.gpu.stream(), (delta, sh, src), cx.sh.hidden, dst)
 }
 
 /// One MoE layer's last routing, read back: the kept expert ids in rank
@@ -865,7 +904,7 @@ pub(super) fn routed(m: &MoeLayer, stream: &CudaStream) -> Result<Routing, GpuEr
 
 #[cfg(test)]
 mod tests {
-    use super::forms_of;
+    use super::{forks_apart, forms_of};
 
     /// A layer whose card holds no expert and whose shared expert is a
     /// dense site reads no q8_1 form: the K-quant's 256-value blocks are not
@@ -890,5 +929,17 @@ mod tests {
             forms_of((240, false), (1024, 1536, 4096, 5376, 9)),
             vec![(1024, 1), (1536, 9)]
         );
+    }
+
+    /// The shared expert's chain runs on a second stream only where its forms are not the routed
+    /// chain's: Bolt's widths are apart; an experts' width equal to the hidden or to the shared
+    /// width, or slots' squared ReLU form of the shared form's shape, makes one buffer of two.
+    #[test]
+    fn the_shared_chain_forks_only_over_forms_apart() {
+        assert!(forks_apart((1024, 1536, 4096, 5376, 9)));
+        assert!(!forks_apart((4096, 1536, 4096, 5376, 9)));
+        assert!(!forks_apart((5376, 1536, 4096, 5376, 9)));
+        assert!(!forks_apart((1024, 5376, 4096, 5376, 1)));
+        assert!(!forks_apart((1024, 4096, 4096, 5376, 1)));
     }
 }

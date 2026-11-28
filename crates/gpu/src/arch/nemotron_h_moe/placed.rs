@@ -16,7 +16,8 @@
 //!   load), then the shared expert's down;
 //! - **back**: the wait, the card's slots' weighted sum (`ds41_ffn_card_acc_9`,
 //!   the places below the layer's card count) plus the host's sum in the latent,
-//!   the latent up, the shared expert, the residual.
+//!   the latent up, then the output add (the delta and the shared expert's down, then the
+//!   residual).
 //!
 //! The prompt runs as passes of up to [`PLACED_ROWS`] rows through the host
 //! tier's batch port ([`super::prefill`]): the same three parts over a pass,
@@ -34,10 +35,11 @@
 
 use super::body::Layer;
 use super::moe::{
-    MoeKernels, MoeLayer, MoeScratch, MoeShape, Shared, card_down, card_slots, one_expert,
+    MoeKernels, MoeLayer, MoeScratch, MoeShape, Shared, card_down, card_slots, layer_out,
+    one_expert,
 };
 use super::program::Program;
-use crate::arch::hybrid::{self, Acts, Cx, rails, residual};
+use crate::arch::hybrid::{self, Acts, Cx, rails};
 use crate::card_slots::{CardAcc, CardSlotKernels, ColPlaces};
 use crate::fault::FaultSink;
 use crate::host::StepLeg;
@@ -431,7 +433,17 @@ fn shadow(
         match &m.shared {
             Shared::Sel { up, .. } => {
                 let act = acts.q8_1_at(what, cx.sh.hidden, 1)?;
-                one_expert(cx, k, l, up, sh.shared_ff, act, &s.zero_id, &mut s.sh_up)?;
+                one_expert(
+                    cx,
+                    k,
+                    stream,
+                    l,
+                    up,
+                    sh.shared_ff,
+                    act,
+                    &s.zero_id,
+                    &mut s.sh_up,
+                )?;
             }
             Shared::Site { up, .. } => {
                 up.project(&cx.gqa(), acts, l, &t.buf.xn, &mut s.sh_up)?;
@@ -446,7 +458,17 @@ fn shadow(
         Shared::Sel { down, .. } => {
             let act = acts.q8_1_at(what, sh.shared_ff, 1)?;
             gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.sh_up, act, l)?;
-            one_expert(cx, k, l, down, cx.sh.hidden, act, &s.zero_id, &mut s.sh)
+            one_expert(
+                cx,
+                k,
+                stream,
+                l,
+                down,
+                cx.sh.hidden,
+                act,
+                &s.zero_id,
+                &mut s.sh,
+            )
         }
         Shared::Site { down, .. } => {
             gpu.elem()
@@ -504,10 +526,8 @@ fn back(
             }
             None => merged,
         };
-        gpu.elem()
-            .enqueue_add(stream, delta, &s.sh, cx.sh.hidden, &mut s.sum)?;
+        layer_out(cx, (delta, &s.sh), src, dst)?;
     }
-    residual(cx, src, &s.sum, dst)?;
     hy.row_enqueued(l, 0)
 }
 

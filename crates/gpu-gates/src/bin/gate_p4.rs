@@ -1,7 +1,8 @@
 //! GPU kernel gate for package P4 (docs/gpu-design.md work package): the
 //! element-wise and reduction kernels of `bloomery_gpu::elem` — embedding row
 //! dequant, rms_norm, rope, swiglu, the logit softcap (`softcap_rows`), the
-//! per-head SSMax query scale (`ssmax_rows`), residual add, routed-expert
+//! per-head SSMax query scale (`ssmax_rows`), residual add (and the fused
+//! three-input add, held to the two launches it replaces), routed-expert
 //! weighted sum, argmax. Two layers per op (the package's gate rule):
 //! - **Asserted**: device output vs a host scalar reference computed in this
 //!   binary from the SAME input, f64 where a sum is involved, mirroring the
@@ -886,6 +887,36 @@ fn run() -> Result<(), GateError> {
                 verdict(pass)
             );
             if !pass {
+                ok = false;
+            }
+
+            // The fused three-input add is the two launches it replaces: `a + b` into a
+            // temporary, then `c + that` (the MoE layer's delta plus the shared expert's down,
+            // then the residual), bit for bit, and the host's `(a + b) + c`. `c` is `b` shifted
+            // by one element, so the two association orders round differently (`a + (b + c)`
+            // would not pass).
+            let c: Vec<f32> = (0..n).map(|i| b[(i + 1) % n]).collect();
+            let c_dev = DeviceBuffer::from_host(stream, &c)?;
+            let mut tmp_dev = DeviceBuffer::<f32>::zeroed(stream, n)?;
+            let mut two_dev = DeviceBuffer::<f32>::zeroed(stream, n)?;
+            let mut fused_dev = DeviceBuffer::<f32>::zeroed(stream, n)?;
+            elem.enqueue_add(stream, &a_dev, &b_dev, n, &mut tmp_dev)?;
+            elem.enqueue_add(stream, &c_dev, &tmp_dev, n, &mut two_dev)?;
+            elem.enqueue_add3(stream, (&a_dev, &b_dev, &c_dev), n, &mut fused_dev)?;
+            stream.synchronize()?;
+            let (two, fused) = (two_dev.to_host_vec(stream)?, fused_dev.to_host_vec(stream)?);
+            let fused_ref: Vec<f32> = (0..n).map(|i| (a[i] + b[i]) + c[i]).collect();
+            let same_two = bits_equal(&fused, &two);
+            let same_host = bits_equal(&fused, &fused_ref);
+            // The shifted `c` must make the order matter, or the clause proves nothing.
+            let order_moves = (0..n)
+                .any(|i| ((a[i] + b[i]) + c[i]).to_bits() != (a[i] + (b[i] + c[i])).to_bits());
+            let pass3 = same_two && same_host && order_moves;
+            println!(
+                "shape op=add3 site={out_name}=({a_name}+{b_name})+{b_name}<<1 n=2048 m=6 bit_equal_two_launches={same_two} bit_exact_host={same_host} order_moves={order_moves} {}",
+                verdict(pass3)
+            );
+            if !pass3 {
                 ok = false;
             }
         }

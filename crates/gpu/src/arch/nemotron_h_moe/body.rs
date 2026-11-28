@@ -25,7 +25,7 @@ use crate::quant_sel::QuantSelKernels;
 use crate::site::{Form, SiteTy};
 use crate::tensor::Q8ACT_MAX_K;
 use crate::weights::Weights;
-use crate::{Gpu, GpuError};
+use crate::{Branch, Gpu, GpuError};
 use bloomery_levers::HostCfg;
 use chain::arch::nemotron_h_moe::plan::MoePlan;
 use chain::arch::nemotron_h_moe::read::layer_plans;
@@ -91,6 +91,8 @@ pub struct Body {
     acts: Acts,
     s: hybrid::Scratch,
     ms: MoeScratch,
+    /// The stream the shared expert's chain runs on beside the routed chain ([`Program`]).
+    branch: Branch,
     /// The residual stream's second buffer ([`Body::enqueue`]).
     r: DeviceBuffer<f32>,
     /// The step record's host words, rewritten by every refresh.
@@ -419,6 +421,7 @@ impl Body {
             acts,
             s: hybrid::Scratch::new(stream, &sh, hp.n_head, 0)?,
             ms: MoeScratch::new(stream, moe, (hidden, ff), &relu2)?,
+            branch: Branch::new(gpu.stream_handle())?,
             r: DeviceBuffer::zeroed(stream, hidden)?,
             words: Words::new(n_kv),
             sh,
@@ -513,6 +516,7 @@ impl Body {
             moe: self.moe,
             layers: &mut self.layers,
             ms: &mut self.ms,
+            branch: &mut self.branch,
         };
         if let Some(Placed { hybrid, side }) = self.placed.as_mut() {
             let mut leg = StepLeg::new(gpu.stream(), hybrid);

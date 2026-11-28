@@ -9,7 +9,7 @@ use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, moe_core, moe_in, m
 use crate::arch::hybrid::{GqaLayer, MambaLayer, Trunk, WORD_POS, WORD_TOKEN, mismatch, rails};
 use crate::flash_gqa::GROUP_16;
 use crate::q38::{EmbedArgs, EmbedRows, Q38Kernels};
-use crate::{GpuError, Window};
+use crate::{Branch, GpuError, Window};
 use chain::arch::nemotron_h_moe::plan::MoePlan;
 use chain::hybrid::ops::{HybridOps, Step};
 use chain::hybrid::plan::{MambaPlan, NopeGqaPlan};
@@ -27,6 +27,8 @@ pub(super) struct Program<'a> {
     pub(super) moe: MoeShape,
     pub(super) layers: &'a mut [Layer],
     pub(super) ms: &'a mut MoeScratch,
+    /// The stream the shared expert's chain runs on beside the routed chain ([`moe_core`]).
+    pub(super) branch: &'a mut Branch,
 }
 
 fn mamba_at(layers: &mut [Layer], l: usize) -> Result<&mut MambaLayer, GpuError> {
@@ -115,13 +117,7 @@ impl HybridOps for Program<'_> {
         let m = moe_at(self.layers, s.layer)?;
         let t = &mut self.t;
         let (src, _) = rails(t.in_head, &mut *t.head, &mut *t.r);
-        moe_in(
-            &t.cx,
-            (self.mk, self.moe),
-            (s.layer, m),
-            (&mut *t.s, &mut *self.ms, &mut *t.acts),
-            src,
-        )
+        moe_in(&t.cx, (s.layer, &*m), (&mut *t.s, &mut *t.acts), src)
     }
 
     fn ffn_core(&mut self, s: Step, _: &MoePlan) -> Result<(), GpuError> {
@@ -132,6 +128,7 @@ impl HybridOps for Program<'_> {
             (self.mk, self.moe),
             (s.layer, m),
             (&mut *t.s, &mut *self.ms, &mut *t.acts),
+            &mut *self.branch,
         )
     }
 
@@ -139,13 +136,7 @@ impl HybridOps for Program<'_> {
         let m = moe_at(self.layers, s.layer)?;
         let t = &mut self.t;
         let (src, dst) = rails(t.in_head, &mut *t.head, &mut *t.r);
-        moe_out(
-            &t.cx,
-            (self.mk, self.moe),
-            (s.layer, m),
-            (&mut *t.s, &mut *self.ms, &mut *t.acts),
-            (src, dst),
-        )?;
+        moe_out(&t.cx, &*m, (&*t.s, &*self.ms), (src, dst))?;
         t.flip();
         Ok(())
     }
