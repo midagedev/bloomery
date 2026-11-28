@@ -287,7 +287,8 @@ pub enum SiteEntry {
     /// `Q8F32Kernels::enqueue_q8_0_gemv` (`enqueue_q8_0_gemv_mcol` past one
     /// column) over the q8f32 planes and f32 rows; wide, `Gemm32Weight::Q8_0Plane`.
     Q8_0,
-    /// `Gemm32Kernels::enqueue_f32_tile` over the f32 rows, narrow and wide.
+    /// `Q8F32Kernels::enqueue_f32_gemv` (`enqueue_f32_gemv_mcol` past one
+    /// column) over the f32 rows; wide, `Gemm32Kernels::enqueue_f32_tile`.
     F32,
     /// `Nvfp4Kernels::enqueue_gemv` (`nvfp4_gemv`, `crates/gpu/src/mxfp4.rs`)
     /// over the NVFP4 planes and the q8_1 rows, times the tensor's scale,

@@ -8,8 +8,8 @@
 //! - [`router_body`]: the logit gemv, the score, the block ticket and, in the
 //!   block that draws the last one, the selection; one token a launch.
 //! - [`pick_body`]: a batch's selection, one block a token over scores the
-//!   pass's tile GEMM and its sigmoid wrote; bit for bit what
-//!   [`router_body`] writes a token.
+//!   pass's F32 product (the tile GEMM, or a few rows' warp-a-row gemv) and its
+//!   sigmoid wrote; bit for bit what [`router_body`] writes a token.
 //!
 //! [`sigmoid_router_instance!`](crate::sigmoid_router_instance) is the one
 //! form of a sigmoid instance of the three: its entries, its output buffers
@@ -1072,8 +1072,12 @@ macro_rules! sigmoid_router_instance {
             /// scores into `probs` ([`N_EXPERT`] a token), then each token's ids
             /// and weights into `ids` and `weights` ([`N_USED`] a token) — what
             /// `t` [`RouterKernels::enqueue_router`] launches write, bit for bit.
-            /// A selection value or a weight that is not finite raises `fault`.
-            /// Asynchronous, allocation-free.
+            /// The scores are the common F32 product
+            /// (`Gemm32Kernels::enqueue_f32_cols`): up to eight tokens `k` is a
+            /// positive multiple of 32; past eight the F32 tile's, a multiple
+            /// of 64 with `w` and `x` 16-byte aligned, and any other is a named
+            /// `Shape` refusal. A selection value or a weight that is not
+            /// finite raises `fault`. Asynchronous, allocation-free.
             #[allow(
                 clippy::too_many_arguments,
                 reason = "enqueue_router's inputs, the token count and the batch's buffers (rust-quality R8)"
@@ -1116,13 +1120,14 @@ macro_rules! sigmoid_router_instance {
                 }
                 let n_expert = launch_u32(what, "n_expert", N_EXPERT)?;
                 let tt = launch_u32(what, "t", t)?;
-                // The scores as one F32 tile GEMM over every token — the
-                // common `f32_tile_gemm`, bit for bit this body's
+                // The scores over every token — the common F32 product
+                // (`enqueue_f32_cols`: a verify's few tokens a warp a row, a
+                // pass's the tile GEMM), bit for bit this body's
                 // per-(token, expert) gemv (the same lane walk,
                 // `f32_lane_partials`, and the same warp tree,
                 // `gemv_lane_sums`) — then the score's scalar over its
                 // logits, in place. The pick launch is unchanged.
-                wide.enqueue_f32_tile(stream, w, x, t, probs)?;
+                Gemm32Kernels::enqueue_f32_cols(Some(wide), gpu.q8f32(), stream, w, x, t, probs)?;
                 gpu.elem()
                     .enqueue_sigmoid_rows(stream, probs, N_EXPERT * t)?;
                 let prep = self
@@ -1666,9 +1671,12 @@ pub mod sigmoid_floor_256_6 {
         }
 
         /// Token-major batch equivalent to ordered single-token launches.
-        /// The common F32 tile requires k a positive multiple of 64 and
-        /// aligned weight/input buffers. All buffers are caller-provided;
-        /// no optional-bias scratch is needed.
+        /// The scores are the common F32 product
+        /// (`Gemm32Kernels::enqueue_f32_cols`): up to eight tokens k is a
+        /// positive multiple of 32; past eight the F32 tile's, a multiple of
+        /// 64 with aligned weight/input buffers, and any other is a named
+        /// `Shape` refusal. All buffers are caller-provided; no optional-bias
+        /// scratch is needed.
         #[allow(
             clippy::too_many_arguments,
             reason = "router inputs, token count and the batch's output buffers (rust-quality R8)"
@@ -1718,8 +1726,8 @@ pub mod sigmoid_floor_256_6 {
                     ),
                 ));
             }
-            // The tile GEMM uses the one-token row walk and warp sum tree.
-            wide.enqueue_f32_tile(stream, w, x, t, probs)?;
+            // The common F32 product uses the one-token row walk and warp sum tree.
+            Gemm32Kernels::enqueue_f32_cols(Some(wide), gpu.q8f32(), stream, w, x, t, probs)?;
             gpu.elem().enqueue_sigmoid_rows(stream, probs, scores)?;
             let prep = self
                 .module

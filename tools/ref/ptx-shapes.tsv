@@ -832,3 +832,5 @@ generate_ds41   vha_mix                                  0           0
 generate_ds41   route_census_add                         0           0
 generate_ds41   route_cut_weights                        0           0
 generate_ds41   route_resident_bias                      0           0
+# PIN(2026-11-28): f32_gemv_mcol at 0/0 [derived: 0/0 on the 5090's sm_120a scan (64 registers, no local depot), and the body holds no local array], not measured on this table's arch and capability until a scan on them runs.
+generate_ds41   f32_gemv_mcol                            0           0

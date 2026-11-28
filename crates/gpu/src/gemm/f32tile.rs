@@ -62,7 +62,9 @@ use super::{GemmAct32, MmaForm};
 use crate::fault::FaultSink;
 use crate::linear::norm_gate::{NormGateTail, gate_act, norm_gate_values};
 use crate::linear::{GATE_SIGMOID, GATE_SILU, HEAD};
-use crate::q8f32::{Bf16Words, ByteBlocks, E4m3Scales, E4m3Weight};
+use crate::q8f32::{
+    Bf16Words, ByteBlocks, E4m3Scales, E4m3Weight, F32GemvMcolArgs, GemvOut, Q8F32Kernels,
+};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use core::marker::PhantomData;
@@ -84,6 +86,8 @@ use cuda_device::{
 
 /// Columns and rows one block covers.
 pub(super) const TILE_COLS: usize = 32;
+/// The most columns [`Gemm32Kernels::enqueue_f32_cols`] runs through a warp-a-row gemv.
+const F32_GEMV_COLS: usize = 8;
 pub(super) const TILE_ROWS: usize = 32;
 /// Values of a chunk one thread takes ([`pair_chunk`]), the threads that
 /// cover a 32-value chunk, and the column halves of a warp (one a sixteen
@@ -2300,6 +2304,46 @@ impl Gemm32Kernels {
         self.module
             .f32_tile_gemm(stream, &prep, w.buf(), x, t.rows, t.k, t.n, y)?;
         Ok(())
+    }
+
+    /// Enqueue `y[c · rows + r] = Σ_k w[r·k + k'] · x[c·k + k']` for the first `n`
+    /// columns of `x`, token-major, every output bit for bit
+    /// `Q8F32Kernels::enqueue_f32_gemv`'s for its row and column: the one owner of
+    /// which launch an F32 weight's columns take. One column runs `f32_gemv`; two
+    /// to [`F32_GEMV_COLS`] (a verify's rows) `f32_gemv_mcol`, a warp a row in
+    /// `⌈rows / 8⌉` blocks where the tile has `⌈n / 32⌉ · ⌈rows / 32⌉` however few
+    /// columns are live; more the tile ([`Self::enqueue_f32_tile`]), which only
+    /// `tile` supplies: `None` there is a named `State` refusal. `n` must be
+    /// positive and `k` a positive multiple of 32, of 64 past [`F32_GEMV_COLS`]
+    /// columns; each launch refuses its own geometry by name. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_f32_cols(
+        tile: Option<&Self>,
+        q8: &Q8F32Kernels,
+        stream: &CudaStream,
+        w: &DeviceTensor<f32>,
+        x: &DeviceBuffer<f32>,
+        n: usize,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Gemm32Kernels::enqueue_f32_cols";
+        match n {
+            0 => Err(GpuError::shape(WHAT, "n must be positive, got 0")),
+            1 => q8.enqueue_f32_gemv(stream, w, x, 1, y),
+            2..=F32_GEMV_COLS => q8.enqueue_f32_gemv_mcol(
+                stream,
+                F32GemvMcolArgs {
+                    w,
+                    x,
+                    m: n,
+                    out: GemvOut::TokenMajor,
+                    y,
+                },
+            ),
+            _ => tile
+                .ok_or(GpuError::state(WHAT, "the F32 tile's kernels"))?
+                .enqueue_f32_tile(stream, w, x, n, y),
+        }
     }
 
     /// Enqueue [`Self::enqueue_f32_tile`]'s product for an E4M3 weight in

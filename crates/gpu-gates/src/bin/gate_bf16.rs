@@ -28,9 +28,11 @@
 //! 2. f32: the same tensors loaded as f32 values (`Weights::load_where`,
 //!    `CardFormat::Bf16AsF32`, the load of every body that does not set
 //!    `bf16_words`) through the F32 site at 1..=8 and 64 columns: bit for bit
-//!    the BF16 site's outputs. A BF16 site over that F32 resident is refused
-//!    by name. Each small site call captures as one graph node and replays
-//!    bit for bit the eager output.
+//!    the BF16 site's outputs, and each width's launch read from the captured
+//!    node (`f32.entry`: `f32_gemv` at one column, `f32_gemv_mcol` to eight,
+//!    `f32_tile_gemm` past them, which the bits cannot show). A BF16 site over
+//!    that F32 resident is refused by name. Each small site call captures as
+//!    one graph node and replays bit for bit the eager output.
 //! 3. join: two BF16 parts joined at load (`Weights::join_rows`) through
 //!    `site::resident_gemv`, bit for bit the rule over the parts' rows; the
 //!    same parts loaded as f32 values the same. Over each joint the dense
@@ -401,6 +403,33 @@ mod gate {
                     verdict(same)
                 );
                 ok &= same;
+                // The F32 site's launch by width, from the captured node.
+                let want = match cols {
+                    1 => "f32_gemv",
+                    2..=8 => "f32_gemv_mcol",
+                    _ => "f32_tile_gemm",
+                };
+                let graph = gpu.capture(|_| {
+                    site::gemv(
+                        gpu,
+                        g32,
+                        (SiteTy::F32, &f32_w, name),
+                        &x_dev,
+                        cols,
+                        &mut f_dev,
+                    )
+                })?;
+                let got = match graph.nodes()?.as_slice() {
+                    [node] => node.kernel.as_ref().map(|k| k.name.clone()),
+                    _ => None,
+                };
+                let pass = got.as_deref() == Some(want);
+                println!(
+                    "bf16 clause=f32.entry {tag} entry={} want={want} {}",
+                    got.as_deref().unwrap_or("-"),
+                    verdict(pass)
+                );
+                ok &= pass;
                 if (1..=8).contains(&m) {
                     // Poisoned again, so a tile that skips a write cannot pass on the site's values.
                     f_dev = DeviceBuffer::from_host(stream, &vec![f32::NAN; cols * rows])?;

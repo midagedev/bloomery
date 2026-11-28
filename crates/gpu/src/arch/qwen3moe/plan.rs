@@ -14,9 +14,9 @@
 //! - Any other type, and a Q4_K one beside a type the group cannot hold: `crate::site`, each
 //!   projection its own launch — Q3_K, Q4_K and Q6_K `Gpu::enqueue_gemv_*` (row-major, a
 //!   token-major copy past one row), Q5_K the K-quant down `_sel` over one expert
-//!   (`q5k_gemv_sel`), Q8_0 `q8_0_gemv` or `q8_0_gemv_mcol` and F32 `f32_tile_gemm`, both over
-//!   the f32 rows; wide the grouped GEMM of a K-quant (`gemm_q{3,4,5,6}k`), `gemm_q8_0p` for
-//!   Q8_0, the F32 tile for F32.
+//!   (`q5k_gemv_sel`), Q8_0 `q8_0_gemv` or `q8_0_gemv_mcol` and F32 `f32_gemv` or
+//!   `f32_gemv_mcol`, both over the f32 rows; wide the grouped GEMM of a K-quant
+//!   (`gemm_q{3,4,5,6}k`), `gemm_q8_0p` for Q8_0, the F32 tile for F32.
 
 use crate::site::Form;
 pub(super) use chain::arch::qwen3moe::plan::{

@@ -54,6 +54,9 @@ ENTRY = {
     ("bf16", "tile"): "bf16_tile_gemm",
 }
 # The design's sm_86 table (ptx-scan --no-jit of bloomery-serve, section 3): regs, smem, blocks an SM.
+# f32_gemv_mcol (the F32 site's and the router rows' entry at 2..8 columns) has no row: the table predates it, and no sm_86
+# scan holds its registers. The ("f32", "gemv") arm prices it already: one launch of f32_gemv's lane walk and butterfly for
+# up to 8 columns (launches = ceil(m / 8)), and a row for the entry would repeat f32_gemv's.
 SM86 = {
     "mxfp8_gemv": (39, 0, 6), "mxfp8_gemv_mcol": (72, 0, 3), "mxfp8_gemv_mcol_staged": (48, 4096, 5),
     "mxfp8_gemv_mcol_staged_wide": (47, 8192, 5), "gemm_q8_0p": (106, 33312, 2), "gemm_q8_0p_slab": (114, 33312, 2),
