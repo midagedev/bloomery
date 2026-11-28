@@ -494,7 +494,7 @@ unsafe fn combine_post_tier_at(
 pub struct TierPiece {
     module: tier_kernels::LoadedModule,
     tsel: Vec<DeviceBuffer<u32>>,
-    places: DeviceTensor<u32>,
+    places: std::sync::Arc<DeviceTensor<u32>>,
 }
 
 impl TierPiece {
@@ -509,12 +509,7 @@ impl TierPiece {
         let tsel = (0..rows)
             .map(|_| DeviceBuffer::zeroed(stream, N_USED))
             .collect::<Result<Vec<_>, _>>()?;
-        let places = DeviceTensor::upload(
-            stream,
-            &map.tier_view(STAGE_TIER)?,
-            map.layers().len(),
-            map.n_expert(),
-        )?;
+        let places = map.tier_places(stream, STAGE_TIER)?;
         Ok(TierPiece {
             module,
             tsel,

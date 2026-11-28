@@ -83,15 +83,28 @@ pub fn history(
     ids: &[u32],
     cleared: impl FnOnce(&mut Session<Body38>) -> Result<(), GateError>,
 ) -> Result<Run, GateError> {
+    history_with(s, ids, cleared, |_, _| Ok(()))
+}
+
+/// [`history`] with `after` called after every step and every verify window,
+/// with the rows the run holds so far.
+pub fn history_with(
+    s: &mut Session<Body38>,
+    ids: &[u32],
+    cleared: impl FnOnce(&mut Session<Body38>) -> Result<(), GateError>,
+    mut after: impl FnMut(&Session<Body38>, usize) -> Result<(), GateError>,
+) -> Result<Run, GateError> {
     s.clear()?;
     cleared(s)?;
     let mut run = Run::default();
     let mut next = 0;
     for &id in &ids[..PROMPT] {
         next = step(s, &mut run, id)?;
+        after(s, run.logits.len())?;
     }
     for _ in 0..STEPS {
         next = step(s, &mut run, next)?;
+        after(s, run.logits.len())?;
     }
     let mut at = PROMPT;
     for (m, keep) in WINDOWS {
@@ -102,9 +115,11 @@ pub fn history(
             _ => window::<4>(s, &mut run, next, fill, keep)?,
         };
         at += m;
+        after(s, run.logits.len())?;
     }
     for _ in 0..STEPS {
         next = step(s, &mut run, next)?;
+        after(s, run.logits.len())?;
     }
     let m = s.model();
     run.stage_nodes = vec![

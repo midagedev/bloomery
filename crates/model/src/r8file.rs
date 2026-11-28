@@ -629,6 +629,13 @@ impl Sidecar {
         &self.path
     }
 
+    /// Whether the sidecar's bytes are its file's own mapping (read ahead of a
+    /// read by the page cache), not a resident copy.
+    #[must_use]
+    pub fn is_mapped(&self) -> bool {
+        self.mapped
+    }
+
     /// The sidecar's bytes as its file's own read-only mapping; `None` for a
     /// resident copy, whose pages are anonymous — `MADV_DONTNEED` would zero
     /// them.

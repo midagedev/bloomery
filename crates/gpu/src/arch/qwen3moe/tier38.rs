@@ -43,6 +43,8 @@
 //! down rows (`crate::card_slots::DownStore`) the join reads each tier row
 //! rounded as that store rounds the same product (`q38_card_tier_acc_bf16`).
 
+use std::sync::Arc;
+
 use super::card38::{LegLayer, SelRun, leg_layers};
 use super::plan38::geo;
 use super::scratch::{cells_view, param_view};
@@ -176,7 +178,7 @@ fn node_experts(
 /// per layer the experts the tier holds. Built once at load by a body with a
 /// tier card.
 pub(super) struct TierSide38 {
-    places: DeviceTensor<u32>,
+    places: Arc<DeviceTensor<u32>>,
     pub(super) tsel: DeviceBuffer<u32>,
     k: Vec<usize>,
 }
@@ -189,16 +191,10 @@ impl TierSide38 {
         let stream = gpu.stream();
         let run = map.layers();
         let k = run
-            .clone()
             .map(|l| map.on_tier_of(STAGE_TIER, l))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(TierSide38 {
-            places: DeviceTensor::upload(
-                stream,
-                &map.tier_view(STAGE_TIER)?,
-                run.len(),
-                map.n_expert(),
-            )?,
+            places: map.tier_places(stream, STAGE_TIER)?,
             tsel: DeviceBuffer::zeroed(stream, cols * geo::N_USED)?,
             k,
         })

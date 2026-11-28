@@ -3,8 +3,11 @@
 //! ([`HOST`]).
 
 use crate::GpuError;
+use crate::tensor::DeviceTensor;
+use cuda_core::CudaStream;
 use model::placement::{Device, Plan, Role};
 use std::ops::Range;
+use std::sync::{Arc, Mutex};
 
 /// The slot map's entry for an expert no card holds: the host computes it.
 pub const HOST: u32 = u32::MAX;
@@ -106,6 +109,16 @@ impl Slot {
 /// kernel reads it, whatever its bytes are. A load's map has capacity = live
 /// ([`SlotMap::from_rows`]); the residency machine frees and fills slots
 /// between passes through [`SlotMap::evict`] and [`SlotMap::admit`].
+///
+/// **Lending.** An expert homed on a tier ([`SlotMap::home`]) may be lent to
+/// a stage card slot ([`SlotMap::lend`]): its entry is the card slot, the
+/// tier entry it came from is kept, and [`SlotMap::evict`] gives it back to
+/// that entry instead of to the host. The tier's slot stays reserved for it,
+/// and the tier's counts ([`SlotMap::on_tier`], [`SlotMap::on_tier_of`]) are
+/// of the experts homed there, lent or not: a kernel that reads a count as
+/// the bound of the tier's slots keeps reading its stacks' length. The tier's
+/// view ([`SlotMap::tier_view`]) shows [`HOST`] for a lent expert, as for
+/// every expert the tier is not asked to compute.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlotMap {
     layers: Range<usize>,
@@ -115,13 +128,42 @@ pub struct SlotMap {
     tiers: usize,
     /// Per row, the experts on the stage card: its live count.
     on_card: Vec<usize>,
-    /// Per row and tier, the experts on that tier card: its live count.
+    /// Per row and tier, the experts homed on that tier card, lent or not.
     on_tier: Vec<[usize; MAX_TIERS]>,
     /// Per row, the stage card's slots.
     cap_card: Vec<usize>,
     /// Per row and tier, that tier card's slots.
     cap_tier: Vec<[usize; MAX_TIERS]>,
+    /// Per entry: the tier entry of an expert lent to the stage card
+    /// ([`SlotMap::lend`]), [`HOST`] for every other.
+    lent: Vec<u32>,
+    /// The card copies of the tiers' views ([`SlotMap::tier_places`]).
+    copies: TierCopies,
 }
+
+/// One tier's card copy of its view.
+type TierCopy = Arc<DeviceTensor<u32>>;
+
+/// The card copy of each tier's view of a [`SlotMap`], made once by the first
+/// reader that asks ([`SlotMap::tier_places`]) and shared by every reader of
+/// it and by the residency machine, which writes it as a lent expert moves.
+/// A map's clones share it; two maps are equal whatever copies they hold.
+#[derive(Clone, Default)]
+struct TierCopies(Arc<Mutex<[Option<TierCopy>; MAX_TIERS]>>);
+
+impl std::fmt::Debug for TierCopies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TierCopies")
+    }
+}
+
+impl PartialEq for TierCopies {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for TierCopies {}
 
 impl SlotMap {
     /// Experts `[0, n_l)` of every layer of `layers` in stage card slots
@@ -231,12 +273,14 @@ impl SlotMap {
         Ok(SlotMap {
             layers,
             n_expert,
+            lent: vec![HOST; slots.len()],
             slots,
             tiers: seen_tiers,
             cap_card: on_card.clone(),
             cap_tier: on_tier.clone(),
             on_card,
             on_tier,
+            copies: TierCopies::default(),
         })
     }
 
@@ -496,8 +540,10 @@ impl SlotMap {
 
     /// Send layer `layer`'s expert `id` from its slot to the host and return
     /// the slot, now free: the device's live count drops by one and its
-    /// capacity stays. Refused by name, the map unchanged: a layer or an id
-    /// outside the map, and an id the host computes already.
+    /// capacity stays. An expert lent to the stage card ([`SlotMap::lend`])
+    /// goes back to its home tier slot instead, and the tier's counts stay.
+    /// Refused by name, the map unchanged: a layer or an id outside the map,
+    /// and an id the host computes already.
     pub fn evict(&mut self, layer: usize, id: u32) -> Result<Slot, GpuError> {
         const WHAT: &str = "SlotMap::evict";
         let (at, i) = self.entry_at(layer, id, WHAT)?;
@@ -512,8 +558,204 @@ impl SlotMap {
                 ));
             }
         }
-        self.slots[at] = HOST;
+        self.slots[at] = std::mem::replace(&mut self.lent[at], HOST);
         Ok(slot)
+    }
+
+    /// Lend layer `layer`'s expert `id`, homed on a tier, to `card_slot`, a
+    /// free slot of the stage card: its entry becomes the card slot, the stage
+    /// card's live count grows by one, and the tier entry it came from is
+    /// kept for [`SlotMap::evict`] and [`SlotMap::home`]. Returns the home
+    /// slot. Refused by name, the map unchanged: a layer or an id outside the
+    /// map, an id not homed on a tier or lent already, a slot at or past the
+    /// stage card's capacity in the row, and a slot a live entry names.
+    pub fn lend(&mut self, layer: usize, id: u32, card_slot: u32) -> Result<Slot, GpuError> {
+        const WHAT: &str = "SlotMap::lend";
+        let (at, i) = self.entry_at(layer, id, WHAT)?;
+        let home = Slot::of(self.slots[at]);
+        if !matches!(home, Slot::Tier { .. }) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer} expert {id} is on {home:?}: only an expert on a tier is lent"
+                ),
+            ));
+        }
+        self.check_free_card_slot(i, layer, card_slot, WHAT)?;
+        self.lent[at] = std::mem::replace(&mut self.slots[at], card_slot);
+        self.on_card[i] += 1;
+        Ok(home)
+    }
+
+    /// Move layer `layer`'s expert `id` from its stage card slot to
+    /// `card_slot`, a free one, and return the slot it left, now free; the
+    /// expert's lent state ([`SlotMap::lend`]) and the live counts stay.
+    /// Refused by name, the map unchanged: a layer or an id outside the map,
+    /// an id the stage card does not hold, and a slot at or past the stage
+    /// card's capacity in the row or one a live entry names.
+    pub fn relocate(&mut self, layer: usize, id: u32, card_slot: u32) -> Result<u32, GpuError> {
+        const WHAT: &str = "SlotMap::relocate";
+        let (at, i) = self.entry_at(layer, id, WHAT)?;
+        let Slot::Card(from) = Slot::of(self.slots[at]) else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer} expert {id} is on {:?}, not on the stage card",
+                    Slot::of(self.slots[at])
+                ),
+            ));
+        };
+        self.check_free_card_slot(i, layer, card_slot, WHAT)?;
+        self.slots[at] = card_slot;
+        Ok(from)
+    }
+
+    /// Refuse, as `what`, a stage card slot of row `i` (layer `layer`) at or
+    /// past the capacity or named by a live entry.
+    fn check_free_card_slot(
+        &self,
+        i: usize,
+        layer: usize,
+        slot: u32,
+        what: &'static str,
+    ) -> Result<(), GpuError> {
+        let cap = self.cap_card[i];
+        if slot & TIER != 0 || !usize::try_from(slot).is_ok_and(|s| s < cap) {
+            return Err(GpuError::shape(
+                what,
+                format!("layer {layer}: card slot {slot} is past the stage card's {cap} slots"),
+            ));
+        }
+        let row = i * self.n_expert..(i + 1) * self.n_expert;
+        if let Some(other) = self.slots[row].iter().position(|&e| e == slot) {
+            return Err(GpuError::shape(
+                what,
+                format!("layer {layer}: card slot {slot} holds expert {other}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The tier slot layer `layer`'s expert `id` is homed on, whether it
+    /// runs there or is lent to the stage card; `None` for an expert not
+    /// homed on a tier, and for a layer or an id the map has no entry for.
+    #[must_use]
+    pub fn home(&self, layer: usize, id: u32) -> Option<Slot> {
+        let at = self.row_offset(layer)?;
+        let id = usize::try_from(id).ok().filter(|&id| id < self.n_expert)?;
+        let entry = match self.lent.get(at + id).copied()? {
+            HOST => *self.slots.get(at + id)?,
+            lent => lent,
+        };
+        match Slot::of(entry) {
+            home @ Slot::Tier { .. } => Some(home),
+            Slot::Card(_) | Slot::Host => None,
+        }
+    }
+
+    /// Layer `layer`'s expert `id` is lent to the stage card.
+    #[must_use]
+    pub fn is_lent(&self, layer: usize, id: u32) -> bool {
+        self.row_offset(layer)
+            .zip(usize::try_from(id).ok().filter(|&id| id < self.n_expert))
+            .and_then(|(at, id)| self.lent.get(at + id))
+            .is_some_and(|&e| e != HOST)
+    }
+
+    /// The experts of layer `layer` lent to the stage card; a layer the map
+    /// has no row for is refused by name.
+    pub fn lent_in(&self, layer: usize) -> Result<usize, GpuError> {
+        let at = self
+            .row_offset(layer)
+            .ok_or_else(|| self.outside(layer, "SlotMap::lent_in"))?;
+        Ok(self.lent[at..at + self.n_expert]
+            .iter()
+            .filter(|&&e| e != HOST)
+            .count())
+    }
+
+    /// The card copy of tier `tier`'s view, a row of places per layer at the
+    /// card copy's row offsets: made from [`SlotMap::tier_view`] by the first
+    /// call and the one every later call returns, so every reader of a tier's
+    /// places and the residency machine, which writes the words of a lent
+    /// expert as it moves, share one table. Load-time only: the first call
+    /// synchronizes. A tier the map does not name is refused by name.
+    pub fn tier_places(
+        &self,
+        stream: &CudaStream,
+        tier: usize,
+    ) -> Result<Arc<DeviceTensor<u32>>, GpuError> {
+        const WHAT: &str = "SlotMap::tier_places";
+        self.check_tier(tier, WHAT)?;
+        let mut copies = self
+            .copies
+            .0
+            .lock()
+            .map_err(|_| GpuError::shape(WHAT, "the tier copies' lock is poisoned"))?;
+        if let Some(copy) = &copies[tier] {
+            return Ok(Arc::clone(copy));
+        }
+        let copy = Arc::new(DeviceTensor::upload(
+            stream,
+            &self.tier_view(tier)?,
+            self.layers.len(),
+            self.n_expert,
+        )?);
+        copies[tier] = Some(Arc::clone(&copy));
+        Ok(copy)
+    }
+
+    /// The card copies of the tiers' views made so far ([`SlotMap::tier_places`]),
+    /// by tier: `None` for a tier no reader asked for.
+    #[must_use]
+    pub fn tier_copies(&self) -> Vec<Option<Arc<DeviceTensor<u32>>>> {
+        let copies = self
+            .copies
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        copies[..self.tiers].to_vec()
+    }
+
+    /// Read back every card copy of a tier's view made so far
+    /// ([`SlotMap::tier_places`]) and hold it to [`SlotMap::tier_view`]: the
+    /// tier cards the check covered, or a refusal naming the first tier,
+    /// layer and expert whose word differs from the map's. Blocking: it
+    /// synchronizes `stream`, so it runs between passes.
+    pub fn check_tier_copies(&self, stream: &CudaStream) -> Result<usize, GpuError> {
+        const WHAT: &str = "SlotMap::check_tier_copies";
+        let mut checked = 0;
+        for (tier, copy) in self.tier_copies().into_iter().enumerate() {
+            let Some(copy) = copy else { continue };
+            let mut card = vec![0u32; copy.buf().len()];
+            copy.buf().copy_to_host(stream, &mut card)?;
+            let map = self.tier_view(tier)?;
+            if let Some(at) = card.iter().zip(&map).position(|(c, m)| c != m) {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "tier {tier}: layer {} expert {} is {:#x} on the card and {:#x} in the \
+                         map",
+                        self.layers.start + at / self.n_expert,
+                        at % self.n_expert,
+                        card[at],
+                        map[at]
+                    ),
+                ));
+            }
+            if card.len() != map.len() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "tier {tier}: {} words on the card, {} in the map",
+                        card.len(),
+                        map.len()
+                    ),
+                ));
+            }
+            checked += 1;
+        }
+        Ok(checked)
     }
 
     /// The entry index of layer `layer`'s expert `id` and the row's index,
@@ -1447,5 +1689,128 @@ mod tests {
             &[(Device::Card(0), &[0]), (Device::Card(0), &[0])],
         );
         assert!(SlotMap::of_plan(&plan, 0, Some(1), 0..2, 8).is_err());
+    }
+
+    /// A row of six: card slots 0 and 1 live (capacity 3), tier 0 holding
+    /// experts 2 and 4 in slots 0 and 1, experts 3 and 5 on the host.
+    fn lending_map() -> SlotMap {
+        let h = HOST;
+        let mut map = SlotMap::from_rows(2..3, 6, vec![0, 1, TIER, h, TIER | 1, h]).expect("a row");
+        map.reserve_card(2, 3).expect("a spare slot");
+        map
+    }
+
+    /// A lent expert runs on the card: its entry is the card slot, the card's
+    /// count grows, the tier's counts and slots stay, the tier's view shows
+    /// HOST for it, and `home` still names its tier slot.
+    #[test]
+    fn a_lent_expert_runs_on_the_card_and_keeps_its_home() {
+        let h = HOST;
+        let mut map = lending_map();
+        let home = Slot::Tier { tier: 0, slot: 1 };
+        assert_eq!(map.home(2, 4), Some(home), "homed before the lend");
+        assert_eq!(map.lend(2, 4, 2).ok(), Some(home));
+        assert_eq!(map.slot(2, 4), Some(Slot::Card(2)));
+        assert_eq!(map.home(2, 4), Some(home), "homed while lent");
+        assert!(map.is_lent(2, 4) && !map.is_lent(2, 2) && !map.is_lent(2, 0));
+        assert_eq!(map.lent_in(2).ok(), Some(1));
+        assert_eq!(
+            (
+                map.on_card(2).ok(),
+                map.on_tier(2).ok(),
+                map.tier_capacity(0, 2).ok()
+            ),
+            (Some(3), Some(2), Some(2)),
+            "the tier's count is of the experts homed there, the stacks' length"
+        );
+        assert_eq!(map.stage_view(), [0, 1, h, h, 2, h]);
+        assert_eq!(
+            map.tier_view(0).ok(),
+            Some(vec![h, h, 0, h, h, h]),
+            "the tier does not compute a lent expert"
+        );
+        assert_eq!(map.home(2, 0), None, "a card expert has no home");
+        assert_eq!(map.home(2, 3), None, "a host expert has no home");
+    }
+
+    /// An eviction gives a lent expert back to its tier slot, not to the
+    /// host: the freed card slot is returned, the card's count drops, the
+    /// tier's counts do not move, and the tier's view shows the place again.
+    #[test]
+    fn evicting_a_lent_expert_returns_it_home() {
+        let h = HOST;
+        let mut map = lending_map();
+        let at_load = map.clone();
+        map.lend(2, 4, 2).expect("a free slot");
+        assert_eq!(map.evict(2, 4).ok(), Some(Slot::Card(2)));
+        assert_eq!(map, at_load, "the lend and the eviction cancel");
+        assert_eq!(map.slot(2, 4), Some(Slot::Tier { tier: 0, slot: 1 }));
+        assert!(!map.is_lent(2, 4));
+        assert_eq!(map.tier_view(0).ok(), Some(vec![h, h, 0, h, 1, h]));
+        assert_eq!(map.on_card(2).ok(), Some(2));
+    }
+
+    /// A relocated lent expert stays lent: only its card slot moves.
+    #[test]
+    fn a_relocated_lent_expert_stays_lent() {
+        let mut map = lending_map();
+        map.lend(2, 4, 2).expect("a free slot");
+        assert_eq!(map.evict(2, 0).ok(), Some(Slot::Card(0)));
+        assert_eq!(map.relocate(2, 4, 0).ok(), Some(2));
+        assert_eq!(map.slot(2, 4), Some(Slot::Card(0)));
+        assert!(map.is_lent(2, 4));
+        assert_eq!(map.evict(2, 4).ok(), Some(Slot::Card(0)));
+        assert_eq!(map.slot(2, 4), Some(Slot::Tier { tier: 0, slot: 1 }));
+    }
+
+    /// Each refusal names its cause and leaves the map unchanged.
+    #[test]
+    fn a_lend_and_a_relocation_refuse_by_name() {
+        let mut map = lending_map();
+        let before = map.clone();
+        let refused = |r: Result<(), crate::GpuError>, map: &SlotMap, why: &str| {
+            assert!(r.is_err(), "{why}");
+            assert_eq!(*map, before, "{why}: the map moved");
+        };
+        refused(map.lend(2, 0, 2).map(drop), &map, "an expert on the card");
+        refused(map.lend(2, 3, 2).map(drop), &map, "an expert on the host");
+        refused(
+            map.lend(2, 4, 1).map(drop),
+            &map,
+            "a slot another expert holds",
+        );
+        refused(map.lend(2, 4, 3).map(drop), &map, "a slot at the capacity");
+        refused(
+            map.lend(2, 4, TIER).map(drop),
+            &map,
+            "a slot with the tier bit",
+        );
+        refused(map.lend(1, 4, 2).map(drop), &map, "a layer outside");
+        refused(map.lend(2, 6, 2).map(drop), &map, "an id outside");
+        refused(
+            map.relocate(2, 4, 2).map(drop),
+            &map,
+            "a relocation of a tier expert",
+        );
+        refused(
+            map.relocate(2, 0, 1).map(drop),
+            &map,
+            "a relocation to a held slot",
+        );
+        refused(
+            map.relocate(2, 0, 3).map(drop),
+            &map,
+            "a relocation past the capacity",
+        );
+        map.lend(2, 4, 2).expect("a free slot");
+        let lent = map.clone();
+        assert!(
+            map.lend(2, 4, 2).is_err() && map == lent,
+            "a lent expert lent again"
+        );
+        assert!(
+            map.lend(2, 2, 2).is_err() && map == lent,
+            "a slot the lent holds"
+        );
     }
 }

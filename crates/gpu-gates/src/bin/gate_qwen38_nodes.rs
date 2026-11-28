@@ -63,6 +63,46 @@
 //!   exits naming the loss within [`LOST_BOUND_S`]. A stopped node 0 is then
 //!   continued: its held step fails, naming the node's release and the lost
 //!   card, and returns no token from the rows node 1 served after it.
+//! - Lend: the residency machine under `mid-p0-s1` with `BLOOMERY_NODE_LEND=1`
+//!   lends a tier expert to the stage card. A reseed names, in each tier
+//!   layer, the layer's first tier expert in the place of the seed's last
+//!   card expert, so the machine lends it at once (the clause needs no
+//!   skewed router). Node 0 with the tier on a fresh node 1 and the same plan
+//!   in one process (the tier a card of that process) each count the lent
+//!   experts (precondition: one in every layer the seed gave a card slot a
+//!   tier expert and two or more slots), hold the card's copy of the tier's
+//!   places to the map's view (`SlotMap::check_tier_copies`), and run the
+//!   history: the two runs are bit for bit each other's. A reseed back to the
+//!   load's seed then returns every lent expert to its tier (none lent in any
+//!   layer, the copy of the places the view again) and the history again is
+//!   the two tiers' bit for bit each other's and bit for bit the history of a
+//!   lending load that was only ever reseeded to the seed (nothing lent to
+//!   begin with): the recall leaves no state of what was lent, so the machine
+//!   lends again in the second history exactly as a fresh one does (each
+//!   lending load must have lent over its second history). That fresh load,
+//!   and the lent run, are held to the run of a machine that lends nothing
+//!   within the residency's stream rule (`GREEDY_MARGIN`: the greedy ids
+//!   equal or parted first at a near tie, every logits row before that within
+//!   the band), not bit for bit: the fresh load must have lent (its map says
+//!   how many), and a lend moves a tier expert to the card, which changes
+//!   nothing (the tier's rows join the card's in slot order), but the expert it
+//!   displaces from the card goes to the host, whose routed sum joins the
+//!   card's as one partial, so the one-card sum's association changes. The
+//!   band is too wide to say that is the only change, so the fresh and the
+//!   lendless load record, after each step, the experts the rule counted over
+//!   it with whether the host computed each before and after, and whether it
+//!   was lent: the fresh load's rows before the first step (or verify window,
+//!   whose unkept rows the rule does not count) that routes an expert the host
+//!   computes in one load and not in the other, or one that moved during it,
+//!   are the lendless load's bit for bit, and some of those steps routed a lent
+//!   expert, so a lent expert computes what the tier computed.
+//!   Each lent expert's bytes are in no resident page, so the machine hands
+//!   them to the page cache when it issues the admit (a read-ahead hint, the
+//!   map and the landing boundary untouched): after the reseed to the lent
+//!   order the machine hinted exactly the lent experts the map names, once
+//!   each and none failed, the bytes hinted are the bytes it moved to the
+//!   card (whole pages over each run), every lending history hinted at
+//!   least one, and the load that lends nothing hinted none.
 //!
 //! `--host` lowers an equal partition of expert ids into the loaded map.
 //! The functional gate's loopback server has 20 GiB of host room; measurements
@@ -101,6 +141,7 @@ mod node_proc;
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use std::cell::RefCell;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
@@ -117,15 +158,16 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model, SplitWalk};
     use bloomery_gpu::host::PoisonKind;
+    use bloomery_gpu::host::lane::LaneStats;
     use bloomery_gpu::host::node::wire::{In, MAX_FRAME, Out as Payload, Tag};
     use bloomery_gpu::host::node::{NodeOpen, TierNode, node_cards};
-    use bloomery_gpu::host::slots::SlotMap;
+    use bloomery_gpu::host::slots::{Slot, SlotMap};
     use bloomery_gpu::host::step::Chain;
-    use bloomery_gpu::host::swap::Residency;
+    use bloomery_gpu::host::swap::{NODE_LEND, Residency};
     use bloomery_gpu::host::tier::{ReplyRows, TierAct, TierCard, TierOpen, TierSet, TierShape};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{
-        GateError, checks_failed, data_dir, prose_ids, ref_model_path, verdict,
+        GREEDY_MARGIN, GateError, checks_failed, data_dir, prose_ids, ref_model_path, verdict,
     };
     use bloomery_gpu_gates::{record, tier};
     use bloomery_levers::{
@@ -191,12 +233,44 @@ mod gate {
         Hold0 {
             gib: u64,
         },
+        /// A load of the lend clause: its tier on node 1 or a card of this
+        /// process, the run written to `out` (`LendArm`).
+        Lend {
+            arm: LendArm,
+            gib: u64,
+            out: PathBuf,
+        },
+    }
+
+    /// Which load of the lend clause a [`Mode::Lend`] is.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LendArm {
+        /// The tier on node 1, the machine lending.
+        Node,
+        /// The tier a card of this process, the machine lending.
+        Local,
+        /// The tier a card of this process, the machine lending nothing.
+        Base,
+        /// The tier a card of this process, the machine lending, reseeded to
+        /// the seed alone: nothing lent to it before its history.
+        Fresh,
+    }
+
+    impl LendArm {
+        fn word(self) -> &'static str {
+            match self {
+                LendArm::Node => "node",
+                LendArm::Local => "local",
+                LendArm::Base => "base",
+                LendArm::Fresh => "fresh",
+            }
+        }
     }
 
     fn parse_args(args: &[String]) -> Result<(Mode, bool), GateError> {
         const USAGE: &str = "usage: gate_qwen38_nodes [--host] (node 0 modes, run by the gate: --node0 \
                              <gib> <out> <server pid> | --hold0 <gib>) or --measure \
-                             <local|node> <gib> or --decode0 <gib> <tokens> <out> or --history <gib> <out>";
+                             <local|node> <gib> or --decode0 <gib> <tokens> <out> or --history <gib> <out> or --lend <node|local|base|fresh> <gib> <out>";
         let host = args.first().is_some_and(|a| a == "--host");
         let args = if host { &args[1..] } else { args };
         let gib = |s: &str, max: u64| -> Result<u64, GateError> {
@@ -238,6 +312,21 @@ mod gate {
             }
             ["--hold0", g] => Mode::Hold0 {
                 gib: gib(g, TOP_GIB)?,
+            },
+            [
+                "--lend",
+                arm @ ("node" | "local" | "base" | "fresh"),
+                g,
+                out,
+            ] => Mode::Lend {
+                arm: match arm {
+                    "node" => LendArm::Node,
+                    "local" => LendArm::Local,
+                    "fresh" => LendArm::Fresh,
+                    _ => LendArm::Base,
+                },
+                gib: gib(g, TOP_GIB)?,
+                out: PathBuf::from(out),
             },
             ["--measure", arm @ ("local" | "node"), g] => Mode::Measure {
                 arm: arm.to_string(),
@@ -318,8 +407,19 @@ mod gate {
             )
         }
 
-        /// A load of `plan`, its session over [`CTX`] positions.
+        /// A load of `plan` with the residency off, its session over [`CTX`]
+        /// positions.
         fn open(&self, plan: &Plan<'_>) -> Result<Session<Body38>, GateError> {
+            self.open_under(plan, Residency::Off)
+        }
+
+        /// A load of `plan` under `residency`, its session over [`CTX`]
+        /// positions.
+        fn open_under(
+            &self,
+            plan: &Plan<'_>,
+            residency: Residency,
+        ) -> Result<Session<Body38>, GateError> {
             let t0 = Instant::now();
             let file = Split::open(&self.path)
                 .map_err(|e| format!("open {}: {e}", self.path.display()))?;
@@ -330,7 +430,7 @@ mod gate {
                 0,
                 self.host,
                 self.ub,
-                Residency::Off,
+                residency,
                 bloomery_levers::ChurnHosting::Hosted,
                 1,
             )?;
@@ -989,6 +1089,23 @@ mod gate {
         }
     }
 
+    /// The plan a history load runs: the tier on the node at `addr`, or a card
+    /// of this process.
+    fn history_plan<'a>(
+        c: &'a Common,
+        machine: &'a mut Option<Machine>,
+        addr: Option<SocketAddr>,
+        gib: u64,
+    ) -> Result<Plan<'a>, GateError> {
+        if let Some(addr) = addr {
+            return child_plan(c, machine, addr, gib);
+        }
+        let own = bloomery_gpu::census()?;
+        let card = own.first().ok_or("no local tier card")?;
+        let m = machine.insert(c.machine(spec_of_device(card))?);
+        plan_under(c, m, gib)?.map_err(|why| format!("under {gib} GiB: {why}").into())
+    }
+
     /// Save the local or remote history, check its structure, and optionally
     /// kill the loopback server for the lost-node clause.
     fn run_history(
@@ -1004,14 +1121,7 @@ mod gate {
             _ => return Err("the history needs exactly one tier".into()),
         };
         let mut machine = None;
-        let plan = if let Some(addr) = addr {
-            child_plan(c, &mut machine, addr, gib)?
-        } else {
-            let own = bloomery_gpu::census()?;
-            let card = own.first().ok_or("no local tier card")?;
-            let m = machine.insert(c.machine(spec_of_device(card))?);
-            plan_under(c, m, gib)?.map_err(|why| format!("under {gib} GiB: {why}"))?
-        };
+        let plan = history_plan(c, &mut machine, addr, gib)?;
         let capacity = if c.node_host {
             let resident = c.inputs.plan_with(
                 plan.machine,
@@ -1496,6 +1606,705 @@ mod gate {
         Ok(node1_lost && node0_lost)
     }
 
+    /// The residency the lend clause's loads run under: no pinned seed expert,
+    /// one spare slot a layer.
+    const LEND_RESIDENCY: Residency = Residency::Mid {
+        pinned: 0,
+        spares: 1,
+    };
+
+    /// The reseed orders of the lend clause, per layer of the machine, each
+    /// naming every id: `seed` the card set as the load seeded it, then the
+    /// other ids ascending; `lent` the same with the layer's first tier expert
+    /// in the place of the seed's last card expert (the one it ranks after),
+    /// for a layer with a tier expert and two or more card slots, else the
+    /// seed.
+    struct LendOrders {
+        seed: Vec<Vec<u32>>,
+        lent: Vec<Vec<u32>>,
+        /// The layers whose `lent` order names a tier expert.
+        layers: Vec<usize>,
+    }
+
+    fn lend_orders(s: &Session<Body38>) -> Result<LendOrders, GateError> {
+        let m = s.model();
+        let hybrid = m.body(NAME)?.hybrid();
+        let slots = hybrid.slots();
+        let machine = hybrid.swap().ok_or("the load runs no residency machine")?;
+        let n = u32::try_from(slots.n_expert())?;
+        let mut out = LendOrders {
+            seed: Vec::new(),
+            lent: Vec::new(),
+            layers: Vec::new(),
+        };
+        for l in slots.layers() {
+            let card = machine.seed(l)?;
+            let mut seed = card.clone();
+            seed.extend((0..n).filter(|id| !card.contains(id)));
+            let tier = (0..n).find(|&id| matches!(slots.slot(l, id), Some(Slot::Tier { .. })));
+            let lent = match (tier, card.split_last()) {
+                (Some(t), Some((&last, head))) if !head.is_empty() => {
+                    out.layers.push(l);
+                    let mut v = head.to_vec();
+                    v.extend([t, last]);
+                    let named = v.clone();
+                    v.extend((0..n).filter(|id| !named.contains(id)));
+                    v
+                }
+                _ => seed.clone(),
+            };
+            out.seed.push(seed);
+            out.lent.push(lent);
+        }
+        Ok(out)
+    }
+
+    /// The experts lent to the stage card in each of `layers`, from the map.
+    fn lent_in(s: &Session<Body38>, layers: &[usize]) -> Result<Vec<usize>, GateError> {
+        let slots = s.model().body(NAME)?.hybrid().slots();
+        layers
+            .iter()
+            .map(|&l| slots.lent_in(l).map_err(GateError::from))
+            .collect()
+    }
+
+    /// The map and the cards agree on where the tier's experts run: the card
+    /// copy of each tier's places is the map's view, and the tier's set is the
+    /// homes the map holds. Printed as `what`.
+    fn lend_tables(s: &Session<Body38>, what: &str) -> Result<bool, GateError> {
+        let m = s.model();
+        let hybrid = m.body(NAME)?.hybrid();
+        let slots = hybrid.slots();
+        let checked = slots.check_tier_copies(m.gpu().stream());
+        let tier = hybrid.tiers().first().ok_or("the load holds no tier")?;
+        let homes = TierSet::of_map(slots, 0)? == *tier.set();
+        let ok = checked.as_ref().is_ok_and(|&n| n > 0) && homes;
+        match &checked {
+            Ok(n) => println!(
+                "lend {what}: the card's copy of the tier's places is the map's view over {n} \
+                 tier cards, the tier's set the map's homes {homes}: {}",
+                verdict(ok)
+            ),
+            Err(e) => println!("FAIL lend {what}: {e}"),
+        }
+        Ok(ok)
+    }
+
+    /// The experts lent to the stage card in every layer of the map.
+    fn lent_total(s: &Session<Body38>) -> Result<usize, GateError> {
+        let slots = s.model().body(NAME)?.hybrid().slots();
+        let mut total = 0;
+        for l in slots.layers() {
+            total += slots.lent_in(l)?;
+        }
+        Ok(total)
+    }
+
+    /// What the machine's read-ahead hints and promotions stood at: its lane
+    /// counters and the bytes it moved to the stage card.
+    struct Hints {
+        lane: LaneStats,
+        moved: u64,
+    }
+
+    /// The bound on the wait for the machine's hint threads to finish what
+    /// they were handed.
+    const HINT_BOUND: Duration = Duration::from_secs(10);
+
+    /// The machine's [`Hints`] once its hint threads have finished every hint
+    /// handed to them (each done or failed), or after [`HINT_BOUND`].
+    fn hints_of(s: &Session<Body38>) -> Result<Hints, GateError> {
+        let machine = s
+            .model()
+            .body(NAME)?
+            .hybrid()
+            .swap()
+            .ok_or("the load runs no residency machine")?;
+        let t0 = Instant::now();
+        loop {
+            let lane = machine.lane_stats();
+            if lane.advised + lane.advise_failed >= lane.advise_sent || t0.elapsed() > HINT_BOUND {
+                return Ok(Hints {
+                    lane,
+                    moved: machine.moved_bytes().0,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The hint line of the lend clause (module doc): the machine's hints
+    /// since `base`. `lent` is the experts the map names lent, which the
+    /// machine issued one admit each for: exactly that many were hinted, and
+    /// their bytes are the bytes it moved to the card to within the pages the
+    /// runs round out to; `None` (a history) is at least one hint, a load that
+    /// lends nothing exactly none. Every hint done, none failed.
+    fn lend_hints(
+        s: &Session<Body38>,
+        arm: LendArm,
+        what: &str,
+        base: &Hints,
+        lent: Option<usize>,
+    ) -> Result<bool, GateError> {
+        // The most pages a run rounds out to over the 3 runs of an expert.
+        const PAGE_SLACK: u64 = 3 * 2 * 4096;
+        let now = hints_of(s)?;
+        let sent = now.lane.advise_sent - base.lane.advise_sent;
+        let done = now.lane.advised - base.lane.advised;
+        let failed = now.lane.advise_failed - base.lane.advise_failed;
+        let bytes = now.lane.advised_bytes - base.lane.advised_bytes;
+        let moved = now.moved - base.moved;
+        let count = match (arm, lent) {
+            (LendArm::Base, _) => sent == 0,
+            (_, Some(n)) => sent == n as u64,
+            (_, None) => sent > 0,
+        };
+        let covered = match (arm, lent) {
+            (LendArm::Base, _) | (_, None) => true,
+            (_, Some(n)) => bytes >= moved && bytes - moved <= n as u64 * PAGE_SLACK && moved > 0,
+        };
+        let ok = count && covered && failed == 0 && done == sent;
+        println!(
+            "lend {} {what}: the machine hinted {sent} lent experts ({bytes} B; it moved {moved} B \
+             to the card), {done} done, {failed} failed, the map names {lent:?}: {}",
+            arm.word(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// What a history's steps and verify windows routed, as the lend clause's
+    /// exactness line reads it ([`Recorder`]).
+    #[derive(Debug, Default, PartialEq)]
+    struct Routed {
+        windows: Vec<RoutedWindow>,
+    }
+
+    /// One step or verify window: the rows the run held after it, and the
+    /// experts the rule counted over it. The rule counts the rows a window
+    /// keeps, so a window's other rows route experts that are not here.
+    #[derive(Debug, PartialEq)]
+    struct RoutedWindow {
+        rows: usize,
+        picks: Vec<Pick>,
+    }
+
+    /// An expert the rule counted over a window, with whether the host
+    /// computed it, and whether it was lent to the card, before the window
+    /// and after it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Pick {
+        layer: usize,
+        id: u32,
+        host: [bool; 2],
+        lent: [bool; 2],
+    }
+
+    /// The map's states a [`Recorder`] compares across a window, `layer
+    /// index * experts + id`.
+    struct Seen {
+        usage: Vec<u64>,
+        host: Vec<bool>,
+        lent: Vec<bool>,
+    }
+
+    impl Seen {
+        fn of(s: &Session<Body38>) -> Result<Seen, GateError> {
+            let hybrid = s.model().body(NAME)?.hybrid();
+            let slots = hybrid.slots();
+            let usage = hybrid
+                .swap()
+                .ok_or("the load runs no residency machine")?
+                .rule()
+                .usage()
+                .to_vec();
+            let n = u32::try_from(slots.n_expert())?;
+            if usage.len() != slots.layers().len() * slots.n_expert() {
+                return Err("the rule's layers are not the map's".into());
+            }
+            let (mut host, mut lent) = (Vec::new(), Vec::new());
+            for l in slots.layers() {
+                for id in 0..n {
+                    host.push(matches!(slots.slot(l, id), Some(Slot::Host)));
+                    lent.push(slots.is_lent(l, id));
+                }
+            }
+            Ok(Seen { usage, host, lent })
+        }
+    }
+
+    /// A [`Routed`] built over a history: [`Recorder::new`] right after the
+    /// history's clear, [`Recorder::note`] after each step and window.
+    struct Recorder {
+        routed: Routed,
+        seen: Seen,
+    }
+
+    impl Recorder {
+        fn new(s: &Session<Body38>) -> Result<Recorder, GateError> {
+            Ok(Recorder {
+                routed: Routed::default(),
+                seen: Seen::of(s)?,
+            })
+        }
+
+        fn note(&mut self, s: &Session<Body38>, rows: usize) -> Result<(), GateError> {
+            let now = Seen::of(s)?;
+            let slots = s.model().body(NAME)?.hybrid().slots();
+            let n = slots.n_expert();
+            let mut picks = Vec::new();
+            for (i, layer) in slots.layers().enumerate() {
+                for id in 0..n {
+                    let k = i * n + id;
+                    if now.usage[k] != self.seen.usage[k] {
+                        picks.push(Pick {
+                            layer,
+                            id: u32::try_from(id)?,
+                            host: [self.seen.host[k], now.host[k]],
+                            lent: [self.seen.lent[k], now.lent[k]],
+                        });
+                    }
+                }
+            }
+            self.routed.windows.push(RoutedWindow { rows, picks });
+            self.seen = now;
+            Ok(())
+        }
+    }
+
+    /// Where a lend load's [`Routed`] is written.
+    fn routed_of(out: &Path) -> PathBuf {
+        let mut name = out.as_os_str().to_owned();
+        name.push(".routed");
+        PathBuf::from(name)
+    }
+
+    /// `routed` written to `path` for the gate to read back
+    /// ([`read_routed`]): per window its rows, then each pick as its layer,
+    /// its id and its four flags.
+    fn write_routed(routed: &Routed, path: &Path) -> Result<(), GateError> {
+        let mut o = Payload::default();
+        o.len(routed.windows.len());
+        for w in &routed.windows {
+            o.len(w.rows);
+            let mut words = Vec::with_capacity(3 * w.picks.len());
+            for p in &w.picks {
+                let flags = [p.host[0], p.host[1], p.lent[0], p.lent[1]]
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |f, (bit, &on)| f | (u32::from(on) << bit));
+                words.extend([u32::try_from(p.layer)?, p.id, flags]);
+            }
+            o.u32s(&words);
+        }
+        std::fs::write(path, o.done()).map_err(|e| format!("{}: {e}", path.display()).into())
+    }
+
+    /// The routing [`write_routed`] wrote to `path`; a file of another form
+    /// is refused by name.
+    fn read_routed(path: &Path) -> Result<Routed, GateError> {
+        let b = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut i = In::new(&b);
+        let routed = (|| {
+            let n = i.len("windows")?;
+            let windows = (0..n)
+                .map(|_| {
+                    let rows = i.len("a window's rows")?;
+                    let words = i.u32s("a window's picks")?;
+                    if words.len() % 3 != 0 {
+                        return Err(format!("a window's picks are {} words", words.len()));
+                    }
+                    let picks = words
+                        .as_chunks::<3>()
+                        .0
+                        .iter()
+                        .map(|w| -> Result<Pick, String> {
+                            let bit = |b: u32| (w[2] >> b) & 1 != 0;
+                            Ok(Pick {
+                                layer: usize::try_from(w[0])
+                                    .map_err(|_| format!("a layer {}", w[0]))?,
+                                id: w[1],
+                                host: [bit(0), bit(1)],
+                                lent: [bit(2), bit(3)],
+                            })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    Ok(RoutedWindow { rows, picks })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            i.end()?;
+            Ok::<_, String>(Routed { windows })
+        })();
+        routed.map_err(|e| format!("{}: {e}", path.display()).into())
+    }
+
+    /// Where two histories' routing first may part, and whether it ran a
+    /// lent expert before.
+    #[derive(Debug, PartialEq)]
+    struct Parting {
+        /// The rows before the first step or verify window that may route an
+        /// expert the host computes in one history and not in the other, or
+        /// one that moved between the host and the card during it; all the
+        /// rows when no step does.
+        row: usize,
+        /// The steps before it that routed an expert lent to the card over the
+        /// whole step, in the first history.
+        lent_steps: usize,
+    }
+
+    /// Whether the routing of one step of `on` and of `off` may part: an
+    /// expert counted by one and not the other, or one the host computes
+    /// before or after the step in one and not in the other, or one that
+    /// moved between the host and the card over it.
+    fn parts(on: &RoutedWindow, off: &RoutedWindow) -> bool {
+        let sorted = |w: &RoutedWindow| {
+            let mut v: Vec<Pick> = w.picks.clone();
+            v.sort_by_key(|p| (p.layer, p.id));
+            v
+        };
+        let (a, b) = (sorted(on), sorted(off));
+        a.len() != b.len()
+            || a.iter().zip(&b).any(|(p, q)| {
+                (p.layer, p.id) != (q.layer, q.id) || p.host != q.host || p.host[0] != p.host[1]
+            })
+    }
+
+    /// The [`Parting`] of `on`'s routing against `off`'s, refused by name when
+    /// the two histories' steps and windows do not line up.
+    fn split_of(on: &Routed, off: &Routed) -> Result<Parting, String> {
+        let lined = on.windows.len() == off.windows.len()
+            && on
+                .windows
+                .iter()
+                .zip(&off.windows)
+                .all(|(a, b)| a.rows == b.rows);
+        if !lined {
+            return Err("the two histories' steps and windows do not line up".into());
+        }
+        let (mut row, mut lent_steps) = (0, 0);
+        for (a, b) in on.windows.iter().zip(&off.windows) {
+            // A step adds one row; a verify window several, and the rule counts
+            // only those it keeps.
+            if a.rows != row + 1 || parts(a, b) {
+                break;
+            }
+            lent_steps += usize::from(a.picks.iter().any(|p| p.lent == [true, true]));
+            row = a.rows;
+        }
+        Ok(Parting { row, lent_steps })
+    }
+
+    /// The first row of logits that parts between `a` and `b` in a bit.
+    fn first_row_apart(a: &Run, b: &Run) -> Option<usize> {
+        a.logits.iter().zip(&b.logits).position(|(x, y)| {
+            x.len() != y.len() || x.iter().zip(y).any(|(p, q)| p.to_bits() != q.to_bits())
+        })
+    }
+
+    /// Whether the rows before `split` are bit for bit the same (`apart` the
+    /// first row that is not) and a lent expert was routed over them.
+    fn exact(split: &Parting, apart: Option<usize>) -> bool {
+        split.lent_steps > 0 && apart.is_none_or(|a| a >= split.row)
+    }
+
+    /// The lend clause's exactness line (module doc): `on` against `off`,
+    /// each with the routing it recorded.
+    fn lend_exact(what: &str, on: (&Run, &Routed), off: (&Run, &Routed)) -> bool {
+        let split = match split_of(on.1, off.1) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("FAIL {what}: {e}");
+                return false;
+            }
+        };
+        let apart = first_row_apart(on.0, off.0);
+        let ok = exact(&split, apart);
+        println!(
+            "{} {what}: the {} rows before the first step that may route an expert the host \
+             computes in one load and not in the other are bit for bit the lendless run's (first \
+             row apart {apart:?}), {} of those steps routed a lent expert",
+            if ok { "ok" } else { "FAIL" },
+            split.row,
+            split.lent_steps
+        );
+        ok
+    }
+
+    /// One load of the lend clause (`--lend <arm> <gib> <out>`, the module
+    /// doc's Lend): the plan under `gib` GiB opened under [`LEND_RESIDENCY`],
+    /// the machine lending when [`NODE_LEND`] is set (the clause's loads that lend
+    /// have it, the base has not; any other pairing is refused here). The base
+    /// and the fresh load are reseeded to the seed alone and write their
+    /// history to `out` and its routing ([`Routed`]) to `out`'s `.routed`; the
+    /// fresh load's machine must have lent over it, and the places' copy is
+    /// the map's view at its end. A load the clause lends to (`Local`, `Node`)
+    /// is reseeded to the lent order, its lent experts counted, the places'
+    /// copy held to the view, its history written to `out`; then reseeded back
+    /// to the seed, no expert lent in any layer, the copy held again, its
+    /// history written to `out`'s `.back`, the machine having lent again over
+    /// it.
+    fn lend_run(c: &Common, arm: LendArm, gib: u64, out: &Path) -> Result<bool, GateError> {
+        let lends = arm != LendArm::Base;
+        let asked = bloomery_levers::node_lend()?;
+        if asked != lends {
+            return Err(format!(
+                "{NODE_LEND} is {} in the {} arm of the lend clause",
+                if asked { "set" } else { "unset" },
+                arm.word()
+            )
+            .into());
+        }
+        let addr = (arm == LendArm::Node).then(lever_addr).transpose()?;
+        let mut machine = None;
+        let plan = history_plan(c, &mut machine, addr, gib)?;
+        let mut s = c.open_under(&plan, LEND_RESIDENCY)?;
+        let orders = lend_orders(&s)?;
+        fn refs(v: &[Vec<u32>]) -> Vec<&[u32]> {
+            v.iter().map(Vec::as_slice).collect()
+        }
+        let mut ok = true;
+        let reseed = |s: &mut Session<Body38>, v: &[Vec<u32>]| -> Result<(), GateError> {
+            s.residency_reseed(&refs(v))?
+                .ok_or("the load runs no residency machine")?;
+            Ok(())
+        };
+        let lent_layers = &orders.layers;
+        let hint0 = hints_of(&s)?;
+        if matches!(arm, LendArm::Node | LendArm::Local) {
+            let pre = !lent_layers.is_empty();
+            println!(
+                "lend {}: the lent order names a tier expert in {} layers of the seed: {}",
+                arm.word(),
+                lent_layers.len(),
+                verdict(pre)
+            );
+            ok &= pre;
+            reseed(&mut s, &orders.lent)?;
+            let lent = lent_in(&s, lent_layers)?;
+            let every = lent.iter().all(|&n| n == 1);
+            let total = lent_total(&s)?;
+            let only = total == lent_layers.len();
+            println!(
+                "lend {}: after the reseed {} experts are lent, one in each of the {} layers \
+                 asked: {}",
+                arm.word(),
+                total,
+                lent_layers.len(),
+                verdict(every && only)
+            );
+            ok &= every && only;
+            ok &= lend_tables(&s, &format!("{} after the reseed", arm.word()))?;
+            ok &= lend_hints(&s, arm, "after the reseed", &hint0, Some(total))?;
+        } else {
+            reseed(&mut s, &orders.seed)?;
+        }
+        let run = if matches!(arm, LendArm::Base | LendArm::Fresh) {
+            let rec = RefCell::new(None::<Recorder>);
+            let run = q38_history::history_with(
+                &mut s,
+                &c.ids,
+                |s| {
+                    *rec.borrow_mut() = Some(Recorder::new(s)?);
+                    Ok(())
+                },
+                |s, rows| {
+                    rec.borrow_mut()
+                        .as_mut()
+                        .ok_or("the history ran a step before its clear")?
+                        .note(s, rows)
+                },
+            )?;
+            let rec = rec
+                .into_inner()
+                .ok_or("the history ended without its clear")?;
+            write_routed(&rec.routed, &routed_of(out))?;
+            run
+        } else {
+            q38_history::history(&mut s, &c.ids, |_| Ok(()))?
+        };
+        write_run(&run, out)?;
+        if lends {
+            ok &= lend_tables(&s, &format!("{} after the history", arm.word()))?;
+        }
+        ok &= lend_hints(&s, arm, "after the history", &hint0, (!lends).then_some(0))?;
+        if arm == LendArm::Fresh {
+            let n = lent_total(&s)?;
+            println!(
+                "lend fresh: the machine lent {n} experts over the history: {}",
+                verdict(n > 0)
+            );
+            ok &= n > 0;
+        }
+        if !matches!(arm, LendArm::Node | LendArm::Local) {
+            return Ok(ok);
+        }
+        reseed(&mut s, &orders.seed)?;
+        let total = lent_total(&s)?;
+        println!(
+            "lend {}: after the reseed back {total} experts are lent: {}",
+            arm.word(),
+            verdict(total == 0)
+        );
+        ok &= total == 0;
+        ok &= lend_tables(&s, &format!("{} after the reseed back", arm.word()))?;
+        let hint1 = hints_of(&s)?;
+        let again = q38_history::history(&mut s, &c.ids, |_| Ok(()))?;
+        write_run(&again, &back_of(out))?;
+        let n = lent_total(&s)?;
+        println!(
+            "lend {}: the machine lent {n} experts again over the second history: {}",
+            arm.word(),
+            verdict(n > 0)
+        );
+        ok &= n > 0;
+        ok &= lend_tables(&s, &format!("{} after the second history", arm.word()))?;
+        ok &= lend_hints(&s, arm, "after the second history", &hint1, None)?;
+        Ok(ok)
+    }
+
+    /// Where a lend load's history after the reseed back is written.
+    fn back_of(out: &Path) -> PathBuf {
+        let mut name = out.as_os_str().to_owned();
+        name.push(".back");
+        PathBuf::from(name)
+    }
+
+    /// The top-1 logit's margin over the second in `row`.
+    fn top_margin(row: &[f32]) -> Option<f32> {
+        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for &x in row {
+            if x > a {
+                (a, b) = (x, a);
+            } else if x > b {
+                b = x;
+            }
+        }
+        (b > f32::NEG_INFINITY).then_some(a - b)
+    }
+
+    /// `on` against `off`, runs of machines that move experts between the
+    /// card and the host, whose sums run in another order: the greedy ids
+    /// equal or first parted at `on`'s near tie (its top-1 margin there below
+    /// [`GREEDY_MARGIN`]), every logits row before that within it.
+    fn within_stream_rule(what: &str, on: &Run, off: &Run) -> bool {
+        let parted = on.tokens.iter().zip(&off.tokens).position(|(a, b)| a != b);
+        let upto = parted.unwrap_or(on.logits.len().min(off.logits.len()));
+        let dmax = on
+            .logits
+            .iter()
+            .zip(&off.logits)
+            .take(upto)
+            .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
+            .fold(0.0f32, f32::max);
+        let margin = parted.and_then(|i| on.logits.get(i).and_then(|r| top_margin(r)));
+        let ids = on.tokens.len() == off.tokens.len()
+            && parted.is_none_or(|_| margin.is_some_and(|m| m < GREEDY_MARGIN));
+        let ok = ids && dmax < GREEDY_MARGIN && on.stage_nodes == off.stage_nodes;
+        println!(
+            "{} {what}: {} tokens, ids parted at {parted:?} (margin {margin:?}), the largest \
+             logit difference before it {dmax:.4}, stage graph nodes {:?} and {:?}",
+            if ok { "ok" } else { "FAIL" },
+            on.tokens.len(),
+            on.stage_nodes,
+            off.stage_nodes
+        );
+        ok
+    }
+
+    /// The lend clause (module doc): the base load, the fresh lending load, and
+    /// the lending load with its tier a card of its process and the one with
+    /// its tier on a fresh node 1, one child each, their runs held to each
+    /// other.
+    fn lend_clause(c: &Common, gib: u64) -> Result<bool, GateError> {
+        const ARMS: [LendArm; 4] = [LendArm::Base, LendArm::Fresh, LendArm::Local, LendArm::Node];
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let path = |arm: LendArm| dir.join(format!("{NAME}-lend-{}-{pid}.run", arm.word()));
+        let (mut n1, addr) = node1(None, c.node_host.then_some(GATE_HOST_ROOM))?;
+        let mut pass = true;
+        for arm in ARMS {
+            let mut cmd = Command::new(std::env::current_exe()?);
+            if c.node_host {
+                cmd.arg("--host");
+            }
+            cmd.args(["--lend", arm.word(), &gib.to_string()])
+                .arg(path(arm));
+            if arm != LendArm::Base {
+                cmd.env(NODE_LEND, "1");
+            }
+            if arm == LendArm::Node {
+                cmd.env(TIER_NODES, addr.to_string());
+            }
+            let mut child = Proc::spawn(cmd, "lend")?;
+            let status = child
+                .wait_within(Duration::from_secs(1800))?
+                .ok_or_else(|| format!("the {} load did not end within 1800 s", arm.word()))?;
+            println!(
+                "lend {} ended {status}: its clauses {}",
+                arm.word(),
+                verdict(status.success())
+            );
+            pass &= status.success();
+        }
+        n1.kill()?;
+        let read = |arm: LendArm, back: bool| -> Result<Run, GateError> {
+            let out = path(arm);
+            read_run(&if back { back_of(&out) } else { out })
+        };
+        let runs = (|| -> Result<_, GateError> {
+            Ok((
+                read(LendArm::Base, false)?,
+                read(LendArm::Fresh, false)?,
+                read(LendArm::Local, false)?,
+                read(LendArm::Local, true)?,
+                read(LendArm::Node, false)?,
+                read(LendArm::Node, true)?,
+                read_routed(&routed_of(&path(LendArm::Base)))?,
+                read_routed(&routed_of(&path(LendArm::Fresh)))?,
+            ))
+        })();
+        match runs {
+            Ok((base, fresh, local, local_back, node, node_back, base_routed, fresh_routed)) => {
+                pass &= same("lend: the tier on node 1 and in one process", &local, &node);
+                pass &= same(
+                    "lend: the recalled run on node 1 and in one process",
+                    &local_back,
+                    &node_back,
+                );
+                pass &= same(
+                    "lend: the recalled run and a lending load nothing was lent to",
+                    &fresh,
+                    &node_back,
+                );
+                pass &=
+                    within_stream_rule("lend: the lent run against the lendless run", &node, &base);
+                pass &= within_stream_rule(
+                    "lend: a lending load nothing was lent to against the lendless run",
+                    &fresh,
+                    &base,
+                );
+                pass &= lend_exact(
+                    "lend: a lending load nothing was lent to against the lendless run, by routing",
+                    (&fresh, &fresh_routed),
+                    (&base, &base_routed),
+                );
+            }
+            Err(e) => {
+                println!("FAIL lend: a run could not be read back: {e}");
+                pass = false;
+            }
+        }
+        for arm in ARMS {
+            let out = path(arm);
+            for f in [out.clone(), back_of(&out), routed_of(&out)] {
+                if f.exists() {
+                    remove_run(&f).map_err(|e| format!("remove {}: {e}", f.display()))?;
+                }
+            }
+        }
+        Ok(pass)
+    }
+
     fn gate(c: &Common) -> Result<(), GateError> {
         let mut pass = true;
         tier::sc("census: node 1's census over the channel is the plan's tier card")?;
@@ -1555,6 +2364,12 @@ mod gate {
         remove_run(&out).map_err(|e| format!("remove {}: {e}", out.display()))?;
         let killed = n1.wait_within(Duration::from_secs(60))?;
         println!("node 1 ended {killed:?} (killed by node 0's lost node clause)");
+
+        tier::sc(
+            "lend: a tier expert lent to the stage card by the residency, node 1 = one process; \
+             recalled, the lendless run",
+        )?;
+        pass &= lend_clause(c, gib)?;
 
         tier::sc("fed bits: node 1 with no model file, fed its rows by node 0 = one process")?;
         pass &= fed_history(c, gib, &want)?;
@@ -1779,6 +2594,13 @@ mod gate {
             }
             Mode::Decode { gib, tokens, out } => measure(&c, gib, Some((tokens, &out))),
             Mode::Hold0 { gib } => run_hold0(&c, gib),
+            Mode::Lend { arm, gib, out } => {
+                if lend_run(&c, arm, gib, &out)? {
+                    Ok(())
+                } else {
+                    Err(checks_failed())
+                }
+            }
             Mode::Measure { arm, gib } => {
                 if !bloomery_levers::tier_nodes()?.is_empty() {
                     return Err(
@@ -1834,6 +2656,7 @@ mod gate {
                 vec![],
                 vec!["--node0", "1", "out", "1"],
                 vec!["--hold0", "1"],
+                vec!["--lend", "node", "1", "out"],
                 vec!["--history", "1", "out"],
                 vec!["--measure", "local", "1"],
                 vec!["--measure", "node", "1"],
@@ -2221,6 +3044,107 @@ mod gate {
                     .contains("tier refused")
             );
             assert!(!path.exists());
+        }
+
+        #[test]
+        fn lend_exactness_reads_the_first_step_that_may_part() {
+            use super::{
+                Parting, Pick, Routed, RoutedWindow, Run, exact, first_row_apart, split_of,
+            };
+            let still = [false, false];
+            let pick = |layer, id, host: [bool; 2], lent: [bool; 2]| Pick {
+                layer,
+                id,
+                host,
+                lent,
+            };
+            let third = |host: [bool; 2]| RoutedWindow {
+                rows: 3,
+                picks: vec![pick(0, 3, host, still)],
+            };
+            let steps = |third: RoutedWindow| Routed {
+                windows: vec![
+                    RoutedWindow {
+                        rows: 1,
+                        picks: vec![pick(0, 1, still, still)],
+                    },
+                    RoutedWindow {
+                        rows: 2,
+                        picks: vec![pick(0, 7, still, [true, true])],
+                    },
+                    third,
+                ],
+            };
+            // The third step routes an expert the host computes in one history
+            // and the card in the other: two rows come before it, and one step
+            // before it routed a lent expert.
+            let split = split_of(&steps(third([true, true])), &steps(third(still))).unwrap();
+            assert_eq!(
+                split,
+                Parting {
+                    row: 2,
+                    lent_steps: 1
+                }
+            );
+            // The host computes it in both and it moved in neither: nothing parts.
+            let together = split_of(&steps(third([true, true])), &steps(third([true, true])));
+            assert_eq!(
+                together.unwrap(),
+                Parting {
+                    row: 3,
+                    lent_steps: 1
+                }
+            );
+            // It moved over the step in both: that step may part them.
+            let moved = split_of(&steps(third([false, true])), &steps(third([false, true])));
+            assert_eq!(moved.unwrap().row, 2);
+            // An expert lent only after its step was computed on the tier.
+            let late = Routed {
+                windows: vec![RoutedWindow {
+                    rows: 1,
+                    picks: vec![pick(0, 7, still, [false, true])],
+                }],
+            };
+            assert_eq!(split_of(&late, &late).unwrap().lent_steps, 0);
+            // A verify window ends the steps, whatever the rule counted over it.
+            let window = |rows| Routed {
+                windows: vec![
+                    RoutedWindow {
+                        rows: 1,
+                        picks: vec![],
+                    },
+                    RoutedWindow {
+                        rows,
+                        picks: vec![],
+                    },
+                ],
+            };
+            assert_eq!(split_of(&window(3), &window(3)).unwrap().row, 1);
+            // Histories whose steps do not line up are refused.
+            assert!(split_of(&window(3), &window(2)).is_err());
+            assert!(split_of(&window(3), &Routed::default()).is_err());
+
+            let rows = |apart: Option<usize>| Run {
+                logits: (0..4)
+                    .map(|r| vec![0.0, if Some(r) == apart { 1.5 } else { 1.0 }])
+                    .collect(),
+                ..Run::default()
+            };
+            assert_eq!(first_row_apart(&rows(None), &rows(None)), None);
+            assert_eq!(first_row_apart(&rows(Some(2)), &rows(None)), Some(2));
+            // Rows apart at the first step that may part them, or none: exact.
+            assert!(exact(&split, first_row_apart(&rows(Some(2)), &rows(None))));
+            assert!(exact(&split, None));
+            // A row apart before it (a lent expert computed another thing), or no
+            // lent expert routed before it (the rows prove nothing): not.
+            assert!(!exact(&split, first_row_apart(&rows(Some(1)), &rows(None))));
+            assert!(!exact(
+                &Parting {
+                    row: 2,
+                    lent_steps: 0
+                },
+                None
+            ));
         }
     }
 }
