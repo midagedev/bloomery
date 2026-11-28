@@ -1,0 +1,27 @@
+# rowsland: rowsm lever A (the F32 mcol router rows form, f32_gemv_mcol) rebased on main e99204ffd, a PROSE prompt, the DSpark draft RUNNING. The code card is rowsland-code.card (same paper).
+# The rowsmkinds prose sitting on the old base 10efa0e4d (rowsm kinds/sit-prose.log, head over base, 6 rounds, LCPP_WARM_EOS=stop) measured +3.00 % (head 224.84, base 218.30 tok/s; paired +2.78 % +-1.16, A/A -0.26 % +-1.23).
+# Its untimed look had the head windows 6.0 17.0 29.0 59.5 10.5 18.0 14.0 23.5 a request at m = 1..8 (e 3.0) and the per-width cost drops 0.69 0.65 0.66 0.77 0.51 0.66 0.59 ms: same-policy gain +4.8 % from
+# the measured drops, +4.0 % from the proxy s_m = 705 641 578 514 451 387 324 us. The timed run sat below that because the head arm's width chooser picked fewer tokens a window (the chooser term, not the kernel).
+# #1214 (in e99204ffd) changed only the one-token plain step (conv tails, norm_proj_q8_f32, qk_clip, the card sum: step 5.92 -> 5.43 ms), not the verify rows path: the cycle cost c_m at m >= 2 and the lever's
+# absolute saving a cycle are unchanged [derived]. A 0.49 ms faster plain step on 6 of ~178 windows a request moves the gain by about +0.0x pp; the faster plain step raises the width chooser's break-even
+# for drafting, and prose (e about 3, plain 3.4 % of the windows) sits nearer that boundary than code: the arm width histograms are read before the effect is.
+# Resource timeline of a cycle at m = 2 / 4 / 8: card chain 8.1 / ~10.0 / 14.4 ms + 2.4-2.5 ms host serial with it (the wall is their sum, one stream); DRAM floor 3.5 / 4.9 / 7.2 ms under the chain; PCIe taps only, NVMe 0.
+kind: ab
+question: on main e99204ffd, does the F32 mcol router rows form speed Inkling-2-Mini drafted decode on a prose prompt, new against base, with the draft running?
+term: decode tok/s (tg, N - 1 decode steps) @ n=512, depth 512 (the first 512 ids of the model corpus-prose.ids), Inkling-2-Mini UD-Q4_K_XL whole on the RTX 5090,
+  BLOOMERY_DRAFT=dspark under the width chooser (BLOOMERY_MTP_WIDTH unset = cost), no ignore_eos (LCPP_WARM_EOS=stop), one fresh server an arm and a round,
+  new (main e99204ffd + f32_gemv_mcol) over base (clean e99204ffd), (new - base) / base
+unit: %
+predict: 2.5..5.0
+rounds: 6
+sd: 1.2 % rowsmkinds prose sitting (6 rounds, paired +-1.16 %, A/A +-1.23 %: pooled round sd about 1.0 %); the A/A arm prices it again
+condition: one hold, one runner call (rowsland/sit3.sh run 6 prose), arms base (clean e99204ffd build), new (this tree), base2 (a byte copy of base: the A/A), each env=BLOOMERY_DRAFT=dspark,
+  DEPTH_SERVE_IDS=corpus-prose.ids, DEPTH_SERVE_N=512, D 512, LCPP_WARM_EOS=stop inside BOX_ENV. Valid only if EVERY arm server log holds `load draft=dspark` and an `mtp width`
+  record with windows >= 100 (a drafted run; a plain-path arm prices nothing), every ROW carries a `draft n/acc` column, every request kept 512 tokens, the 5090 alone
+  (no compute process but ours, no ComfyUI, uptime load under 4 at the start) and the A/A pair (base2 over base) lands within 1.5 % of 0. A ROW marked [cpu-busy] or [cold] is
+  read before it is used. Binaries: the two builds' sha256 recorded before and after, not rebuilt.
+decide-in: lever A pays on drafted prose decode on main: the PR carries both kinds' rows, each with its interval, the A/A and the width histograms
+decide-below: under 2.5 %: recompute the run expectation from the arms own `mtp width` windows and costs (rowsm kinds/sit_sum.py); a new arm whose width histogram has fewer wide windows than base is
+  the chooser term (the old prose sitting's miss), reported apart from the kernel term and not repeated; costs that did not drop by 0.4..0.8 ms at m = 2..4 mean the kernel did not save what the look measured
+decide-above: over 5.0 %: read the A/A and the arms width histograms first: a new path whose gate or widths differ from base is the chooser term, reported apart from the kernel term;
+  with the A/A clean, land

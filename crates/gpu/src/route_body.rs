@@ -1116,13 +1116,14 @@ macro_rules! sigmoid_router_instance {
                 }
                 let n_expert = launch_u32(what, "n_expert", N_EXPERT)?;
                 let tt = launch_u32(what, "t", t)?;
-                // The scores as one F32 tile GEMM over every token — the
-                // common `f32_tile_gemm`, bit for bit this body's
+                // The scores over every token — the common F32 product
+                // (`enqueue_f32_cols`: a verify's few tokens a warp a row, a
+                // pass's the tile GEMM), bit for bit this body's
                 // per-(token, expert) gemv (the same lane walk,
                 // `f32_lane_partials`, and the same warp tree,
                 // `gemv_lane_sums`) — then the score's scalar over its
                 // logits, in place. The pick launch is unchanged.
-                wide.enqueue_f32_tile(stream, w, x, t, probs)?;
+                wide.enqueue_f32_cols(gpu.q8f32(), stream, w, x, t, probs)?;
                 gpu.elem()
                     .enqueue_sigmoid_rows(stream, probs, N_EXPERT * t)?;
                 let prep = self
@@ -1718,8 +1719,8 @@ pub mod sigmoid_floor_256_6 {
                     ),
                 ));
             }
-            // The tile GEMM uses the one-token row walk and warp sum tree.
-            wide.enqueue_f32_tile(stream, w, x, t, probs)?;
+            // The common F32 product uses the one-token row walk and warp sum tree.
+            wide.enqueue_f32_cols(gpu.q8f32(), stream, w, x, t, probs)?;
             gpu.elem().enqueue_sigmoid_rows(stream, probs, scores)?;
             let prep = self
                 .module

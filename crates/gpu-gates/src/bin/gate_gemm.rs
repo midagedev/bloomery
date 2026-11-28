@@ -311,6 +311,11 @@
 //! - `g32_f32tile`: `enqueue_f32_tile` bit for bit `enqueue_f32_gemv` over
 //!   chunks of up to eight columns at 96, 100, 128 and 512 rows, up to 4095
 //!   columns, nothing written past its output.
+//! - `g32_f32tile_mcol`: `enqueue_f32_gemv_mcol` bit for bit `enqueue_f32_tile`
+//!   (token-major) and `enqueue_f32_gemv` (row-major) at every column count
+//!   1..=8 over 1, 7, 96, 100, 128 and 512 rows of K 320 to 2560, and at a K of
+//!   32 values that the tile refuses; `enqueue_f32_cols` the same bits at 1 to 9
+//!   columns; nothing written past the output.
 //! - `dense_mma`: the dense prompt MMA of a compute capability 12 device for
 //!   BF16, MXFP8 and FP8_B128 weights (`enqueue_bf16_mma`,
 //!   `enqueue_e4m3_mma`) at ragged shapes (one
@@ -8066,6 +8071,119 @@ mod gate {
             Ok(ok)
         }
 
+        /// `f32_gemv_mcol` against the F32 tile and `f32_gemv`, bit for bit, at
+        /// every column count a verify launches: the router's 128 rows of 2304,
+        /// rows that are no multiple of a block's eight or the tile's 32, one
+        /// row, and K of 96 values (the tile takes a multiple of 64 only, so
+        /// that shape meets `f32_gemv` alone). The token-major output meets the
+        /// tile, the row-major `f32_gemv`; `enqueue_f32_cols` takes the warp-a-row
+        /// launch to eight columns and the tile past them.
+        fn f32_mcol_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            use bloomery_gpu::q8f32::{F32GemvMcolArgs, GemvOut};
+            if !wanted("g32_f32tile_mcol") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let mut ok = true;
+            for (rows, k) in [
+                (128usize, 2304usize),
+                (100, 2560),
+                (96, 2560),
+                (512, 320),
+                (7, 64),
+                (1, 320),
+                (33, 96),
+            ] {
+                let wh = activations(k, rows, 7700 + rows as u32);
+                let w = DeviceTensor::upload(stream, &wh, rows, k)?;
+                let tile_k = k.is_multiple_of(64);
+                for n in 1..=9usize {
+                    let wide = n > 8;
+                    if wide && !tile_k {
+                        continue;
+                    }
+                    let xh = activations(k, n, 7800 + n as u32);
+                    let xd = DeviceBuffer::from_host(stream, &xh)?;
+                    let sent = vec![SENT; rows * n + 64];
+                    let mut ym = DeviceBuffer::from_host(stream, &sent)?;
+                    let mut yr = DeviceBuffer::from_host(stream, &sent)?;
+                    let mut yc = DeviceBuffer::from_host(stream, &sent)?;
+                    let mut yt = DeviceBuffer::from_host(stream, &sent)?;
+                    if !wide {
+                        gpu.q8f32().enqueue_f32_gemv_mcol(
+                            stream,
+                            F32GemvMcolArgs {
+                                w: &w,
+                                x: &xd,
+                                m: n,
+                                out: GemvOut::TokenMajor,
+                                y: &mut ym,
+                            },
+                        )?;
+                        gpu.q8f32().enqueue_f32_gemv_mcol(
+                            stream,
+                            F32GemvMcolArgs {
+                                w: &w,
+                                x: &xd,
+                                m: n,
+                                out: GemvOut::RowMajor,
+                                y: &mut yr,
+                            },
+                        )?;
+                    }
+                    if tile_k {
+                        dev.g32.enqueue_f32_tile(stream, &w, &xd, n, &mut yt)?;
+                        dev.g32
+                            .enqueue_f32_cols(gpu.q8f32(), stream, &w, &xd, n, &mut yc)?;
+                    }
+                    stream.synchronize()?;
+                    let (got_m, got_r) = (ym.to_host_vec(stream)?, yr.to_host_vec(stream)?);
+                    let (got_c, got_t) = (yc.to_host_vec(stream)?, yt.to_host_vec(stream)?);
+                    let past = |v: &[f32], used: bool| {
+                        !used || v[rows * n..].iter().all(|x| x.to_bits() == SENT.to_bits())
+                    };
+                    let tail_ok = past(&got_m, !wide)
+                        && past(&got_r, !wide)
+                        && past(&got_c, tile_k)
+                        && past(&got_t, tile_k);
+                    let (mut vs_gemv, mut vs_tile, mut vs_cols) = (0usize, 0usize, 0usize);
+                    if !wide {
+                        let mut yg = DeviceBuffer::<f32>::zeroed(stream, rows * n)?;
+                        gpu.q8f32().enqueue_f32_gemv(stream, &w, &xd, n, &mut yg)?;
+                        let g = yg.to_host_vec(stream)?;
+                        for c in 0..n {
+                            for r in 0..rows {
+                                let want = g[r * n + c].to_bits();
+                                vs_gemv += usize::from(got_r[r * n + c].to_bits() != want)
+                                    + usize::from(got_m[c * rows + r].to_bits() != want);
+                                if tile_k {
+                                    vs_tile += usize::from(
+                                        got_m[c * rows + r].to_bits()
+                                            != got_t[c * rows + r].to_bits(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if tile_k {
+                        for i in 0..rows * n {
+                            vs_cols += usize::from(got_c[i].to_bits() != got_t[i].to_bits());
+                        }
+                    }
+                    let pass = vs_gemv == 0 && vs_tile == 0 && vs_cols == 0 && tail_ok;
+                    println!(
+                        "gemm32 case=g32_f32tile_mcol rows={rows} K={k} n={n} bits_differ_vs_f32_gemv={vs_gemv} \
+                         bits_differ_vs_tile={vs_tile} bits_differ_cols_vs_tile={vs_cols} \
+                         past_end_untouched={tail_ok} {}",
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            Ok(ok)
+        }
+
         /// The host API's refusals, each a named error: a case passes only
         /// when its call is an error whose text holds the case's own fragment
         /// (another check refusing first, or a launch error, does not).
@@ -10822,6 +10940,7 @@ mod gate {
             ok &= q2_0_case(&dev)?;
             ok &= remap_case(&dev)?;
             ok &= f32tile_case(&dev)?;
+            ok &= f32_mcol_case(&dev)?;
             ok &= dense_mma_case(&dev)?;
             ok &= norm_gate_case(gpu, false)?;
             ok &= norm_form_case(&dev)?;

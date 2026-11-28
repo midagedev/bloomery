@@ -916,7 +916,10 @@ gguf 7 2 0
 # PIN(2026-11-28): gpu 3858 -> 3862 blocks, new code, not old code relaxed: the streamed slot state's four card copies
 # (checkpoint/saved.rs read_halves, read_words, write_halves, write_words: one dtoh_2d or htod_2d each over a bounded
 # chunk), each with its SAFETY line.
-gpu 3862 490 10
+# PIN(2026-11-28): gpu 3862 -> 3864 blocks, a new kernel entry, not old code relaxed: q8f32.rs f32_gemv_mcol (the F32 gemv's
+# warp-a-row walk for the two to eight columns of a verify): its two blocks, the lane walk and the store of the sums, each with
+# its SAFETY line.
+gpu 3864 490 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

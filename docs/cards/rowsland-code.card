@@ -1,0 +1,31 @@
+# rowsland: rowsm lever A (the F32 mcol router rows form, f32_gemv_mcol) rebased on main e99204ffd, a CODE prompt, the DSpark draft RUNNING.
+# The first rowsm sitting sent ignore_eos, so the drafted Inkling seat ran plain steps (no `mtp width` record in its 12 server logs); the rowsmkinds
+# sitting (LCPP_WARM_EOS=stop, no ignore_eos) priced the lever on the old base 10efa0e4d: head over base +3.65 % +-0.89, A/A -0.37 +-1.25, tokens bit-identical.
+# This card prices it again on main e99204ffd, where #1214 folded the PLAIN step's conv tails (step 5.92 -> 5.43 ms) and #1208 changed the step's attention kernel.
+# Paper (rowsland/paper.md): a verify at m = 2..8 saves s_m = 705 641 578 514 451 387 324 us [derived, rowsm design.md s4]; the old base's look measured the per-width
+# drop 0.68 0.76 0.55 0.60 0.39 0.26 0.16 ms (code windows 8.0 8.5 11.5 17.0 10.0 19.0 25.5 33.0 a request at m = 1..8): same-policy gain +2.6 % (measured drops) .. +3.1 %
+# (proxy), the look's own tg ratio +3.6 .. +4.0 %. #1214 touched the one-token step (body.rs m = 1 conv tails, norm_proj_q8_f32, qk_clip, the card sum), not the verify rows
+# (pass.rs RowWalk, norm_proj_q8_f32_cols, enqueue_router_rows): the cycle cost c_m at m >= 2 and the lever's absolute saving a cycle are unchanged, and the plain
+# windows (6 % of a code request) get 0.49 ms faster, which moves the gain by +0.01 pp [derived]. The band stays [2.6, 4.0].
+# Resource timeline of a cycle at m = 2 / 4 / 8: card chain 8.1 / ~10.0 / 14.4 ms + 2.4-2.5 ms host serial with it (the wall is their sum, one stream); card DRAM floor
+# 3.5 / 4.9 / 7.2 ms, under the chain (latency-bound: a chain term is worth its full size); PCIe taps/logits only, NVMe 0. The router's 48 launches x 18.6 us are on the chain.
+kind: ab
+question: on main e99204ffd, does the F32 mcol router rows form speed Inkling-2-Mini drafted decode on a code prompt, new against base, with the draft running?
+term: decode tok/s (tg, N - 1 decode steps) @ n=512, depth 512 (the first 512 ids of the model corpus-code.ids), Inkling-2-Mini UD-Q4_K_XL whole on the RTX 5090,
+  BLOOMERY_DRAFT=dspark under the width chooser (BLOOMERY_MTP_WIDTH unset = cost), no ignore_eos (LCPP_WARM_EOS=stop), one fresh server an arm and a round,
+  new (main e99204ffd + f32_gemv_mcol) over base (clean e99204ffd), (new - base) / base
+unit: %
+predict: 2.6..4.0
+rounds: 6
+sd: 0.8 % rowsmkinds code sitting (6 rounds, head vs base +-0.89 %, A/A +-1.25 %: round-ratio sd 1.19 % and 1.70 %); the A/A arm prices it again
+condition: one hold, one runner call (rowsland/sit3.sh), arms base (clean e99204ffd build), new (this tree), base2 (a byte copy of base: the A/A), each env=BLOOMERY_DRAFT=dspark,
+  DEPTH_SERVE_IDS=corpus-code.ids, DEPTH_SERVE_N=512, D 512, LCPP_WARM_EOS=stop inside BOX_ENV. Valid only if EVERY arm server log holds `load draft=dspark` and an `mtp width`
+  record with windows >= 100 (a drafted run; a plain-path arm prices nothing), every ROW carries a `draft n/acc` column, every request kept 512 tokens, the 5090 alone
+  (no compute process but ours, no ComfyUI, uptime load under 4 at the start) and the A/A pair (base2 over base) lands within 1 % of 0. A ROW marked [cpu-busy] or [cold] is
+  read before it is used. Binaries: the two builds' sha256 recorded before and after, not rebuilt.
+decide-in: lever A pays on drafted code decode on main: the table is the lease number for the PR; the pr.md says the effect with its interval, the A/A and the width histograms
+decide-below: under 2.6 %: recompute the run expectation from the arms own `mtp width` windows and costs (rowsm kinds/sit_sum.py); if the new costs did not drop by 0.4..0.8 ms
+  at m = 2..4 the kernel did not save what the look measured on this base (a different binary or a noisy window: repeat once, 8 rounds); if they did and tg did not move, the host side
+  (2.5 ms a cycle) absorbed it; an A/A outside 1 % is chooser scatter: report it and repeat with 8 rounds
+decide-above: over 4.0 %: read the A/A and the arms width histograms first: a new path whose gate or widths differ from base is the chooser term, reported apart from the kernel term;
+  with the A/A clean, land

@@ -2002,6 +2002,67 @@ mod q8f32_kernels {
         }
     }
 
+    /// `f32_gemv` in `bf16_gemv`'s output layout: row r's column c lands at
+    /// `y[r*y_row + c*y_col]`, the host picking (m_cols, 1) for row-major or
+    /// (1, n_rows) for token-major, with one writer per slot. One warp per row,
+    /// 8 rows per 256-thread block, [`f32_lane_partials`]' lane walk and
+    /// `gemv_lane_sums`' butterfly: every output bit for bit `f32_gemv`'s on its
+    /// row and column, so the F32 tile's (`f32_tile_gemm`) too. `k` a positive
+    /// multiple of 32 (host-checked).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_rows * k,
+            x.len() >= m_cols * k,
+            y.len() >= (n_rows - 1) * y_row + (m_cols - 1) * y_col + 1
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn f32_gemv_mcol(
+        w: &[f32],
+        x: &[f32],
+        n_rows: u32,
+        k: u32,
+        m_cols: u32,
+        y_row: u32,
+        y_col: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        // SAFETY: row < n_rows, so w.len() >= n_rows·k >= (row + 1)·k, and
+        // x.len() >= m_cols·k, by the launch contract; the launcher passes k a
+        // positive multiple of 32 and m_cols in 1..=8 (`check_gemv_geometry`);
+        // lane < 32.
+        let partials = unsafe { f32_lane_partials(w, x, k, row, m_cols, lane) };
+        let sums = gemv_lane_sums(partials, m_cols);
+        if lane == 0 {
+            // SAFETY: the slots row*y_row + c*y_col, c < m_cols <= 8, lie at or
+            // below (n_rows-1)*y_row + (m_cols-1)*y_col < y.len() by the launch
+            // contract, and the host's layout gives each to this row's lane 0
+            // alone.
+            unsafe {
+                store_sums(
+                    &mut y,
+                    row * y_row as usize,
+                    y_col as usize,
+                    m_cols as usize,
+                    &sums,
+                );
+            }
+        }
+    }
+
     /// `f32_gemv` over a BF16 weight's words (`w` two values a word, the
     /// module doc's BF16 layout), each value widened as it is read
     /// ([`Bf16Words`]): every output bit for bit `f32_gemv`'s over the widened
@@ -3170,6 +3231,41 @@ impl Q8F32Kernels {
         Ok(())
     }
 
+    /// Enqueue [`Self::enqueue_f32_gemv`]'s product in `out`'s layout through
+    /// `f32_gemv_mcol`, at any `m` in 1..=8 and `k` a positive multiple of 32;
+    /// every output bit for bit `enqueue_f32_gemv`'s, and the F32 tile's
+    /// (`Gemm32Kernels::enqueue_f32_tile`). Another geometry is a named `Shape`
+    /// error. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_f32_gemv_mcol(
+        &self,
+        stream: &CudaStream,
+        a: F32GemvMcolArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let F32GemvMcolArgs { w, x, m, out, y } = a;
+        let what = "enqueue_f32_gemv_mcol";
+        let (n_rows, k) = (w.rows(), w.cols());
+        check_gemv_geometry(what, n_rows, k, x.len(), m, y.len())?;
+        if w.buf().len() < n_rows * k {
+            return Err(GpuError::shape(
+                what,
+                format!("w.len() {} < rows*k = {n_rows}*{k}", w.buf().len()),
+            ));
+        }
+        let n_rows = launch_u32(what, "n_rows", n_rows)?;
+        let k = launch_u32(what, "k", k)?;
+        let m = launch_u32(what, "m", m)?;
+        let (y_row, y_col) = match out {
+            GemvOut::RowMajor => (m, 1),
+            GemvOut::TokenMajor => (1, n_rows),
+        };
+        let prep =
+            self.module
+                .prepare_f32_gemv_mcol(LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0))?;
+        self.module
+            .f32_gemv_mcol(stream, &prep, w.buf(), x, n_rows, k, m, y_row, y_col, y)?;
+        Ok(())
+    }
+
     /// Enqueue [`Self::enqueue_f32_gemv`]'s product for a BF16 weight in its
     /// words (`w` rows × k/2): `y` row-major with `m` outputs a row, each bit
     /// for bit `f32_gemv`'s over the widened rows. `k` a positive multiple of
@@ -4175,6 +4271,17 @@ pub(crate) struct Bf16GemvMcolArgs<'a> {
 pub struct Q8_0GemvMcolArgs<'a> {
     pub qs: &'a DeviceTensor<u32>,
     pub d: &'a DeviceTensor<u16>,
+    pub x: &'a DeviceBuffer<f32>,
+    pub m: usize,
+    pub out: GemvOut,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`Q8F32Kernels::enqueue_f32_gemv_mcol`]'s arguments: an F32 weight of
+/// `w.rows()` rows of `w.cols()` (= k) values, `m` activation columns
+/// (1..=8) and the output layout.
+pub struct F32GemvMcolArgs<'a> {
+    pub w: &'a DeviceTensor<f32>,
     pub x: &'a DeviceBuffer<f32>,
     pub m: usize,
     pub out: GemvOut,
