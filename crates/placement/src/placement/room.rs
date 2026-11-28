@@ -879,12 +879,11 @@ fn pool_room(
 
 /// Whether a room that holds the cap takes the split all the same, with `over` the cap and the
 /// window past the room (0 where the window fits beside the cap), `pool` the churn pool the
-/// floor's free room holds ([`pool_room`]) and `headroom` what the cap leaves of the room: the
-/// split has no arena (a split with one keeps the K/V charged at the cap), the window does not
-/// fit beside the cap, and the pool passes the headroom, which is the pool the room had without
+/// floor's free room holds ([`pool_room`], none under an arena) and `headroom` what the cap
+/// leaves of the room: the window does not fit beside the cap, and the pool passes the headroom, which is the pool the room had without
 /// it.
-pub(super) fn split_pays(arena: u64, over: u128, pool: u64, headroom: u128) -> bool {
-    arena == 0 && over > 0 && u128::from(pool) > headroom
+pub(super) fn split_pays(over: u128, pool: u64, headroom: u128) -> bool {
+    over > 0 && u128::from(pool) > headroom
 }
 
 /// The split of the host's routed experts to the NVMe tier, and the yields beside it.
@@ -1033,8 +1032,8 @@ fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), P
         0
     };
     // The headroom the cap leaves of the room that is left past the arena: an arena past it is a split
-    // with an arena, which `split_pays` refuses by itself.
-    if holds && !split_pays(arena, over, pool, u128::from(room).saturating_sub(exact)) {
+    // with an arena, which budgets no pool (above), so `split_pays` refuses it.
+    if holds && !split_pays(over, pool, u128::from(room).saturating_sub(exact)) {
         return Ok(());
     }
     plan.host.nvme_arena_bytes = arena;

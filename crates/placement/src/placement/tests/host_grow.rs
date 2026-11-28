@@ -943,27 +943,26 @@ fn a_room_that_holds_the_cap_ignores_an_arena_lever_it_never_asked_for() {
     }
 }
 
-/// A room that holds the cap takes the split only where all three hold: no arena, the window past
-/// what the room leaves beside the cap (`over` > 0), and a pool past the headroom the cap leaves.
+/// A room that holds the cap takes the split only where both hold: the window past what the room
+/// leaves beside the cap (`over` > 0), and a pool past the headroom the cap leaves.
 /// Each row of the table breaks one of them against a row that takes it.
 ///
-/// FAIL-first: a predicate without the arena term takes the split with an arena, without the
-/// window term at `over` 0, and with `>=` at a pool equal to the headroom.
+/// FAIL-first: a predicate without the window term takes the split at `over` 0, and with `>=` at a
+/// pool equal to the headroom.
 #[test]
 fn a_room_that_holds_the_cap_takes_the_split_only_where_it_pays() {
-    // (arena, over, pool, headroom, takes)
+    // (over, pool, headroom, takes)
     let rows = [
-        (0, 1, 11, 10, true),
-        (1, 1, 11, 10, false),
-        (0, 0, 11, 10, false),
-        (0, 1, 10, 10, false),
-        (0, 1, 0, 0, false),
+        (1, 11, 10, true),
+        (0, 11, 10, false),
+        (1, 10, 10, false),
+        (1, 0, 0, false),
     ];
-    for (arena, over, pool, headroom, takes) in rows {
+    for (over, pool, headroom, takes) in rows {
         assert_eq!(
-            room::split_pays(arena, over, pool, headroom),
+            room::split_pays(over, pool, headroom),
             takes,
-            "arena {arena}, over {over}, pool {pool}, headroom {headroom}"
+            "over {over}, pool {pool}, headroom {headroom}"
         );
     }
 }
