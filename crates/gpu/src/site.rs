@@ -13,7 +13,9 @@
 //!   q8f32 gemv (`q8_0_gemv` at one column, `q8_0_gemv_mcol` token-major
 //!   past it, the two bit for bit equal on a column), F32 `f32_gemv` at one
 //!   column and `f32_gemv_mcol` past it (token-major, bit for bit `f32_gemv`
-//!   on every row and column, so the F32 tile's too), MXFP8 (`GgmlType::MXFP8`) the
+//!   on every row and column, so the F32 tile's too; an F32 site takes any
+//!   column count, the F32 tile past eight, `Gemm32Kernels::enqueue_f32_cols`
+//!   picking), MXFP8 (`GgmlType::MXFP8`) the
 //!   q8f32 MXFP8 gemv (`mxfp8_gemv` at one column, `mxfp8_gemv_mcol`
 //!   token-major past it, bit for bit equal on a column), FP8_B128
 //!   (`GgmlType::FP8_B128`) the same walk's FP8_B128 entries
@@ -89,8 +91,7 @@ use crate::mxfp4_sel::{Nvfp4Down, Nvfp4SelKernels, Nvfp4Stack};
 use crate::q5::Q8Blocks32;
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q8f32::{
-    Bf16GemvMcolArgs, E4m3GemvArgs, E4m3Scales, E4m3Weight, F32GemvMcolArgs, GemvOut,
-    Q8_0GemvMcolArgs, SelArgs,
+    Bf16GemvMcolArgs, E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, Q8_0GemvMcolArgs, SelArgs,
 };
 use crate::quant_sel::QuantSelKernels;
 use crate::tensor::{Pitched, Q8Act, TensorWindow, WindowMut, dtod_2d};
@@ -302,48 +303,49 @@ fn kq<'w>(
 
 /// `y = W · x` for site `name` of type `ty` over the first `m` (1..=8)
 /// columns of the f32 rows `x`, token-major (module doc): Q8_0, F32,
-/// MXFP8, FP8_B128 and BF16. A K-quant site is
+/// MXFP8, FP8_B128 and BF16; an F32 site takes any `m`, the F32 tile of `g32`
+/// past eight. A K-quant site is
 /// [`kgemv`] and a Q5_0 site is [`blocks32_gemv`]; each is refused here by
 /// name.
 pub fn gemv(
     gpu: &Gpu,
-    _g32: &Gemm32Kernels,
+    g32: &Gemm32Kernels,
     (ty, w, name): (SiteTy, &Weights, &str),
     x: &DeviceBuffer<f32>,
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     let src = (Some(ty), w, name);
-    launch(gpu, gpu.stream(), src, x, m, y)
+    launch(gpu, gpu.stream(), Some(g32), src, x, m, y)
 }
 
 /// [`gemv`] for the resident weight `name` at the site type of its resident
 /// form ([`of_resident`]) over the first `m` (1..=8) columns of the
 /// f32 rows `x`, token-major: a body whose plan picks each site's type per
-/// tensor. `_g32` is not read: an F32 site past one column runs `f32_gemv_mcol`, which
-/// needs no tile kernels; callers still pass it.
+/// tensor. `g32` is read only by an F32 site past eight columns (any `m`
+/// is served there), which is refused by name without it.
 pub fn resident_gemv_cols(
     gpu: &Gpu,
-    _g32: Option<&Gemm32Kernels>,
+    g32: Option<&Gemm32Kernels>,
     (w, name): (&Weights, &str),
     x: &DeviceBuffer<f32>,
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    resident_gemv_cols_on(gpu, gpu.stream(), _g32, (w, name), x, m, y)
+    resident_gemv_cols_on(gpu, gpu.stream(), g32, (w, name), x, m, y)
 }
 
 /// [`resident_gemv_cols`] on `stream`, ordered by the caller before its consumers.
 pub fn resident_gemv_cols_on(
     gpu: &Gpu,
     stream: &cuda_core::CudaStream,
-    _g32: Option<&Gemm32Kernels>,
+    g32: Option<&Gemm32Kernels>,
     (w, name): (&Weights, &str),
     x: &DeviceBuffer<f32>,
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    launch(gpu, stream, (None, w, name), x, m, y)
+    launch(gpu, stream, g32, (None, w, name), x, m, y)
 }
 
 /// `y = W · x` at one column for the resident weight `name`, by the site
@@ -425,10 +427,12 @@ fn resident_ty(
 
 /// The gemv of resident weight `name` over the first `m` (1..=8) columns
 /// of the f32 rows `x`, token-major, at the site type of its resident form, which must be
-/// `declared` when the caller names one ([`resident_ty`]).
+/// `declared` when the caller names one ([`resident_ty`]). `g32` is read
+/// only by an F32 site past eight columns.
 fn launch(
     gpu: &Gpu,
     stream: &cuda_core::CudaStream,
+    g32: Option<&Gemm32Kernels>,
     (declared, w, name): (Option<SiteTy>, &Weights, &str),
     x: &DeviceBuffer<f32>,
     m: usize,
@@ -439,7 +443,7 @@ fn launch(
     let ty = resident_ty(WHAT, (declared, weight, name))?;
     match ty.reads() {
         Form::F32 | Form::Q8x32 => with_planes(WHAT, (ty, weight, name), None, |p| {
-            gemv_planes(gpu, stream, p, x, m, y)
+            gemv_planes(gpu, stream, g32, p, x, m, y)
         }),
         Form::Q8x128 => Err(GpuError::shape(
             WHAT,
@@ -454,11 +458,14 @@ fn launch(
 
 /// `y = W · x` for the planes `p` over the first `m` (1..=8) columns of the
 /// f32 rows `x`, token-major: Q8_0 `q8_0_gemv` at one column and
-/// `q8_0_gemv_mcol` past it, F32 `f32_gemv` at one column and `f32_gemv_mcol`
-/// past it, BF16 `bf16_gemv`, MXFP8 and FP8_B128 their gemvs.
+/// `q8_0_gemv_mcol` past it, F32 the common owner's pick
+/// (`Gemm32Kernels::enqueue_f32_cols`: `f32_gemv`, `f32_gemv_mcol` to eight
+/// columns, the tile of `g32` past them), BF16 `bf16_gemv`, MXFP8 and
+/// FP8_B128 their gemvs.
 fn gemv_planes(
     gpu: &Gpu,
     stream: &cuda_core::CudaStream,
+    g32: Option<&Gemm32Kernels>,
     p: Planes<'_>,
     x: &DeviceBuffer<f32>,
     m: usize,
@@ -478,19 +485,7 @@ fn gemv_planes(
                 y,
             },
         ),
-        // A warp a row at one column (`f32_gemv`) and past it (`f32_gemv_mcol`): the F32 tile's
-        // bits in `rows / 8` blocks where the tile has `rows / 32`.
-        Planes::F32(w) if m == 1 => q.enqueue_f32_gemv(stream, w, x, 1, y),
-        Planes::F32(w) => q.enqueue_f32_gemv_mcol(
-            stream,
-            F32GemvMcolArgs {
-                w,
-                x,
-                m,
-                out: GemvOut::TokenMajor,
-                y,
-            },
-        ),
+        Planes::F32(w) => Gemm32Kernels::enqueue_f32_cols(g32, q, stream, w, x, m, y),
         Planes::Bf16(w) => q.enqueue_bf16_gemv_mcol(
             stream,
             Bf16GemvMcolArgs {
@@ -962,8 +957,9 @@ impl ByName {
     /// `out = W · x` for the resident weight `name`, by the site type of its
     /// resident form, over the first `m` (1..=[`BY_NAME_COLS`]) columns of
     /// the f32 rows `x`; a fault of the quantization raises into layer
-    /// `layer`'s sink. `k` is read only by a K-quant, IQ4_XS or NVFP4 site; the
-    /// tile kernels are not read ([`resident_gemv_cols`]). A Q5_0 site, a
+    /// `layer`'s sink. `k` is read only by a K-quant, IQ4_XS or NVFP4 site, `g32`
+    /// only by an F32 site past eight columns, which no unit here has
+    /// ([`resident_gemv_cols`]). A Q5_0 site, a
     /// form the load made no q8_1 rows for, or a part past the output's
     /// stride is refused by name.
     #[allow(
@@ -996,7 +992,7 @@ impl ByName {
         &mut self,
         gpu: &Gpu,
         stream: &cuda_core::CudaStream,
-        (k, _): (Option<&ByNameKernels>, Option<&Gemm32Kernels>),
+        (k, g32): (Option<&ByNameKernels>, Option<&Gemm32Kernels>),
         (w, name): (&Weights, &str),
         fault: FaultSink,
         x: &DeviceBuffer<f32>,
@@ -1022,13 +1018,13 @@ impl ByName {
         match ty.reads() {
             Form::F32 | Form::Q8x32 => {
                 if whole {
-                    return launch(gpu, stream, (None, w, name), x, m, y);
+                    return launch(gpu, stream, g32, (None, w, name), x, m, y);
                 }
                 if m == 1 {
                     let mut win = WindowMut::<f32>::of_mut(y, at * size_of::<f32>(), rows)?;
-                    return launch(gpu, stream, (None, w, name), x, 1, &mut win);
+                    return launch(gpu, stream, g32, (None, w, name), x, 1, &mut win);
                 }
-                launch(gpu, stream, (None, w, name), x, m, &mut self.stage)?;
+                launch(gpu, stream, g32, (None, w, name), x, m, &mut self.stage)?;
                 scatter(stream, &self.stage, (rows, m), y, (at, stride))
             }
             Form::Q8x128 => {
