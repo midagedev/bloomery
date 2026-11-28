@@ -51,7 +51,7 @@ use super::state::{self, StepIn, VisitStore, WORD_POS, WORD_RING, WORD_TOKEN};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs, MAX_NQ, MAX_VECS};
 use crate::attn_res_step::{AttnResStepKernels, MixStepScratch};
-use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
+use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, QuantRun};
 use crate::draft_taps::DraftTaps;
 use crate::flash_gqa::{FlashGqaKernels, window_segments};
 use crate::folder::Model;
@@ -75,9 +75,10 @@ use crate::norm_proj_bf16::{self, Bf16Site, NormProjBf16Args, NormProjBf16Kernel
 use crate::q38::{EmbedIo, Q38Kernels};
 use crate::qk_clip::{CONV_TAPS, QkClipArgs, QkClipConv, QkClipKernels};
 use crate::rel_bias::{REL, RelBiasArgs, RelBiasKernels};
+use crate::route_norm::{RouteNormArgs, RouteNormKernels, RouteNormOut};
 use crate::routed_block::RouteIn;
 use crate::site::{self, KGemvKernels, SiteTy};
-use crate::tensor::{PartedBuffer, Window, WindowMut, copy_row};
+use crate::tensor::{PartedBuffer, Q8Act, Window, WindowMut, copy_row};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use bloomery_levers::{
@@ -271,6 +272,9 @@ struct Kernels {
     rel: RelBiasKernels,
     out_gate: OutGateKernels,
     router: Route,
+    /// The feed-forward norm, its q8_1 form and the router in one launch, where the router is the
+    /// 128-expert instance.
+    route_norm: Option<RouteNormKernels>,
     leg: CardLeg,
     /// The LoopCD-Hidden boundary step ([`loop_cd`]).
     loop_cd: LoopCdKernels,
@@ -279,6 +283,7 @@ struct Kernels {
 impl Kernels {
     fn load(gpu: &Gpu, n_expert: usize) -> Result<Kernels, GpuError> {
         let ctx = gpu.context();
+        let router = Route::load(ctx, n_expert)?;
         Ok(Kernels {
             kgemv: KGemvKernels::load(gpu)?,
             g32: Gemm32Kernels::load(ctx)?,
@@ -294,7 +299,11 @@ impl Kernels {
             clip: QkClipKernels::load(ctx)?,
             rel: RelBiasKernels::load(ctx)?,
             out_gate: OutGateKernels::load(ctx)?,
-            router: Route::load(ctx, n_expert)?,
+            route_norm: match &router {
+                Route::E128(_) => Some(RouteNormKernels::load(ctx)?),
+                Route::E384(_) => None,
+            },
+            router,
             leg: CardLeg::load(gpu)?,
             loop_cd: LoopCdKernels::load(ctx)?,
         })
@@ -335,6 +344,12 @@ struct Scratch {
     fmix: DeviceBuffer<f32>,
     fctl: DeviceBuffer<f32>,
     fxn: DeviceBuffer<f32>,
+    /// The feed-forward norm's q8_1 planes, which the fused norm and router writes for the card leg.
+    fxq: Q8Act,
+    /// The fused router's block ticket, zero between launches.
+    rtick: DeviceBuffer<u32>,
+    /// The card leg's down rows where it reads `fxq`.
+    fdown: DeviceBuffer<f32>,
     moe: DeviceBuffer<f32>,
     /// A placed layer's card slots' weighted sum, which the host's joins to make `moe`.
     cacc: DeviceBuffer<f32>,
@@ -398,6 +413,9 @@ impl Scratch {
             fmix: z(n)?,
             fctl: z(n)?,
             fxn: z(n)?,
+            fxq: Q8Act::with_k(stream, 1, n)?,
+            rtick: DeviceBuffer::zeroed(stream, 1)?,
+            fdown: z(N_USED * n)?,
             moe: z(n)?,
             cacc: z(n)?,
             ffn_out: z(n)?,
@@ -441,6 +459,7 @@ impl Scratch {
             &self.fmix,
             &self.fctl,
             &self.fxn,
+            &self.fdown,
             &self.moe,
             &self.cacc,
             &self.ffn_out,
@@ -463,6 +482,16 @@ impl Scratch {
             + self.leg.bytes()
             + self.mix_step.bytes()
             + self.route.bytes()
+            + [
+                self.fxq.q3.num_bytes(),
+                self.fxq.q4.num_bytes(),
+                self.fxq.q6.num_bytes(),
+                self.fxq.s8.num_bytes(),
+                self.fxq.d8.num_bytes(),
+                self.rtick.num_bytes(),
+            ]
+            .iter()
+            .sum::<usize>()
     }
 }
 
@@ -1339,6 +1368,20 @@ impl Body {
         self.layers.get(l).is_some_and(|x| x.o.ty == SiteTy::Q8_0)
     }
 
+    /// Whether the feed-forward's norm and the router run as one launch (the 128-expert router) on
+    /// a step without the imatrix collector.
+    #[must_use]
+    pub fn route_norm(&self) -> bool {
+        self.k.route_norm.is_some()
+    }
+
+    /// Whether the card leg reads the q8_1 planes that launch writes, on a step without the
+    /// imatrix collector: the whole-card body, which runs the leg itself.
+    #[must_use]
+    pub fn leg_prequant(&self) -> bool {
+        self.route_norm() && self.placed.is_none()
+    }
+
     /// The stored layers the visits run.
     #[must_use]
     pub fn stored_layers(&self) -> usize {
@@ -1573,7 +1616,13 @@ impl Body {
             n_msg: 0,
             banked: false,
             loopcd: *loopcd,
+            route_norm: k
+                .route_norm
+                .as_ref()
+                .filter(|_| crate::imatrix::collector().is_none()),
+            prequant: false,
         };
+        walk.prequant = walk.route_norm.is_some() && placed.is_none();
         let core = hp.loop_.filter(|lp| lp.passes > 1);
         match placed.as_mut() {
             Some(Placed {
@@ -1675,6 +1724,12 @@ struct Walk<'a> {
     /// LoopCD-Hidden at the loop→coda boundary ([`Walk::pass_edge`], [`Walk::loop_boundary`]);
     /// `None` off.
     loopcd: Option<LoopCd>,
+    /// The fused feed-forward norm and router ([`RouteNormKernels`]) where the router is the
+    /// 128-expert instance and no collector reads the norm's input.
+    route_norm: Option<&'a RouteNormKernels>,
+    /// The card leg reads the fused launch's q8_1 planes: the whole-card step, where the walk's
+    /// own shadow runs the leg (a placed layer's leg quantizes the normed row itself).
+    prequant: bool,
 }
 
 /// `src`'s `rows` rows of `n` from row `from` into `dst` from row `to`, one copy; nothing for no
@@ -2310,6 +2365,33 @@ impl<'a> Walk<'a> {
             (true, None) => return Err(GpuError::state(STEP, "a core layer's controllers")),
             (false, _) => &s.fmix,
         };
+        let rin = RouteIn {
+            w: w.f32_tensor(STEP, &layer.router)?,
+            bias: Some(w.f32_buf(STEP, &layer.probs_b)?),
+            scale: self.route_scale,
+            fault,
+        };
+        if let (Some(fused), RouteOut::E128(out)) = (self.route_norm, &mut s.route) {
+            // The norm, its q8_1 form and the router in one launch.
+            return fused.enqueue(
+                stream,
+                RouteNormArgs {
+                    w: rin.w,
+                    x: normed_in,
+                    gain: w.f32_buf(STEP, &layer.ffn_norm)?,
+                    bias: w.f32_buf(STEP, &layer.probs_b)?,
+                    eps: self.eps,
+                    scale: self.route_scale,
+                    fault,
+                },
+                RouteNormOut {
+                    y: &mut s.fxn,
+                    act: &mut s.fxq,
+                    route: out,
+                    ticket: &mut s.rtick,
+                },
+            );
+        }
         gpu.elem().enqueue_rms_norm(
             stream,
             normed_in,
@@ -2319,12 +2401,6 @@ impl<'a> Walk<'a> {
             1,
             &mut s.fxn,
         )?;
-        let rin = RouteIn {
-            w: w.f32_tensor(STEP, &layer.router)?,
-            bias: Some(w.f32_buf(STEP, &layer.probs_b)?),
-            scale: self.route_scale,
-            fault,
-        };
         self.k.router.route(stream, &s.fxn, &rin, &mut s.route)
     }
 
@@ -2371,12 +2447,32 @@ impl<'a> Walk<'a> {
             n_card: d.n_expert,
             rule: self.act,
         };
-        self.k.leg.enqueue(gpu, &mut s.leg, &run, None)?;
+        if self.prequant {
+            // The fused launch wrote the normed row's q8_1 planes: the leg's other launches.
+            let quant = QuantRun {
+                layer: slot,
+                stacks: &stacks,
+                act: &s.fxq,
+                m: 1,
+                sel,
+                n_card: d.n_expert,
+                rule: self.act,
+            };
+            self.k
+                .leg
+                .enqueue_rows_quantized(gpu, &mut s.leg, &quant, &mut s.fdown)?;
+        } else {
+            self.k.leg.enqueue(gpu, &mut s.leg, &run, None)?;
+        }
         let inp = if self.banked { &s.attn_out } else { &s.ffn_inp };
         self.k.tail.enqueue_card_acc_conv(
             stream,
             CardAccConvArgs {
-                down: s.leg.down(),
+                down: if self.prequant {
+                    &s.fdown
+                } else {
+                    s.leg.down()
+                },
                 w: weights,
                 sel,
                 n_card: d.n_expert,

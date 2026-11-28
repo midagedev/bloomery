@@ -132,6 +132,7 @@ pub mod rope_tail;
 pub mod route_body;
 pub mod route_core;
 pub mod route_dial;
+pub mod route_norm;
 pub mod route_softmax;
 pub mod routed_block;
 pub mod router;

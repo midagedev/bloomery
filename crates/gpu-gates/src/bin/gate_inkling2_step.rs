@@ -73,6 +73,15 @@
 //!     (`q8_0_gemv`, `f32_gemv`), the taps of a launch without them unwritten; a NaN input value
 //!     raises the norm's fault from the fused launch, every site of that input NaN and the other
 //!     inputs' sites their bits.
+//! 11b. `route_norm_is_the_launches`: the feed-forward front of a decode token in one launch
+//!     (`route_norm::enqueue`: the norm, its q8_1 form for the card leg and the 128-expert router)
+//!     against `rms_norm`, `q3k_quantize_q8_1` and the router it replaces — the normed row, the
+//!     five q8_1 planes, the logits, scores, ids and weights bit for bit, the block ticket back at
+//!     zero, and the fault word the same — at the files' 2,304 wide (run twice on one set of
+//!     buffers) and the entry's narrowest and widest rows, a NaN input value (the norm's fault, the
+//!     quantizer's and the router's) and a NaN gain value (a finite scale, one 128-value block
+//!     with no q8_1 form); a shape the launch cannot take is refused by name with nothing
+//!     enqueued.
 //!
 //! The oracle clauses (`fx_ref_inkling2_a`, its positions' count read from the set, the fixture's
 //! 25-visit schedule — the stem 0-5, the core's three passes 6-11, 12-17, 18-23, the coda 24; the
@@ -123,7 +132,11 @@ mod gate {
     };
     use bloomery_gpu::norm_proj::{F32Site, NormProjArgs, NormProjKernels, Q8Site};
     use bloomery_gpu::qk_clip::{QkClipArgs, QkClipConv, QkClipKernels};
-    use bloomery_gpu::{DeviceTensor, Fault, Gpu, GpuError};
+    use bloomery_gpu::route_body::sigmoid_128_8;
+    use bloomery_gpu::route_norm::{
+        ActPlanes, RouteNormArgs, RouteNormKernels, RouteNormOut, act_planes,
+    };
+    use bloomery_gpu::{DeviceTensor, Fault, Gpu, GpuError, Q8Act};
     use bloomery_gpu_gates::tier::{self, Tier};
     use bloomery_gpu_gates::{
         GateError, GateRng, RefManifest, bits_equal, checks_failed, ref_tensor_logical_in, verdict,
@@ -2041,6 +2054,304 @@ mod gate {
         Ok(out)
     }
 
+    // ------------------------------------------------------------------ the fused ffn front
+
+    /// The router's experts: the entry's, and the file's.
+    const ROUTE_E: usize = 128;
+    /// Widths the clause runs: the files' (the first, run twice), the entry's narrowest and widest.
+    const ROUTE_WIDTHS: [usize; 3] = [N, 256, 3072];
+    /// The file's `expert_weights_scale` stand-in.
+    const ROUTE_SCALE: f32 = 2.5;
+
+    /// One token's feed-forward front inputs.
+    struct RouteCase {
+        k: usize,
+        x: Vec<f32>,
+        gain: Vec<f32>,
+        w: Vec<f32>,
+        bias: Vec<f32>,
+    }
+
+    impl RouteCase {
+        fn new(seed: u64, k: usize) -> RouteCase {
+            let mut r = GateRng(seed);
+            RouteCase {
+                k,
+                x: fill(&mut r, k, -2.0, 2.0),
+                gain: fill(&mut r, k, 0.5, 1.5),
+                w: fill(&mut r, ROUTE_E * k, -0.05, 0.05),
+                bias: fill(&mut r, ROUTE_E, -0.2, 0.2),
+            }
+        }
+    }
+
+    /// What a front leaves: the normed row, the q8_1 planes, the router's results, the fused
+    /// launch's ticket and the fault word.
+    #[derive(PartialEq)]
+    struct RouteOutput {
+        y: Vec<u32>,
+        planes: ActPlanes,
+        logits: Vec<u32>,
+        probs: Vec<u32>,
+        ids: Vec<u32>,
+        weights: Vec<u32>,
+        tickets: u32,
+        fault: String,
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// The front on the three launches (`fused` `None`) or the one, `reps` times on one set of
+    /// buffers (the router's block ticket must be back at zero for the next launch).
+    fn route_run(
+        gpu: &Gpu,
+        router: &sigmoid_128_8::RouterKernels,
+        fused: Option<&RouteNormKernels>,
+        case: &RouteCase,
+        reps: usize,
+    ) -> Result<RouteOutput, GateError> {
+        let s = gpu.stream();
+        let k = case.k;
+        let x = DeviceBuffer::from_host(s, &case.x)?;
+        let gain = DeviceBuffer::from_host(s, &case.gain)?;
+        let bias = DeviceBuffer::from_host(s, &case.bias)?;
+        let w = DeviceTensor::upload(s, &case.w, ROUTE_E, k)?;
+        let mut y = DeviceBuffer::zeroed(s, k)?;
+        let mut act = Q8Act::with_k(s, 1, k)?;
+        let mut route = sigmoid_128_8::RouterOut::new(s)?;
+        let mut ticket = DeviceBuffer::<u32>::zeroed(s, 1)?;
+        s.synchronize()?;
+        gpu.clear_fault()?;
+        for _ in 0..reps {
+            match fused {
+                None => {
+                    gpu.elem()
+                        .enqueue_rms_norm(s, &x, &gain, EPS, k, 1, &mut y)?;
+                    gpu.enqueue_quantize_q8_1_on(s, &y, &mut act, gpu.unlabelled_sink())?;
+                    router.enqueue_router(
+                        s,
+                        &w,
+                        &y,
+                        &bias,
+                        ROUTE_SCALE,
+                        &mut route,
+                        gpu.unlabelled_sink(),
+                    )?;
+                }
+                Some(f) => f.enqueue(
+                    s,
+                    RouteNormArgs {
+                        w: &w,
+                        x: &x,
+                        gain: &gain,
+                        bias: &bias,
+                        eps: EPS,
+                        scale: ROUTE_SCALE,
+                        fault: gpu.unlabelled_sink(),
+                    },
+                    RouteNormOut {
+                        y: &mut y,
+                        act: &mut act,
+                        route: &mut route,
+                        ticket: &mut ticket,
+                    },
+                )?,
+            }
+        }
+        s.synchronize()?;
+        let tickets = match fused {
+            None => route.tickets(s)?,
+            Some(_) => ticket.to_host_vec(s)?[0],
+        };
+        Ok(RouteOutput {
+            y: bits(&y.to_host_vec(s)?),
+            planes: act_planes(s, &act)?,
+            logits: bits(&route.logits.to_host_vec(s)?),
+            probs: bits(&route.probs.to_host_vec(s)?),
+            ids: route.ids.to_host_vec(s)?,
+            weights: bits(&route.weights.to_host_vec(s)?),
+            tickets,
+            fault: format!("{:?}", gpu.fault()?),
+        })
+    }
+
+    /// Clause `route_norm_is_the_launches` (module doc, clause 11b).
+    fn route_norm_clauses(
+        gpu: &Gpu,
+        router: &sigmoid_128_8::RouterKernels,
+        fused: &RouteNormKernels,
+    ) -> Result<Vec<bool>, GateError> {
+        let mut out = Vec::new();
+        // (what, case, reps, a fault is raised)
+        let mut cases: Vec<(String, RouteCase, usize, bool)> = Vec::new();
+        for (i, &k) in ROUTE_WIDTHS.iter().enumerate() {
+            let reps = if i == 0 { 2 } else { 1 };
+            cases.push((
+                format!("{k} wide, run {reps}x"),
+                RouteCase::new(0x2b0d_0000 + i as u64, k),
+                reps,
+                false,
+            ));
+        }
+        let mut nan_x = RouteCase::new(0x2b0d_0100, N);
+        nan_x.x[7] = f32::NAN;
+        cases.push(("a NaN input value".to_owned(), nan_x, 1, true));
+        let mut nan_gain = RouteCase::new(0x2b0d_0101, N);
+        nan_gain.gain[1000] = f32::NAN;
+        cases.push(("a NaN gain value".to_owned(), nan_gain, 1, true));
+        for (what, case, reps, faults) in &cases {
+            let pair = route_run(gpu, router, None, case, 1)?;
+            let one = route_run(gpu, router, Some(fused), case, *reps)?;
+            let same = pair.y == one.y
+                && pair.planes == one.planes
+                && pair.logits == one.logits
+                && pair.probs == one.probs
+                && pair.ids == one.ids
+                && pair.weights == one.weights;
+            let pass = same
+                && pair.tickets == 0
+                && one.tickets == 0
+                && pair.fault == one.fault
+                && (one.fault != "None") == *faults;
+            println!(
+                "  route_norm_is_the_launches {what}: row, planes and router bits {} tickets \
+                 pair={} fused={} fault pair={} fused={}: {}",
+                if same { "equal" } else { "differ" },
+                pair.tickets,
+                one.tickets,
+                pair.fault,
+                one.fault,
+                verdict(pass)
+            );
+            gpu.clear_fault()?;
+            out.push(pass);
+        }
+        Ok(out)
+    }
+
+    /// The refusals of `route_norm::enqueue`, each with nothing enqueued: the row and the ticket
+    /// stay as they were.
+    fn route_norm_refusals(gpu: &Gpu, fused: &RouteNormKernels) -> Result<Vec<bool>, GateError> {
+        let s = gpu.stream();
+        let mut out = Vec::new();
+        // (what, rows, k, activation (columns, width), x length, scale, names)
+        type Refusal = (
+            &'static str,
+            usize,
+            usize,
+            (usize, usize),
+            usize,
+            f32,
+            &'static str,
+        );
+        let refusals: &[Refusal] = &[
+            (
+                "127 expert rows",
+                127,
+                N,
+                (1, N),
+                N,
+                ROUTE_SCALE,
+                "router weight",
+            ),
+            (
+                "a width that is no multiple of 256",
+                ROUTE_E,
+                2336,
+                (1, N),
+                2336,
+                ROUTE_SCALE,
+                "multiple of 256",
+            ),
+            (
+                "a width past the shared row",
+                ROUTE_E,
+                3328,
+                (1, 3328),
+                3328,
+                ROUTE_SCALE,
+                "up to 3072",
+            ),
+            (
+                "two activation columns",
+                ROUTE_E,
+                N,
+                (2, N),
+                N,
+                ROUTE_SCALE,
+                "activation planes",
+            ),
+            (
+                "an activation of another width",
+                ROUTE_E,
+                N,
+                (1, 2048),
+                N,
+                ROUTE_SCALE,
+                "activation planes",
+            ),
+            (
+                "a short input row",
+                ROUTE_E,
+                N,
+                (1, N),
+                N - 1,
+                ROUTE_SCALE,
+                "x.len()",
+            ),
+            (
+                "a NaN scale",
+                ROUTE_E,
+                N,
+                (1, N),
+                N,
+                f32::NAN,
+                "must be finite",
+            ),
+        ];
+        for &(what, rows, k, (cols, width), x_len, scale, names) in refusals {
+            let x = DeviceBuffer::from_host(s, &vec![1.0f32; x_len])?;
+            let gain = DeviceBuffer::from_host(s, &vec![1.0f32; k])?;
+            let bias = DeviceBuffer::from_host(s, &vec![0.0f32; ROUTE_E])?;
+            let w = DeviceTensor::upload(s, &vec![0.01f32; rows * k], rows, k)?;
+            let mut y = DeviceBuffer::from_host(s, &vec![UNWRITTEN; k])?;
+            let mut act = Q8Act::with_k(s, cols, width)?;
+            let mut route = sigmoid_128_8::RouterOut::new(s)?;
+            let mut ticket = DeviceBuffer::<u32>::zeroed(s, 1)?;
+            let got = refused(fused.enqueue(
+                s,
+                RouteNormArgs {
+                    w: &w,
+                    x: &x,
+                    gain: &gain,
+                    bias: &bias,
+                    eps: EPS,
+                    scale,
+                    fault: gpu.unlabelled_sink(),
+                },
+                RouteNormOut {
+                    y: &mut y,
+                    act: &mut act,
+                    route: &mut route,
+                    ticket: &mut ticket,
+                },
+            ));
+            s.synchronize()?;
+            let untouched = y
+                .to_host_vec(s)?
+                .iter()
+                .all(|v| v.to_bits() == UNWRITTEN.to_bits())
+                && ticket.to_host_vec(s)?[0] == 0
+                && gpu.fault()?.is_none();
+            let pass = refusal(what, got, names) && untouched;
+            println!("  route_norm_is_the_launches {what}: nothing enqueued {untouched}");
+            out.push(pass);
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------------ the refusals
 
     /// The text of the refusal `r` is, or `None` when it ran.
@@ -2739,6 +3050,8 @@ mod gate {
         let clip = QkClipKernels::load(ctx)?;
         let tail = ConvTailKernels::load(ctx)?;
         let slots = CardSlotKernels::load(ctx)?;
+        let router = sigmoid_128_8::RouterKernels::load(ctx)?;
+        let route_norm = RouteNormKernels::load(ctx)?;
         let mut results = Vec::new();
         results.extend(mix_clauses(&gpu, &mix)?);
         results.extend(mix_faults(&gpu, &mix)?);
@@ -2748,6 +3061,8 @@ mod gate {
         results.extend(conv_clauses(&gpu, &conv)?);
         results.extend(conv_clip_clauses(&gpu, &conv, &clip)?);
         results.extend(conv_tail_clauses(&gpu, (&conv, &slots, &tail))?);
+        results.extend(route_norm_clauses(&gpu, &router, &route_norm)?);
+        results.extend(route_norm_refusals(&gpu, &route_norm)?);
         results.extend(refusal_clauses(&gpu, &mix, &control, &conv)?);
         results.extend(oracle_clauses(&gpu, &mix, &control)?);
         let failed = results.iter().filter(|p| !**p).count();
