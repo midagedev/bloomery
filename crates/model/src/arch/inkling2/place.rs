@@ -300,6 +300,12 @@ fn native_fp4_col_bytes(k: usize) -> usize {
     }
 }
 
+/// Rows up to which a prompt pass is a few-block grid on every launch (a wide GEMM's grid is a
+/// block a row tile and a column tile): its sibling projections run on side streams, the second
+/// and third inputs of a three-input visit hold forms of their own for that many columns
+/// ([`pass_bytes`]), and its mixes run the step's launch pair.
+pub const SMALL_PASS_ROWS: usize = 32;
+
 /// The card bytes of the buffers of a prompt pass of `rows` rows over `s`, four bytes a value:
 ///
 /// - f32 rows of the model's width: the stream, the attention mix's three inputs, the three
@@ -319,7 +325,9 @@ fn native_fp4_col_bytes(k: usize) -> usize {
 /// - u32 words: the ids, the positions, the live key counts, the ring slots, the first position
 ///   word and the router's picks (`n_used` a row);
 /// - the forms: the wide forms of the model's and the attention's site widths
-///   ([`wide_act_bytes`] of their types), the one-expert route table
+///   ([`wide_act_bytes`] of their types) and, twice more at [`SMALL_PASS_ROWS`] columns or the
+///   pass's rows if fewer, the model-width forms of a small pass's second and third inputs, the
+///   one-expert route table
 ///   ([`place_hybrid::route_bytes`]), the route block's buffers over the experts
 ///   ([`place_hybrid::ring_pass_bytes_in`] over every expert: the rows' and the slots' forms,
 ///   the gate and up rows, the route table) and, on a build that carries the native FP4 products
@@ -349,7 +357,9 @@ pub fn pass_bytes(s: &PassShape, rows: usize, native_fp4: bool) -> u64 {
             + s.n_used * s.n);
     let u32s = rows * (4 + s.n_used) + 1;
     let (cols, n, q64) = (rows as u64, s.n as u64, q as u64);
+    let small = cols.min(SMALL_PASS_ROWS as u64);
     let wide = wide_act_bytes(s.inner.iter().copied(), cols, n)
+        + 2 * wide_act_bytes(s.inner.iter().copied(), small, n)
         + wide_act_bytes(s.outer.iter().copied(), cols, q64);
     let route = place_hybrid::route_bytes(rows);
     let native = |cols: usize, k: usize, on: bool| {
@@ -550,15 +560,19 @@ mod tests {
         let f32s =
             512 * (29 * 2304 + 4 * 3072 + 4 * 1024 + 384 + 24 + 64 + 2 + 192 + 128 + 8 + 18_432);
         assert_eq!(f32s, 512 * 102_434);
-        let forms = 3_440_640 + 4_176 + 45_139_464;
+        // The two small-pass input forms: 32 columns of 2,304 values at 1.25 B a value, twice.
+        let small = 2 * 32 * 2_304 * 5 / 4;
+        assert_eq!(small, 184_320);
+        let forms = 3_440_640 + small + 4_176 + 45_139_464;
         assert_eq!(
             pass_bytes(&mini, 512, false),
             4 * (f32s + 512 * 12 + 1) as u64 + forms
         );
-        assert_eq!(pass_bytes(&mini, 512, false), 258_393_692);
+        // PIN(2026-11-28): the small pass's two input forms joined the formula (258_393_692 + 184_320).
+        assert_eq!(pass_bytes(&mini, 512, false), 258_578_012);
         assert_eq!(
             pass_bytes(&mini, 512, true),
-            258_393_692 + 512 * 1_300 + 4_096 * 652
+            258_578_012 + 512 * 1_300 + 4_096 * 652
         );
         let q8 = PassShape {
             gate_up_nvfp4: false,

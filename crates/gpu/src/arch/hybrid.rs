@@ -1384,50 +1384,92 @@ pub fn project_wide_on(
     sites: &mut [(&Site, usize, &mut DeviceBuffer<f32>)],
     branches: &mut [Branch],
 ) -> Result<(), GpuError> {
-    let Some(k) = sites.first().map(|s| s.0.k) else {
-        return Ok(());
-    };
-    if let Some(s) = sites.iter().find(|s| s.0.k != k) {
-        return Err(GpuError::shape(
-            cx.what,
-            format!(
-                "sites of one input read one width: {} reads {}, not {k}",
-                s.0.name, s.0.k
-            ),
-        ));
-    }
-    let tys: Vec<SiteTy> = sites.iter().map(|s| s.0.ty).collect();
-    acts.quantize(cx.gpu, &cx.wk, cx.gpu.layer_sink(layer)?, x, cx.m, &tys)?;
-    let input = acts.input(x);
-    let (mut forks, mut here) = (Vec::new(), Vec::new());
-    let mut spare = branches.iter_mut();
-    for (i, (s, rows, y)) in sites.iter_mut().enumerate() {
-        let side = if i == 0 { None } else { spare.next() };
-        let Some(branch) = side else {
-            here.push((s, rows, y));
+    project_wide_groups(
+        cx,
+        route,
+        layer,
+        &mut [WideGroup { acts, x, sites }],
+        branches,
+    )
+}
+
+/// One input of [`project_wide_groups`]: the rows `x`, the forms `acts` they are quantized into,
+/// and the sites that read them, each as [`project_wide`]'s.
+pub struct WideGroup<'a, 's, 'y> {
+    pub acts: &'a mut WideActs,
+    pub x: &'a DeviceBuffer<f32>,
+    pub sites: &'a mut [(&'s Site, usize, &'y mut DeviceBuffer<f32>)],
+}
+
+/// The projections of several inputs in one call: every group's rows are quantized first (each
+/// into its own `acts`, so no group's forms are overwritten under another's GEMMs), then every
+/// site is enqueued, the very first on the engine stream and each of the rest on its own of
+/// `branches`, any past their count on the engine stream, and the engine stream waits for all of
+/// them before it returns. As [`project_wide_on`] the bits are the serial calls': a site is its
+/// own launch whatever stream it is on and reads only its group's forms. The time of a call whose
+/// every launch is a few blocks is its longest site, not the sum of the groups'.
+pub fn project_wide_groups(
+    cx: &WideCx<'_>,
+    route: &GemmRoute,
+    layer: usize,
+    groups: &mut [WideGroup<'_, '_, '_>],
+    branches: &mut [Branch],
+) -> Result<(), GpuError> {
+    let (mut inputs, mut lists) = (Vec::new(), Vec::new());
+    for WideGroup { acts, x, sites } in groups.iter_mut() {
+        let Some(k) = sites.first().map(|s| s.0.k) else {
             continue;
         };
-        let fork = branch.fork()?;
-        site::gemm_on(
-            fork.stream(),
-            cx.gpu,
-            &cx.wk,
-            (s.ty, cx.w, SiteWeight::Resident(&s.name)),
-            *rows,
-            &input,
-            (route, GemmInput::PerSlot),
-            cx.m,
-            y,
-        )?;
-        forks.push(fork);
+        if let Some(s) = sites.iter().find(|s| s.0.k != k) {
+            return Err(GpuError::shape(
+                cx.what,
+                format!(
+                    "sites of one input read one width: {} reads {}, not {k}",
+                    s.0.name, s.0.k
+                ),
+            ));
+        }
+        let tys: Vec<SiteTy> = sites.iter().map(|s| s.0.ty).collect();
+        acts.quantize(cx.gpu, &cx.wk, cx.gpu.layer_sink(layer)?, x, cx.m, &tys)?;
+        inputs.push(acts.input(x));
+        lists.push(&mut **sites);
     }
-    for (s, rows, y) in here {
+    let (mut forks, mut here) = (Vec::new(), Vec::new());
+    let mut spare = branches.iter_mut();
+    let mut first = true;
+    for (g, list) in lists.iter_mut().enumerate() {
+        for (s, rows, y) in list.iter_mut() {
+            let side = if std::mem::take(&mut first) {
+                None
+            } else {
+                spare.next()
+            };
+            let Some(branch) = side else {
+                here.push((g, s, rows, y));
+                continue;
+            };
+            let fork = branch.fork()?;
+            site::gemm_on(
+                fork.stream(),
+                cx.gpu,
+                &cx.wk,
+                (s.ty, cx.w, SiteWeight::Resident(&s.name)),
+                *rows,
+                &inputs[g],
+                (route, GemmInput::PerSlot),
+                cx.m,
+                y,
+            )?;
+            forks.push(fork);
+        }
+    }
+    for (g, s, rows, y) in here {
         site::gemm(
             cx.gpu,
             &cx.wk,
             (s.ty, cx.w, SiteWeight::Resident(&s.name)),
             *rows,
-            &input,
+            &inputs[g],
             (route, GemmInput::PerSlot),
             cx.m,
             y,
