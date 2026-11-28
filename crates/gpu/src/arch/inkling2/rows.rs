@@ -41,7 +41,8 @@ pub(in crate::arch::inkling2) const VERIFY_ROWS: usize = MAX_PASS_ROWS;
 const _: () = assert!(VERIFY_ROWS == 8);
 
 /// A verify's own buffers beside the prompt pass's, whose rows it walks: the step's flash
-/// partials and card leg at [`VERIFY_ROWS`] rows, and its mixes' statistics and tickets at as many.
+/// partials and card leg at [`VERIFY_ROWS`] rows, and its mixes' statistics and tickets at as many
+/// (at the small pass's rows when those are more: the pass's mixes run the step's pair on them too).
 pub(in crate::arch::inkling2) struct VerifyBufs {
     pub(super) part_v: DeviceBuffer<f32>,
     pub(super) part_ms: DeviceBuffer<f32>,
@@ -68,7 +69,7 @@ impl VerifyBufs {
         Ok(VerifyBufs {
             part_v: z(VERIFY_ROWS * d.n_head * segs * HEAD)?,
             part_ms: z(VERIFY_ROWS * d.n_head * segs * 2)?,
-            mix: MixStepScratch::rows(stream, (d.n, VERIFY_ROWS))?,
+            mix: MixStepScratch::rows(stream, (d.n, VERIFY_ROWS.max(super::SMALL_ROWS)))?,
             leg: LegBufs::for_down(stream, shape, DownAct::Q8Blocks32)?,
         })
     }

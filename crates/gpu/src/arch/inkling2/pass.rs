@@ -60,9 +60,9 @@ use super::{
     MSG_K, MSG_Q, MSG_V, Placed, WHAT, conv_scale, head_logits, layer_card_stacks, q8_site,
     tap_widths,
 };
-use crate::arch::hybrid::{Site, WideCx, project_wide_on};
+use crate::arch::hybrid::{Site, WideCx, WideGroup, project_wide_groups, project_wide_on};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs};
-use crate::attn_res_step::AttnResStepKernels;
+use crate::attn_res_step::{AttnResStepKernels, MixStepScratch};
 use crate::card_leg::{LegStacks, RouteIo};
 use crate::card_slots::{CardAcc, CardSlotKernels};
 use crate::draft_taps::{DraftTaps, TapRowsSink};
@@ -111,8 +111,10 @@ const MSGS: usize = 4;
 
 /// Rows up to which a pass is a few-block grid on every launch (a wide GEMM's grid is a block a
 /// row tile and a column tile): the 170-SM card is mostly idle, so a visit's sibling projections
-/// run on side streams, each launch's latency under the longest one's instead of in a chain.
-const SMALL_ROWS: usize = 32;
+/// run on side streams, each launch's latency under the longest one's instead of in a chain, and
+/// its mixes run the step's launch pair (two launches for up to two mixes) instead of one launch
+/// a mix.
+const SMALL_ROWS: usize = place::SMALL_PASS_ROWS;
 
 /// Rows up to which a pass's controllers run the step's pair instead of the rows form
 /// ([`crate::loop_control`]: a block a row, bit-identical to the rows form, gate clauses 5 and 6): the
@@ -120,9 +122,10 @@ const SMALL_ROWS: usize = 32;
 /// a row, so it wins to 16 rows and loses by 32.
 const STEP_CTRL_ROWS: usize = 16;
 
-/// Side streams a small pass's sibling projections fork onto: a visit's widest call has six sites (eight
-/// with the draft's taps); the first, and any past these, run on the engine stream.
-const SIDE_STREAMS: usize = 5;
+/// Side streams a small pass's sibling projections fork onto: a windowless visit's three inputs
+/// project together, eight sites (q, the relative rows, the sinks and the gate; k and its taps; v
+/// and its taps); the first, and any past these, run on the engine stream.
+const SIDE_STREAMS: usize = 7;
 
 /// The prompt pass's shape for `hp` over `file`'s site types ([`place::pass_shape`]).
 pub(super) fn shape_of(hp: &Hparams, file: &Split) -> Result<PassShape, GpuError> {
@@ -195,6 +198,10 @@ struct Bufs {
     n_keys: DeviceBuffer<u32>,
     picks: DeviceBuffer<u32>,
     wide_n: WideActs,
+    /// The model-width forms of a small pass's second and third inputs ([`SMALL_ROWS`] columns):
+    /// a visit that projects three inputs quantizes each into its own, so their GEMMs run side by
+    /// side.
+    side_n: [WideActs; 2],
     wide_q: WideActs,
     dense: GemmRoute,
     /// The routed rows' inputs in the gate·up's form and the SwiGLU rows in the down's.
@@ -233,6 +240,14 @@ impl Bufs {
         } else {
             None
         };
+        let side = || {
+            WideActs::new(
+                stream,
+                WideActs::wants_of(inner).without_f32(),
+                rows.min(SMALL_ROWS),
+                n,
+            )
+        };
         Ok(Bufs {
             x: z(rn)?,
             mix: [z(rn)?, z(rn)?, z(rn)?],
@@ -268,6 +283,7 @@ impl Bufs {
             n_keys: w(rows)?,
             picks: w(slots)?,
             wide_n: WideActs::new(stream, WideActs::wants_of(inner).without_f32(), rows, n)?,
+            side_n: [side()?, side()?],
             wide_q: WideActs::new(stream, WideActs::wants_of(outer).without_f32(), rows, q)?,
             dense: GemmRoute::new(stream, rows, 1)?,
             x_rows: Rows::new(stream, rows, n, (s.forms.gate_up32, s.gate_up_nvfp4))?,
@@ -331,6 +347,7 @@ impl Bufs {
                 .map(|b| b.num_bytes())
                 .sum::<usize>()
             + self.wide_n.bytes()
+            + self.side_n.iter().map(WideActs::bytes).sum::<usize>()
             + self.wide_q.bytes()
             + self.dense.bytes()
             + self.x_rows.bytes()
@@ -713,8 +730,14 @@ impl Body {
         } = pass
             .as_mut()
             .ok_or(GpuError::state(WHAT, "a load with the pass's buffers"))?;
-        let (forced, verify) = match &tail {
-            Tail::Pass { at, .. } => (forced.as_ref().map(|f| (f, at.first)), None),
+        let (forced, verify, step_mix) = match &tail {
+            Tail::Pass { at, .. } => (
+                forced.as_ref().map(|f| (f, at.first)),
+                None,
+                (m <= SMALL_ROWS)
+                    .then(|| verify.as_mut().map(|v| &mut v.mix))
+                    .flatten(),
+            ),
             Tail::Verify => (
                 None,
                 Some(
@@ -722,6 +745,7 @@ impl Body {
                         .as_mut()
                         .ok_or(GpuError::state(WHAT, "a whole-card load"))?,
                 ),
+                None,
             ),
         };
         let mut r = RowWalk {
@@ -732,6 +756,7 @@ impl Body {
             b,
             forced,
             verify,
+            step_mix,
             branches: if m <= SMALL_ROWS {
                 &mut branches[..]
             } else {
@@ -1015,6 +1040,10 @@ struct RowWalk<'a> {
     verify: Option<&'a mut rows::VerifyBufs>,
     /// The side streams the sibling projections fork onto; empty past [`SMALL_ROWS`] rows.
     branches: &'a mut [Branch],
+    /// The statistics a small prompt pass's mixes run the step's launch pair on
+    /// ([`MixAt::mix_step`]); none on a verify (its own, [`rows::VerifyBufs`]) and past
+    /// [`SMALL_ROWS`] rows.
+    step_mix: Option<&'a mut MixStepScratch>,
     /// A block draft's taps ([`GpuModel::set_draft_taps`]), laid as the step's walk lays them;
     /// none on a load with no taps set (a placed one carries none).
     draft: Option<&'a mut DraftTaps>,
@@ -1288,6 +1317,7 @@ impl<'a> RowWalk<'a> {
             pos,
             n_keys,
             wide_n,
+            side_n,
             wide_q,
             dense,
             o,
@@ -1296,7 +1326,12 @@ impl<'a> RowWalk<'a> {
             ..
         } = &mut *self.b;
         // The message mixes (q, ffn, k, v) over the bank, then the attention mix's queries: the
-        // pass's entry a query a launch; a verify the step's pair, a query a job (rows.rs).
+        // step's pair (a query a job) on a verify and on a small pass, else a query a launch
+        // (rows.rs).
+        let mut scratch = match self.verify.as_deref_mut() {
+            Some(v) => Some(&mut v.mix),
+            None => self.step_mix.as_deref_mut(),
+        };
         if let Some(c) = ctrl {
             let LoopRows {
                 msg: msgs,
@@ -1306,16 +1341,16 @@ impl<'a> RowWalk<'a> {
             } = lp
                 .as_mut()
                 .ok_or(GpuError::state(CALL, "a looped trunk's message rows"))?;
-            if let Some(v) = self.verify.as_deref_mut() {
+            if let Some(sc) = scratch.as_deref_mut() {
                 let [mq, mf, mk, mv] = &mut *msgs;
                 let (bank, last, table) = (&*msg_bank, &*bank_last, &c.queries);
                 mx.mix_step((
-                    &mut v.mix,
+                    &mut *sc,
                     StepMix::new((bank, n_msg), last, (table, MSG_Q), mq),
                     Some(StepMix::new((bank, n_msg), last, (table, MSG_FFN), mf)),
                 ))?;
                 mx.mix_step((
-                    &mut v.mix,
+                    &mut *sc,
                     StepMix::new((bank, n_msg), last, (table, MSG_K), mk),
                     Some(StepMix::new((bank, n_msg), last, (table, MSG_V), mv)),
                 ))?;
@@ -1327,17 +1362,17 @@ impl<'a> RowWalk<'a> {
         }
         if let Some((query, nq)) = &layer.attn_query {
             let queries = w.f32_buf(CALL, query)?;
-            if let Some(v) = self.verify.as_deref_mut() {
+            if let Some(sc) = scratch {
                 let [y0, y1, y2] = &mut *mix;
                 let (bank, cur, table) = (&*banks, &*x, queries);
                 mx.mix_step((
-                    &mut v.mix,
+                    &mut *sc,
                     StepMix::new((bank, pushed), cur, (table, 0), y0),
                     (*nq > 1).then(|| StepMix::new((bank, pushed), cur, (table, 1), y1)),
                 ))?;
                 if *nq > 2 {
                     mx.mix_step((
-                        &mut v.mix,
+                        &mut *sc,
                         StepMix::new((bank, pushed), cur, (table, 2), y2),
                         None,
                     ))?;
@@ -1516,6 +1551,31 @@ impl<'a> RowWalk<'a> {
                     slot,
                     &normed[0],
                     &mut qs,
+                    &mut *self.branches,
+                )?;
+            } else if !self.branches.is_empty() {
+                let [wide_k, wide_v] = &mut *side_n;
+                project_wide_groups(
+                    &wc,
+                    dense,
+                    slot,
+                    &mut [
+                        WideGroup {
+                            acts: &mut *wide_n,
+                            x: &normed[0],
+                            sites: &mut qs,
+                        },
+                        WideGroup {
+                            acts: wide_k,
+                            x: &normed[1],
+                            sites: &mut ks,
+                        },
+                        WideGroup {
+                            acts: wide_v,
+                            x: &normed[2],
+                            sites: &mut vs,
+                        },
+                    ],
                     &mut *self.branches,
                 )?;
             } else {
@@ -1736,9 +1796,13 @@ impl<'a> RowWalk<'a> {
         } = &mut *self.b;
         let cur = if self.banked { &*attn_out } else { &*ffn_inp };
         let query = w.f32_buf(CALL, &layer.ffn_query)?;
-        if let Some(v) = self.verify.as_deref_mut() {
+        let scratch = match self.verify.as_deref_mut() {
+            Some(v) => Some(&mut v.mix),
+            None => self.step_mix.as_deref_mut(),
+        };
+        if let Some(sc) = scratch {
             mx.mix_step((
-                &mut v.mix,
+                sc,
                 StepMix::new((&*banks, self.pushed), cur, (query, 0), fmix),
                 None,
             ))?;
