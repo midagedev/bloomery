@@ -1,0 +1,32 @@
+# ppdraft: the history draft (BLOOMERY_DRAFT=lookup|recall) on the qwen3 seat ran a prompt's last id as a decode step of its own
+# (Q3::prefill_next: closes = draft.rows() == 1 && Body::closes, false for a history draft whose rows() is its window), where the draft-off
+# arm folds it into the closing call. The fix: closes = !draft.takes_prompt_call() && Body::closes (only the DSpark draft takes the call).
+# Decomposition (paper.md in /root/agents/specs/ppdraft/): measured delta of the prompt wall, draft arm - off arm = +10.48 / +10.56 ms
+# (lookup / recall) at D=512 and +10.40 / +10.91 ms at D=3179 [derived from recallwire's ROW lines, 4 rounds]: one constant a request,
+# equal for lookup and recall, absent on the Inkling seat. Code term: the closing call's last row (0.31 ms at 1/3217 s) replaced by one
+# plain decode step (11.37 ms = 1/87.93 s, draft-off tg at D=512 [measured]); delta predicted 10.0..11.5 ms (T_step - T_fold = 11.06 ms,
+# the fold's seal/keep-last overhead [not measured] widens the band down). Resource timeline: the card is the only busy unit; the step reads
+# the state the unread call writes, so the wall is the sum and the removed step is on it in full (no shadow).
+# Prediction at D=512: recall pp base 512/169.69 ms = 3017 tok/s; after the fix 512/(169.69 - 10.0..11.5 ms) = 3206..3237 tok/s,
+# i.e. +6.3..+7.3 % over the base build's recall arm; +-0.3 % build-to-build scatter widens the band to +6.0..+7.6.
+# Second claim, read from the same table: the new build's recall pp is within 1 % of its own off arm (predicted -0.5..+0.5 %).
+kind: ab
+question: does the new build (the history draft's prompt call folds its last id as the draft-off path does) bring the prompt rate of
+  BLOOMERY_DRAFT=recall on Qwen3.8-27B back to the draft-off arm's, and by how much over the base build's recall arm?
+term: prompt tok/s (timings.prompt_per_second) of the new build's recall arm over the base build's recall arm, paired by round @ D = 512
+  prose ids, n_predict 256, LCPP_WARM_EOS=stop, one slot, bloomery-serve at the serving defaults except BLOOMERY_DRAFT, Qwen3.8-27B
+  Q4_K_M, RTX 5090
+unit: %
+predict: 6.0..7.6
+rounds: 4
+sd: 0.2 % recallwire prose-qwen38d.log (pp sd of the four arms' 4 rounds: 0.07..0.22 %), for a build-to-build pair kept at 0.2 %
+condition: four arms in one runner call and one lease, 4 rounds, the order rotated: BLOOMERY_DRAFT=off and =recall on the base build
+  (clean main e99204ffd, ~/repo/bloomery-pplook) and on the new build (~/repo/bloomery-pplook-new); no row carries [cpu-busy] or [other-busy];
+  every request has draft_n above 0 on the recall arms (the runner's EOS mode stop, so a drafted seat runs passes). The sha256 of both
+  binaries is printed before and after and equal. The second claim (new recall within 1 % of new off) is the table's means, computed with
+  card.py's half-width.
+decide-in: the term is the removed step: land the fix (the lead merges), then ask the owning gates' record for the same.
+decide-below: part of the 10 ms stays in the draft arm: read the ppstamp look (probe build) for the phase that still costs it and
+  re-derive before any other change; the fix is kept only if the table still shows a gain over the base.
+decide-above: the draft-off arm of the new build moved too (a build-to-build term): compare the two off arms and re-derive the base before
+  crediting the fix.

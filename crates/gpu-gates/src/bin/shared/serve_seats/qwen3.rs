@@ -1353,10 +1353,12 @@ impl<B: Body3> Seat for Q3<B> {
     /// ([`app::Prompt::closes`]), the target's row read after it. A call the
     /// DSpark draft takes (its call feeds the draft's rows besides the
     /// target's) and one the body does not fold take the call less that id,
-    /// then its step ([`bind::prefill_then_step`]).
+    /// then its step ([`bind::prefill_then_step`]). A history draft takes no
+    /// call: the closing call runs through [`ServedDraft::prefill`], which feeds
+    /// the ids and the argmax to the slot's context.
     fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
-        let closes =
-            self.draft.rows() == 1 && <B as app::Prompt>::closes(self.s.model(), ids.len())?;
+        let closes = !self.draft.takes_prompt_call()
+            && <B as app::Prompt>::closes(self.s.model(), ids.len())?;
         bind::prefill_closing(self, ids, row, closes)
     }
 

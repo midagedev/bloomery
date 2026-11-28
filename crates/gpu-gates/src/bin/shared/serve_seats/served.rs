@@ -458,6 +458,14 @@ where
         }
     }
 
+    /// Whether the draft takes the prompt call in the seat's place: the DSpark
+    /// draft's own call feeds its rows besides the target's, where a history
+    /// draft's call is the seat's own ([`ServedDraft::prefill`]'s `plain`) with
+    /// its ids fed to the slot's context, and no draft leaves the call as it is.
+    pub fn takes_prompt_call(&self) -> bool {
+        self.dspark.is_some()
+    }
+
     /// Whether the draft's state is per slot (`Seat::slot_drafts`): the
     /// lookup's is, a context a slot.
     pub fn slot_drafts(&self) -> bool {
