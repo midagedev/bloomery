@@ -61,6 +61,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bloomery_gpu::GpuError;
+use bloomery_gpu::checkpoint::bytes::Fail;
 use bloomery_gpu::checkpoint::saved::{Pending as Saving, SeqView};
 use bloomery_gpu::checkpoint::staging::NoRoom;
 use bloomery_gpu::model::{SlotRows, slots_a_pass};
@@ -3141,6 +3142,22 @@ pub fn seat_failure(e: &(dyn std::error::Error + 'static), what: String) -> Stat
     }
 }
 
+/// A failure of a slot file's byte form (`bloomery_gpu::checkpoint::bytes`) as
+/// the server's kind: a refusal by name is the request's (`Format`), a failure
+/// of the stream the file's (`Io`), a failure of the card's copy the engine's
+/// ([`seat_failure`]), and so is a restore whose reset failed too: what the
+/// model holds is unknown.
+pub fn byte_failure(e: Fail) -> StateError {
+    match e {
+        Fail::Refused(e) => StateError::Format(e.to_string()),
+        Fail::Io(e) => StateError::Io(e),
+        Fail::Card(e) => seat_failure(&e, "a slot file's card copy".to_owned()),
+        e @ Fail::Reset { .. } => {
+            StateError::Engine(EngineError(format!("a slot file's restore: {e}")))
+        }
+    }
+}
+
 /// A copy on a seat's save lane, as the cache's entry for its state waits for
 /// it ([`Cached`]) and the server's [`Flight`] polls it.
 pub trait Landing: Send + Sync {
@@ -4797,6 +4814,38 @@ mod tests {
         assert!(
             e.to_string().starts_with("--slot-save-path needs a value"),
             "{e}"
+        );
+    }
+
+    /// A slot file's byte-form failures reach the server as their kinds: a refusal by name the
+    /// request's, the stream's error the file's, the card's the engine's, and a restore whose
+    /// reset failed too the engine's, whatever the restore's own kind was, with both named: only
+    /// the engine's ends the server. Mutant: the `Reset` arm of [`byte_failure`] as `Format`.
+    #[test]
+    fn a_slot_files_failures_reach_the_server_as_their_kinds() {
+        use super::byte_failure;
+        use bloomery_gpu::GpuError;
+        use bloomery_gpu::checkpoint::bytes::Fail;
+        use serve::StateError;
+        let driver = || GpuError::Protocol {
+            what: "a test copy",
+            detail: "the card went".to_owned(),
+        };
+        let refusal = || Fail::Refused(GpuError::shape("a test state", "a short stream"));
+        assert!(matches!(byte_failure(refusal()), StateError::Format(_)));
+        let closed = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the pipe closed");
+        assert!(matches!(byte_failure(Fail::Io(closed)), StateError::Io(_)));
+        assert!(matches!(
+            byte_failure(Fail::Card(driver())),
+            StateError::Engine(_)
+        ));
+        let StateError::Engine(e) = byte_failure(refusal().with_reset(Err(driver()))) else {
+            panic!("a failed reset after a refusal is not the engine's");
+        };
+        assert!(
+            e.0.contains("a short stream") && e.0.contains("the card went"),
+            "{}",
+            e.0
         );
     }
 

@@ -143,7 +143,8 @@ use super::wide38::{
 use crate::DeviceBufferRaw;
 use crate::checkpoint::bytes::{self, Fail, Put, refused};
 use crate::checkpoint::saved::{
-    HostBytes, Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams,
+    HostBytes, Identity, Lent, Live, Pending, SaveLane, SeqState, SeqView, Spans, StateHead,
+    Streams,
 };
 use crate::checkpoint::staging::NoRoom;
 use crate::checkpoint::{self, Checkpoints};
@@ -246,7 +247,29 @@ impl Seq38 {
     pub fn keep_point(&self, n: u32) -> u32 {
         self.state.keep_point(n)
     }
+}
 
+/// A Qwen3.8 state read up to its arrays for a streamed restore
+/// ([`GpuModel::seq_restore_head`]): the shared state's head and the PLE
+/// histories, checked against the model it is to be put on.
+pub struct Head38 {
+    state: StateHead<History>,
+}
+
+impl Head38 {
+    /// The positions the state holds.
+    #[must_use]
+    pub fn positions(&self) -> u32 {
+        self.state.positions()
+    }
+}
+
+/// The draft's side of a state read from its byte form by a streamed
+/// restore ([`GpuModel::seq_restore_arrays`]): its [`DraftRows38`], or none
+/// for a state saved without the draft.
+pub struct Draft38(Option<DraftRows38>);
+
+impl Draft38 {
     /// Refused by name unless a draft walk from `pos0` that reads rows
     /// `first .. first + m` of the `walk` arena reads the target's final
     /// hidden rows the state carries for the positions before it, as the
@@ -260,7 +283,7 @@ impl Seq38 {
         pos0: u32,
     ) -> Result<(), Fail> {
         let d = self
-            .draft
+            .0
             .as_ref()
             .ok_or_else(|| refused("a parked MTP draft on a state without the draft's side"))?;
         let records = match walk {
@@ -279,6 +302,24 @@ const STATE_TAG: [u8; 8] = *b"BLMQ38SQ";
 /// The byte form's layout ([`Seq38::put`]): raised whenever a part, its
 /// order or its encoding changes.
 const STATE_FORMAT: u32 = 1;
+
+/// A Qwen3.8 state's first bytes in its byte form: the tag and the format.
+fn put_tag(w: &mut Put<'_>) -> Result<(), Fail> {
+    w.vals(&STATE_TAG)?;
+    w.one(STATE_FORMAT)
+}
+
+/// The draft's side at the end of a state's byte form: a u8, 0 for none or 1
+/// with its [`DraftRows38`] after it.
+fn put_draft_side(w: &mut Put<'_>, draft: Option<&DraftRows38>) -> Result<(), Fail> {
+    match draft {
+        None => w.one(0u8),
+        Some(d) => {
+            w.one(1u8)?;
+            d.put(w)
+        }
+    }
+}
 
 /// A PLE history in a state's byte form: its tokens (a count, then each,
 /// u32), then the position it stands before (u64).
@@ -314,22 +355,49 @@ fn check_ple_history(h: &History, len: usize, window: &Window) -> Result<(), Fai
     Ok(())
 }
 
+/// Refused by name unless the PLE history of the position `at` stands at
+/// `at`, and each point's at its own position.
+fn check_ple_stands(
+    what: &'static str,
+    (at, current): (u32, &History),
+    points: &[(u32, History)],
+) -> Result<(), GpuError> {
+    let off = std::iter::once((at, current))
+        .chain(points.iter().map(|(p, h)| (*p, h)))
+        .find(|&(p, h)| h.next_pos() != u64::from(p));
+    match off {
+        Some((p, h)) => Err(GpuError::shape(
+            what,
+            format!(
+                "a state whose PLE history at {p} stands at {}",
+                h.next_pos()
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Refused by name: a state without the draft's side put back on a load with
+/// the draft.
+fn draft_side_missing(what: &'static str) -> GpuError {
+    GpuError::shape(
+        what,
+        "a state without the draft's side put back on a load with the draft (the store layouts \
+         differ)"
+            .to_owned(),
+    )
+}
+
 impl Seq38 {
     /// The state in its byte form (`checkpoint::bytes`), what a slot file
     /// carries: [`STATE_TAG`], [`STATE_FORMAT`] (u32), the shared state
     /// ([`SeqState::put`]), then the draft's side (u8: 0 none, 1 its
-    /// [`DraftRows38`] after it). [`GpuModel::seq_take`] reads it back.
+    /// [`DraftRows38`] after it). [`GpuModel::seq_restore_head`] and the parts after it
+    /// read it back onto the card.
     pub fn put(&self, w: &mut Put<'_>) -> Result<(), Fail> {
-        w.vals(&STATE_TAG)?;
-        w.one(STATE_FORMAT)?;
+        put_tag(w)?;
         self.state.put(w)?;
-        match &self.draft {
-            None => w.one(0u8),
-            Some(d) => {
-                w.one(1u8)?;
-                d.put(w)
-            }
-        }
+        put_draft_side(w, self.draft.as_ref())
     }
 }
 
@@ -3643,6 +3711,29 @@ impl Body38 {
         })
     }
 
+    /// The sequence state at `pos` written to `w` in the byte form
+    /// [`Seq38::put`] writes ([`SeqState::put_save`], the draft's store rows
+    /// among the positional rows), straight from the card and the
+    /// checkpoints' host slots, a bounded chunk at a time. Everything
+    /// [`Body38::save_state`] refuses is refused before the first byte: the
+    /// tag is `put_save`'s lead, written after its last refusal.
+    fn put_state(&mut self, stream: &CudaStream, pos: u32, w: &mut Put<'_>) -> Result<(), Fail> {
+        let (written, draft) = self
+            .take_state(stream, pos, |who, lent, current, points, ckpt| {
+                let live = Live {
+                    current: &current,
+                    points: &points,
+                    ckpt,
+                };
+                Ok(SeqState::put_save(
+                    w, stream, &who, pos, lent, live, put_tag,
+                ))
+            })
+            .map_err(Fail::card)?;
+        written?;
+        put_draft_side(w, draft.as_ref())
+    }
+
     /// [`Body38::save_state`] with the copy on `lane`'s stream into its
     /// pinned staging ([`SeqState::save_async`]), the draft's store rows in
     /// it: the state and its copy in flight, or [`NoRoom`], nothing begun.
@@ -3880,14 +3971,7 @@ impl Body38 {
         let n = s.positions();
         match &s.draft {
             Some(d) => self.draft_fits(d, n)?,
-            None if self.mtp.is_some() => {
-                return Err(GpuError::shape(
-                    WHAT_L,
-                    "a state without the draft's side put back on a load with the draft (the \
-                     store layouts differ)"
-                        .to_owned(),
-                ));
-            }
+            None if self.mtp.is_some() => return Err(draft_side_missing(WHAT_L)),
             None => {}
         }
         let lane = self.lane.lane();
@@ -3918,20 +4002,28 @@ impl Body38 {
                 .load_prefix(stream, &self.who, &mut lent, &mut self.ckpt, ask)?;
             (r.at, r.current.clone(), r.points.to_vec())
         };
-        let off = std::iter::once((at, &cur))
-            .chain(pts.iter().map(|(p, h)| (*p, h)))
-            .find(|&(p, h)| h.next_pos() != u64::from(p));
-        if let Some((p, h)) = off {
+        if let Err(e) = check_ple_stands(WHAT_L, (at, &cur), &pts) {
             self.ckpt.clear();
-            return Err(GpuError::shape(
-                WHAT_L,
-                format!(
-                    "a state whose PLE history at {p} stands at {}",
-                    h.next_pos()
-                ),
-            ));
+            return Err(e);
         }
-        if let Some(d) = &s.draft {
+        self.stand_restored(stream, (n, at), (cur, pts), s.draft.as_ref())?;
+        Ok(at)
+    }
+
+    /// The model standing at `at` of a state of `n` positions put back on
+    /// the empty model, its rows and recurrent stores and points already on
+    /// the card and in the checkpoints: the draft's side `draft` put back
+    /// ([`Body38::put_draft_rows`]) with its point rows up to `at`, the
+    /// committed lane stamped at `at`, and the PLE history and its points the
+    /// state's.
+    fn stand_restored(
+        &mut self,
+        stream: &CudaStream,
+        (n, at): (u32, u32),
+        (current, points): (History, Vec<(u32, History)>),
+        draft: Option<&DraftRows38>,
+    ) -> Result<(), GpuError> {
+        if let Some(d) = draft {
             self.put_draft_rows(stream, d, n, at)?;
             self.point_rows = d
                 .point_rows
@@ -3940,11 +4032,12 @@ impl Body38 {
                 .cloned()
                 .collect();
         }
+        let lane = self.lane.lane();
         self.restamp(stream, lane, at)?;
-        self.ple.hist = cur;
-        self.ple_points = pts;
+        self.ple.hist = current;
+        self.ple_points = points;
         self.held = at;
-        Ok(at)
+        Ok(())
     }
 
     /// The first positions of `src`, another slot's sequence, up to its
@@ -5427,13 +5520,35 @@ impl GpuModel<Body38> {
         body.save_state(gpu.stream(), pos)
     }
 
-    /// The state [`Seq38::put`] wrote, read for this load, the model
-    /// untouched: refused by name for another tag or format, a state of
-    /// another model ([`SeqState::take`]), and a PLE history of another
-    /// length than the load's or with an id the load's hash refuses. The put back ([`GpuModel::seq_resume`])
-    /// holds the rest to the stores.
-    pub fn seq_take(&self, r: &mut bytes::Take<'_>) -> Result<Seq38, Fail> {
-        let body = self.body("qwen4exp state read").map_err(Fail::Refused)?;
+    /// The sequence state written to `w` in the byte form [`Seq38::put`]
+    /// writes, straight from the card, a bounded chunk at a time: no copy of
+    /// the state is held on the host, and the model is as it was. Refused by
+    /// name as [`GpuModel::seq_save`] refuses, before the first byte; a
+    /// failure of the card is [`Fail::Card`], of the stream [`Fail::Io`].
+    pub fn seq_put(&mut self, w: &mut Put<'_>) -> Result<(), Fail> {
+        const WHAT_S: &str = "qwen4exp snapshot";
+        self.settle_ahead(WHAT_S).map_err(Fail::card)?;
+        self.refuse_if_poisoned(WHAT_S).map_err(Fail::card)?;
+        let pos = self.pos();
+        let (gpu, _, body) = self.body_parts(WHAT_S).map_err(Fail::card)?;
+        body.put_state(gpu.stream(), pos, w)
+    }
+
+    /// The first part of a streamed restore of the state [`Seq38::put`] or
+    /// [`GpuModel::seq_put`] wrote, which the skeleton of
+    /// [`crate::checkpoint::restore::restore_streamed`] runs before it
+    /// resets the model: the tag and the format, the shared state's head
+    /// ([`SeqState::take_state_head`]) and the PLE histories, checked
+    /// against this load and its stores. Refused by name, the model
+    /// untouched, for another tag or format, a state of another model
+    /// ([`Identity`]), a PLE history of another length than the load's, with
+    /// an id the load's hash refuses or standing off its position, runs or
+    /// recurrent stores that are not the model's own, and while a pass of
+    /// several slots waits for its commit.
+    pub fn seq_restore_head(&mut self, r: &mut bytes::Take<'_>) -> Result<Head38, Fail> {
+        const WHAT_R: &str = "qwen4exp restore";
+        self.refuse_if_slots_wait(WHAT_R).map_err(Fail::card)?;
+        let (_, _, body) = self.body_parts(WHAT_R).map_err(Fail::card)?;
         let tag = r.vals::<u8>(STATE_TAG.len(), "the tag")?;
         let format: u32 = r.one("the format")?;
         if tag != STATE_TAG || format != STATE_FORMAT {
@@ -5443,20 +5558,113 @@ impl GpuModel<Body38> {
                 String::from_utf8_lossy(&tag)
             )));
         }
-        let state = SeqState::<History>::take(r, &body.who)?;
+        let head = SeqState::<History>::take_state_head(r, &body.who)?;
         let n_gram = body.ple.hist.tokens().len();
-        for h in state.values() {
+        for h in std::iter::once(head.current()).chain(head.points().iter().map(|(_, h)| h)) {
             check_ple_history(h, n_gram, body.ple.hash.window())?;
         }
-        let draft = match r.one::<u8>("the draft's side")? {
+        check_ple_stands(WHAT_R, (head.positions(), head.current()), head.points())
+            .map_err(Fail::card)?;
+        let Body38 {
+            stores,
+            ple_ring,
+            lane,
+            ctx,
+            mtp,
+            ckpt,
+            ..
+        } = body;
+        let mut c = Copied::of(
+            stores,
+            ple_ring,
+            lane.lane(),
+            Some((*ctx, head.positions() as usize)),
+            mtp.as_mut(),
+        )
+        .map_err(Fail::card)?;
+        let (positional, mut recurrent) = c.list_split();
+        let lent = Lent {
+            positional,
+            recurrent: &mut recurrent,
+        };
+        head.check(&lent, ckpt).map_err(Fail::card)?;
+        Ok(Head38 { state: head })
+    }
+
+    /// The arrays of a streamed restore, on the model the skeleton reset
+    /// ([`GpuModel::seq_restore_head`]): the stores backed for the state's
+    /// positions, its rows and recurrent stores read from `r` onto the card
+    /// a bounded chunk at a time and its points into the checkpoints
+    /// ([`StateHead::take_arrays`]), then the draft's side of the byte form
+    /// (a u8, 0 for none or 1 with its [`DraftRows38`] after it). A refusal
+    /// or a failure of the stream or the card here leaves the model for the
+    /// caller to reset; so does a state without the draft's side put on a
+    /// load with the draft.
+    pub fn seq_restore_arrays(
+        &mut self,
+        r: &mut bytes::Take<'_>,
+        head: &Head38,
+    ) -> Result<Draft38, Fail> {
+        const WHAT_R: &str = "qwen4exp restore";
+        let n = head.positions() as usize;
+        let (gpu, _, body) = self.body_parts(WHAT_R).map_err(Fail::card)?;
+        for st in &mut body.stores {
+            st.fit(n).map_err(Fail::card)?;
+        }
+        if let Some(d) = body.mtp.as_mut() {
+            d.fit_store(n).map_err(Fail::card)?;
+        }
+        let Body38 {
+            stores,
+            ple_ring,
+            lane,
+            ctx,
+            mtp,
+            ckpt,
+            ..
+        } = &mut *body;
+        {
+            let mut c = Copied::of(stores, ple_ring, lane.lane(), Some((*ctx, n)), mtp.as_mut())
+                .map_err(Fail::card)?;
+            let (positional, mut recurrent) = c.list_split();
+            let mut lent = Lent {
+                positional,
+                recurrent: &mut recurrent,
+            };
+            head.state.take_arrays(r, gpu.stream(), &mut lent, ckpt)?;
+        }
+        let rows = match r.one::<u8>("the draft's side")? {
             0 => None,
             1 => Some(DraftRows38::take(r)?),
             c => return Err(refused(format!("a draft's side of code {c}"))),
         };
-        Ok(Seq38 {
-            state: Arc::new(state),
-            draft,
+        if rows.is_none() && body.mtp.is_some() {
+            return Err(Fail::card(draft_side_missing(WHAT_R)));
+        }
+        Ok(Draft38(rows))
+    }
+
+    /// The end of a streamed restore, after the stream ended where it must:
+    /// the model stands at the state's positions with the draft's side put
+    /// back ([`Body38::stand_restored`]), the calls after it bit for bit
+    /// those after the state was taken. A state of no positions leaves the
+    /// model reset. The draft's side is refused by name, as
+    /// [`Body38::draft_fits`] refuses it, before it is put back. Returns the
+    /// positions.
+    pub fn seq_restore_stand(&mut self, head: Head38, draft: Draft38) -> Result<u32, Fail> {
+        const WHAT_R: &str = "qwen4exp restore";
+        let n = head.positions();
+        if n == 0 {
+            self.reset().map_err(Fail::card)?;
+            return Ok(0);
+        }
+        let host = head.state.into_host();
+        self.run_rows(n as usize, WHAT_R, |gpu, _, body, _, _| {
+            body.stand_restored(gpu.stream(), (n, n), host, draft.0.as_ref())?;
+            Ok(false)
         })
+        .map_err(Fail::card)?;
+        Ok(n)
     }
 
     /// The host arrays a sequence save would hold, without reading the card.

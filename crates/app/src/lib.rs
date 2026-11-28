@@ -42,6 +42,7 @@ pub mod warm;
 pub use bloomery_gpu::card_bytes::PhaseBytes;
 
 use bloomery_gpu::best;
+use bloomery_gpu::checkpoint::restore::Resettable;
 use bloomery_gpu::folder::Model;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::served::prompt_pass;
@@ -1418,9 +1419,17 @@ impl<B: Prompt + Keep> Target for Session<B> {
     }
 
     fn reset(&mut self) -> Result<(), SessionError> {
+        Ok(Resettable::reset(self)?)
+    }
+}
+
+/// The session a streamed restore resets ([`Resettable`]): the calls it
+/// holds in flight dropped, then the model empty, as [`Target::reset`] does.
+impl<B: ChainBody> Resettable for Session<B> {
+    fn reset(&mut self) -> Result<(), GpuError> {
         self.rows = None;
         self.slots_waiting = None;
-        Ok(self.model.reset()?)
+        self.model.reset()
     }
 }
 

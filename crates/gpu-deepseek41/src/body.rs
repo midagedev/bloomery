@@ -148,7 +148,8 @@ pub use prefill::{
 use seq::RowSeqs;
 pub use seq::{KeepLimit, Seq};
 pub use snap::{
-    SeqSnapshot, StateFail, restore_state, resume, save_state, snapshot, snapshot_size,
+    SeqSnapshot, StateFail, restore_state, restore_state_chunked, resume, save_state,
+    save_state_chunked, snapshot, snapshot_size,
 };
 
 /// The V4.1 engine: the shared skeleton over this body.

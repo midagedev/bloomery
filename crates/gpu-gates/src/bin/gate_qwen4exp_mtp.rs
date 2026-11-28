@@ -300,6 +300,7 @@ mod gate {
         MTP_STORE_ROWS_MOST, Mtp38, MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38, SplitWalk,
         Store38Host, TargetRows, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
+    use bloomery_gpu::checkpoint::bytes::Put;
     use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, Proposal, WalkMode};
     use bloomery_gpu::fault::FaultSite;
     use bloomery_gpu::kv_format::KvQ8;
@@ -3601,6 +3602,8 @@ mod gate {
     /// (kp-draft): a cut to a point and a prefix restore to it keep the draft. A drafted run
     /// with a point at its prompt's end (`p`) below its end is saved; put back whole, the
     /// draft's store holds its saved count, which can trail the target (the contrast).
+    /// The state streamed from the card (`seq_put`) is the held state's bytes ([`Seq38::put`]'s
+    /// layout) first; mutant: the streamed save without the draft's side.
     /// Then the state put back whole and cut to `p` by `rollback`, the state put back as its first `p` positions
     /// (`seq_resume_prefix` asked one short of the end), and a state saved there put back whole
     /// each stand at `p` with the draft rejoined ([`AtPoint::rejoined`]): the draft's store
@@ -3620,6 +3623,26 @@ mod gate {
         let (mut m, first, point_row) = drafted_run(m, prompt, N)?;
         let end = DraftEnd::read(&m)?;
         let state = m.seq_save()?;
+        // The state streamed from the card is the bytes of the held state's layout ([`Seq38::put`]):
+        // the tag, the shared state with its points and PLE histories, the draft's side.
+        let (held_bytes, streamed_bytes) = {
+            let (mut held, mut streamed) = (Vec::new(), Vec::new());
+            let mut w = Put::new(&mut held);
+            state.put(&mut w)?;
+            w.flush()?;
+            let mut w = Put::new(&mut streamed);
+            m.seq_put(&mut w)?;
+            w.flush()?;
+            (held, streamed)
+        };
+        let streamed_ok = held_bytes == streamed_bytes;
+        println!(
+            "(kp-draft) the state streamed from the card is the held state's {} bytes: {} bytes \
+             {}",
+            held_bytes.len(),
+            streamed_bytes.len(),
+            verdict(streamed_ok)
+        );
         let n = state.positions();
         let ask = n.saturating_sub(1);
         let at = state.keep_point(ask);
@@ -3738,7 +3761,7 @@ mod gate {
         );
         Ok((
             m,
-            contrast && roll_ok && pre_ok && same && saved_ok && fresh_ok,
+            streamed_ok && contrast && roll_ok && pre_ok && same && saved_ok && fresh_ok,
         ))
     }
 

@@ -454,6 +454,7 @@
 //! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
 //! kinds and exits.
 
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -468,6 +469,7 @@ use bloomery_gpu::arch::qwen3moe::{
 };
 use bloomery_gpu::autotune::{MCOL_KERNEL, Mcol};
 use bloomery_gpu::checkpoint::bytes;
+use bloomery_gpu::checkpoint::restore::restore_streamed;
 use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::costs::{Source, Store};
 use bloomery_gpu::host::route_trace::RouteTrace;
@@ -480,8 +482,8 @@ use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     AutoSlots, CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine,
     SlotFlags, SlotPassRow, SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin,
-    bind_server, eprint_noted, model_props, note_line, parallel_line, place_word, placement_of,
-    prefill_closing, put_back, seat_failure, slots_of,
+    bind_server, byte_failure, eprint_noted, model_props, note_line, parallel_line, place_word,
+    placement_of, prefill_closing, put_back, seat_failure, slots_of,
 };
 use bloomery_gpu_gates::generate::{
     BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, lane_of,
@@ -3676,16 +3678,6 @@ fn arena_of(code: u8) -> Option<(TargetRows, usize)> {
     .find(|&(a, _)| arena_code(a) == code)
 }
 
-/// A failure of a slot file's byte form as the server's kind: a refusal by
-/// name is the request's (`Format`), a failure of the stream the file's
-/// (`Io`).
-fn byte_failure(e: bytes::Fail) -> StateError {
-    match e {
-        bytes::Fail::Refused(e) => StateError::Format(e.to_string()),
-        bytes::Fail::Io(e) => StateError::Io(e),
-    }
-}
-
 /// The draft's three steps around a Qwen3.8 state's put-back ([`put_back`]).
 impl PutBack for Q38 {
     type Body = Seq38;
@@ -4210,58 +4202,79 @@ impl Seat for Q38 {
     }
 
     /// The selected slot's state as [`Seat::snapshot`] takes it, in its
-    /// byte form: the body's ([`Seq38::put`]), then the draft's side
-    /// ([`ParkedDraft::put`]); the bytes written. Refused as the snapshot
-    /// refuses (a sequence that holds an image).
+    /// byte form: the body's (`GpuModel::seq_put`, the bytes [`Seq38::put`]
+    /// writes, copied from the card a bounded chunk at a time), then the
+    /// draft's side ([`ParkedDraft::put`]); the bytes written. Refused as the
+    /// snapshot refuses (a sequence that holds an image), before the first
+    /// byte.
     fn save_state(&mut self, out: &mut dyn Write) -> Result<u64, StateError> {
         let failed = |e: GateError| seat_failure(&*e, "a slot save".to_owned());
-        let saved = Seat::snapshot(self).map_err(failed)?;
-        let saved = Saved38::of(&*saved, WHOSE).map_err(failed)?;
+        self.refuse_images("qwen38::snapshot").map_err(failed)?;
+        let sel = self.s.selected();
+        let draft = self.drafts.park(sel).map_err(failed)?;
         let mut w = bytes::Put::new(out);
-        saved
-            .body()
-            .map_err(failed)?
-            .put(&mut w)
-            .map_err(byte_failure)?;
-        ParkedDraft::put(saved.draft.as_ref(), &mut w, arena_code, &OFF_WHYS)
-            .map_err(byte_failure)?;
+        self.s.model_mut().seq_put(&mut w).map_err(byte_failure)?;
+        ParkedDraft::put(draft.as_ref(), &mut w, arena_code, &OFF_WHYS).map_err(byte_failure)?;
         w.flush().map_err(byte_failure)?;
         Ok(w.bytes())
     }
 
-    /// The state [`Seat::save_state`] wrote, read whole and then put back
-    /// into the selected slot as [`Seat::resume`] puts back a cached one: the
-    /// slot's next call runs as it would have with no save between, its
-    /// draft joining where it left. Refused by name, nothing on the card
-    /// touched, for a stream that is not such a state of this load, for
-    /// one saved under another draft ([`PutBack::takes`]), and for a draft's
-    /// side the state cannot carry: an id past the vocabulary or rows waiting
-    /// that the state's arenas do not hold ([`ParkedDraft::check`]). The file
-    /// does not name the MTP draft's weights: a draft file other than the
+    /// The state [`Seat::save_state`] wrote, put back into the selected slot
+    /// as it is read, never held whole on the host
+    /// ([`restore_streamed`]): the header, the PLE histories and the layout
+    /// against the stores are read and checked first ([`GpuModel::seq_restore_head`]),
+    /// a refusal there leaving the session and the slot's draft untouched;
+    /// then the session is reset and the slot's draft started over, the
+    /// arrays go to the card a bounded chunk at a time
+    /// ([`GpuModel::seq_restore_arrays`]), and the draft's side follows them
+    /// in the stream: it is read, and refused by name for one saved under
+    /// another draft ([`SlotDrafts::takes`]), an id past the vocabulary or
+    /// rows waiting that the state's arenas do not hold
+    /// ([`ParkedDraft::check`]). A refusal there, a stream that ends or
+    /// fails or goes on past the state, and a draft side the body cannot take
+    /// leave the session reset (the server resets the slot then); the
+    /// session stands at the state's positions and the draft's side joins the
+    /// slot's next call where it left only once the stream ended where it
+    /// must ([`GpuModel::seq_restore_stand`], [`SlotDrafts::unpark`]). The
+    /// file does not name the MTP draft's weights: a draft file other than the
     /// save's drafts from the saved store, which the target's verify keeps
     /// correct at a lower acceptance.
     fn restore_state(&mut self, input: &mut dyn Read) -> Result<usize, StateError> {
         let mut r = bytes::Take::new(input);
-        let body = self.s.model().seq_take(&mut r).map_err(byte_failure)?;
-        let draft = ParkedDraft::take(&mut r, arena_of, &OFF_WHYS).map_err(byte_failure)?;
-        r.end().map_err(byte_failure)?;
-        PutBack::takes(self, &draft)
-            .map_err(|e| StateError::Format(format!("a slot restore: {e}")))?;
-        if let Some(side) = &draft {
-            let vocab = self
-                .s
-                .model()
-                .n_vocab()
-                .map_err(|e| seat_failure(&e, "a slot restore".to_owned()))?;
-            side.check(vocab, body.positions(), |walk, rows, pos0| {
-                body.check_draft_rows(walk, rows, pos0)
-            })
-            .map_err(byte_failure)?;
-        }
-        let n = body.positions() as usize;
-        Seat::resume(self, &Saved38::landed(body, draft))
-            .map_err(|e| seat_failure(&*e, "a slot restore".to_owned()))?;
-        Ok(n)
+        let sel = self.s.selected();
+        let Q38 { s, drafts, .. } = self;
+        let drafts = RefCell::new(drafts);
+        let named = |e: GateError| bytes::refused(format!("a slot restore: {e}"));
+        let n = restore_streamed(
+            s,
+            &mut r,
+            |s, r| s.model_mut().seq_restore_head(r),
+            |s, r, head| {
+                let mut drafts = drafts.borrow_mut();
+                drafts.restart(sel).map_err(named)?;
+                let model = s.model_mut();
+                let rows = model.seq_restore_arrays(r, head)?;
+                let side = ParkedDraft::take(r, arena_of, &OFF_WHYS)?;
+                drafts.takes(side.as_ref()).map_err(named)?;
+                if let Some(side) = &side {
+                    let vocab = model.n_vocab().map_err(bytes::Fail::card)?;
+                    side.check(vocab, head.positions(), |walk, at, pos0| {
+                        rows.check_draft_rows(walk, at, pos0)
+                    })?;
+                }
+                Ok((rows, side))
+            },
+            |s, head, (rows, side)| {
+                let n = s.model_mut().seq_restore_stand(head, rows)?;
+                drafts
+                    .borrow_mut()
+                    .unpark(sel, side.as_ref())
+                    .map_err(named)?;
+                Ok(n)
+            },
+        )
+        .map_err(byte_failure)?;
+        Ok(n as usize)
     }
 
     /// The body's share rule (`GpuModel::seq_share_point`): the nearest
