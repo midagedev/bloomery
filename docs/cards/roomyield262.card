@@ -1,0 +1,34 @@
+# roomyield2: the planner's room-yield rule (room.rs split_nvme_tier; no lever) against today's room mode, at the plan the predecessor's probe
+# priced. At ctx 262,144 and the pinned room 252,150,000,000 B the base arm is grow=room (the whole 11,051,991,040 B growth charged to the cap,
+# 217 churn experts) and the rule arm grow=yields (the floor's 335,544,320 B charged, the pool budgeted from what the floor leaves: 857
+# experts). The base arm is the predecessor's probe binary with its lever unset (sha256 ce2132cec470, `~/repo/bloomery-roomyield-base`), the
+# rule arm the new binary (`~/repo/bloomery-roomyield`): two binaries, so the runner's one-binary witness is read as two arm dirs.
+# The plan values in `condition` are paper (paper.md section 3, the predecessor's pinned prints) and are re-read from `--plan` prints
+# of both binaries before this run. The slope is the kvkeep card's 0.0198 tok/s an expert; the predecessor measured +30.04 % +/- 2.35 %
+# (n=3 each, [cpu-busy] on every row) for the same plan through the lever.
+kind: ab
+question: At ctx 262,144 on this box, does the planner's rule (a plan that holds the cap yields when the window does not fit beside it:
+  the V4.1 host K/V charged at its 8,192-position floor, the churn pool the room the floor leaves) buy at depth 512 on a fresh server
+  the decode tok/s its 640 extra pool experts predict, with no `[cpu-busy]` row and no direct reclaim
+term: decode tok/s (timings.predicted_per_second) @ n=128, depth D=512 (the first 512 ids of the prose corpus), one fresh server a row,
+  V4.1 Q3_K_M (bq3km) at ctx 262,144 and BLOOMERY_HOST_ROOM=252150000000 in both arms, RTX 5090 at its quiet card_free:
+  rule arm (new binary) / base arm (probe binary, lever unset)
+unit: %
+predict: 24..37
+rounds: 3
+sd: 1.6 % the shallow fresh-server rows' scatter (docs/cards/kvkeep262.card's, whose warm rows read SD 0.31 % and 0.13 % at df 2); the
+  predecessor's rows of this very pair read SD 0.92 % (base) and 0.88 % (probe), n=3 each
+condition: two arm dirs, the base's sha256 ce2132cec470 and the rule's printed before and after, both arms at ctx 262,144 and
+  BLOOMERY_HOST_ROOM=252150000000 (234.8 GiB), no other process of any owner on the card, no rustc or cargo running when the sitting starts (the
+  chain waits for none and logs the count; a row's witness `busiest` line and its `[cpu-busy]` tag show one that starts later). The base arm prints grow=room,
+  host_kv_grow 11,051,991,040 B and residency mid-p34-s1 (217 churn experts; p33..p35 accepted); the rule arm grow=yields,
+  host_kv_grow 11,051,991,040 B, grow_experts about 1,402 and mid-p18-s1 (857 experts; p17..p19 accepted): the pools differ by 640
+  experts. The chain compares both `--plan` prints with these words before the runner starts and stops without a run when the pair
+  differs by under 12 rungs, the room is not the pinned one or card_free is not 33,234,681,856. A vmstat/meminfo sampler (5 Hz) runs
+  through the sitting; each request's direct-reclaim and allocstall deltas are read from it
+decide-in: the rule arm reads +24..37 % and the sampler reads 0 direct reclaim per request at the pinned room: the rule's plan at this
+  cell is the probe's, go on to the deep card (docs/cards/roomyield65k.card, same hold) and the owning gates, then deliver
+decide-below: under 24 %: the slope flattens past 697 experts or the first-request fill grows with the pool; between +15 % and +24 % the
+  change still lives (the lead's bar is +15 %), report the three points (217, 697 and 857 experts) of the slope; under +15 % report the
+  rule as not worth its plan term and stop before the gates. A row with direct reclaim above 0 is reported with the plan's room
+decide-above: over 37 %: the slope is steeper at these pool sizes than the measured 0.0198; report the new slope and go on as above

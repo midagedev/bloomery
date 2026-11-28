@@ -432,6 +432,19 @@ fn pooled<'a>(
     machine: &'a Machine,
     pool: bool,
 ) -> Result<Plan<'a>, PlacementError> {
+    pooled_by(model, machine, pool, |plan, room| {
+        expert_nvme_tier(plan, room, Some(0))
+    })
+}
+
+/// [`pooled`] with the split `split` (the plan and the room it is made at) in place of the one
+/// with no arena.
+fn pooled_by<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    pool: bool,
+    split: impl FnOnce(&mut Plan<'a>, u64) -> Result<(), PlacementError>,
+) -> Result<Plan<'a>, PlacementError> {
     let levers = PlanLevers {
         kv_floor: Some(FLOOR),
         kv_host: KvHost::Spill,
@@ -442,7 +455,7 @@ fn pooled<'a>(
     plan.kv_host_planes(POOL_GROWTH - shadows, 0)?;
     plan.host.grow.pool_room = pool;
     let room = plan.plan_at(&(machine.host().usable_bytes, workstation::HostRead::Given));
-    expert_nvme_tier(&mut plan, room, Some(0))?;
+    split(&mut plan, room)?;
     Ok(plan)
 }
 
@@ -565,8 +578,14 @@ fn the_books_close_at_the_floor_and_at_the_cap_with_the_pool_budgeted() {
     let room = floor_need(&model, POOL_HELD) + slack;
     let tight = machine_of(WIDE, POOL_HELD, room);
     let plan = pooled(&model, &tight, true).expect("the plan at the floor");
+    assert_books(&plan, room);
+}
+
+/// The sums of [`the_books_close_at_the_floor_and_at_the_cap_with_the_pool_budgeted`], over a
+/// plan of the pool model made at `room`.
+fn assert_books(plan: &Plan<'_>, room: u64) {
     let (h, g) = (&plan.host, &plan.host.grow);
-    let need = workstation::HostNeed::of(&plan, 0);
+    let need = workstation::HostNeed::of(plan, 0);
     assert!(
         g.yield_bytes > h.shadow_bytes + h.stage_kv_bytes + h.kv_host_bytes,
         "the yields pass the K/V's bytes, the case the sums below are about"
@@ -591,7 +610,7 @@ fn the_books_close_at_the_floor_and_at_the_cap_with_the_pool_budgeted() {
         h.expert_bytes,
         h.table_bytes,
         g.floor_bytes,
-        h.reserve_bytes - window_of(&plan),
+        h.reserve_bytes - window_of(plan),
         h.pool_card_bytes,
         g.pool_bytes,
     ]) - i128::from(need.os);
@@ -725,4 +744,225 @@ fn the_pool_room_is_no_more_than_the_cards_experts_can_make() {
     assert_eq!(g.pool_bytes, cards, "{g}");
     let headroom = u64::try_from(plan.host.headroom_bytes).expect("a headroom");
     assert!((cards..cards + EXPERT).contains(&headroom), "{headroom} B");
+}
+
+/// The pool model's machine with the host's one reserve named as the OS's, so the need's page
+/// classes can be read ([`workstation::HostNeed::classes`] refuses a reserve with no class).
+fn named_machine_of(held: u64, room: u64) -> Machine {
+    let mut machine = machine_of(WIDE, held, room);
+    machine.host_mut().reserves = vec![(workstation::OS_RESERVE.to_string(), BESIDE)];
+    machine
+}
+
+/// The pool model's host need at the cap on [`named_machine_of`], every host expert resident:
+/// a room of this plus `h` holds the cap with `h` to spare.
+fn cap_need(model: &ModelTensors, held: u64) -> u64 {
+    let ample = named_machine_of(held, 1 << 40);
+    let whole = pooled(model, &ample, true).expect("the plan at an ample room");
+    u64::try_from(workstation::HostNeed::of(&whole, 0).exact(true)).expect("u64")
+}
+
+/// A room that holds the cap with less than the split's window to spare charges the K/V at its
+/// floor all the same, and the pool takes the floor's free room: the growth's bytes more than
+/// the headroom the cap leaves (a pool of the room mode's headroom, `h`, is the plan the room
+/// made before). Here the model's window is 10 experts, the growth 48 and the cards' pool 56,
+/// and the room holds the cap with 6 to spare [derived by hand]: the pool is 6 + 48 = 54
+/// experts, the yields the growth's and the window's, 58, and the books close at the floor and
+/// at the cap.
+///
+/// FAIL-first: a split that is not taken (the early return as it was) leaves `grow.hold` at
+/// `Room` with no yield and the pool at nothing.
+#[test]
+fn a_room_that_holds_the_cap_without_the_window_beside_it_yields_for_a_pool() {
+    let model = layered(WIDE);
+    let room = cap_need(&model, POOL_HELD) + 6 * EXPERT;
+    let tight = named_machine_of(POOL_HELD, room);
+    let plan = pooled(&model, &tight, true).expect("the plan at the floor");
+    let window = window_of(&plan);
+    assert_eq!(
+        window,
+        10 * EXPERT,
+        "two of the heaviest layer's host experts"
+    );
+    let g = &plan.host.grow;
+    assert_eq!(g.hold, GrowHold::Yields, "{g}");
+    assert_eq!(plan.nvme_bytes, 0, "every expert is on the host at load");
+    assert_eq!(g.pool_bytes, 6 * EXPERT + POOL_GROWTH, "{g}");
+    assert!(
+        g.pool_bytes > 6 * EXPERT,
+        "more pool than the headroom the cap leaves"
+    );
+    let owed = POOL_GROWTH + window;
+    assert!(
+        (owed..owed + EXPERT).contains(&g.yield_bytes),
+        "{} B of yields for the growth's {POOL_GROWTH} B and the window's {window} B",
+        g.yield_bytes
+    );
+    assert!(plan.violations().is_empty(), "{:?}", plan.violations());
+    assert_books(&plan, room);
+}
+
+/// Whether a room that holds the cap yields is the window's: the room holds the cap with `h` to
+/// spare, and a plan with `h` under the window yields while one with the window or more keeps the
+/// plan an ample room makes, no yield and the K/V charged at the cap. Every plan the rule makes
+/// is one its need can be classed by (`HostNeed::classes`) and holds the room. Run for cards that
+/// hold 3 and 4 experts a layer.
+///
+/// FAIL-first: a split taken at any `h` (the first form of the rule: the yields branch with
+/// `over` clamped at 0) yields at `h` = the window and more; a split taken only when `h` is
+/// under the window less a byte keeps the plan at `h` = the window less a byte.
+#[test]
+fn a_room_that_holds_the_cap_and_the_window_beside_it_keeps_its_plan() {
+    use workstation::{HostNeed, Hosting};
+    let model = layered(WIDE);
+    let how = Hosting {
+        lock: false,
+        arena_pinned: false,
+    };
+    for held in [POOL_HELD, 4] {
+        let cap = cap_need(&model, held);
+        let roomy = named_machine_of(held, 1 << 40);
+        let ample = pooled(&model, &roomy, true).expect("the plan at an ample room");
+        let window = window_of(&ample);
+        for h in [
+            0,
+            EXPERT,
+            window - EXPERT,
+            window - 1,
+            window,
+            window + 1,
+            window + 6 * EXPERT,
+        ] {
+            let room = cap + h;
+            let tight = named_machine_of(held, room);
+            let plan = pooled(&model, &tight, true).expect("the plan");
+            let g = &plan.host.grow;
+            let want = if h < window {
+                GrowHold::Yields
+            } else {
+                GrowHold::Room
+            };
+            assert_eq!(g.hold, want, "held {held}, h = {h}: {g}");
+            if want == GrowHold::Room {
+                assert!(g.yields.is_empty() && g.pool_bytes == 0, "h = {h}: {g}");
+                assert_eq!(split_of(&plan), split_of(&ample), "h = {h}: no split");
+            }
+            let need = HostNeed::of(&plan, 0);
+            need.classes(&plan, how)
+                .unwrap_or_else(|e| panic!("held {held}, h = {h}: {e}"));
+            assert!(
+                plan.violations().is_empty(),
+                "held {held}, h = {h}: {:?}",
+                plan.violations()
+            );
+            assert!(
+                need.plan_bytes() <= room,
+                "held {held}, h = {h}: the need {} B holds the room {room} B",
+                need.plan_bytes()
+            );
+        }
+    }
+}
+
+/// A room that holds the cap without the window keeps its plan where the yields would gain the
+/// pool nothing: a caller that cleared the budget, and cards whose whole pool the headroom the
+/// cap leaves already holds. The pool the split budgets must pass that headroom: at `h` = the
+/// cards' pool (8 experts, the cards that hold the fewest) the room keeps its plan and one byte
+/// under it yields.
+///
+/// FAIL-first: a split taken whatever the pool budgeted yields the window's bytes on the cleared
+/// budget and at `h` = the cards' pool; a pool that must only reach the headroom (`>=`) does the
+/// same at `h` = the cards' pool.
+#[test]
+fn a_room_that_holds_the_cap_keeps_its_plan_where_the_yields_gain_no_pool() {
+    let model = layered(WIDE);
+    let kept = |name: &str, plan: &Plan<'_>, hold: GrowHold| {
+        let g = &plan.host.grow;
+        assert_eq!(g.hold, hold, "{name}: {g}");
+        assert_eq!(g.pool_bytes > 0, hold == GrowHold::Yields, "{name}: {g}");
+    };
+    let cleared = named_machine_of(POOL_HELD, cap_need(&model, POOL_HELD) + 6 * EXPERT);
+    let plan = pooled(&model, &cleared, false).expect("the plan with the budget cleared");
+    assert!(
+        window_of(&plan) > 6 * EXPERT,
+        "the window is past the headroom"
+    );
+    kept("a cleared budget", &plan, GrowHold::Room);
+    let held = 0;
+    let cap = cap_need(&model, held);
+    let roomy = named_machine_of(held, 1 << 40);
+    let ample = pooled(&model, &roomy, true).expect("the plan at an ample room");
+    let cards = pool_at(&ample, 0);
+    assert_eq!(
+        cards,
+        8 * EXPERT,
+        "the pool of the cards that hold the fewest"
+    );
+    assert!(cards < window_of(&ample), "the window is past the headroom");
+    for (name, room, hold) in [
+        (
+            "the cards' pool in the headroom",
+            cap + cards,
+            GrowHold::Room,
+        ),
+        ("a byte under it", cap + cards - 1, GrowHold::Yields),
+    ] {
+        let machine = named_machine_of(held, room);
+        let plan = pooled(&model, &machine, true).expect(name);
+        kept(name, &plan, hold);
+    }
+}
+
+/// A room that holds the cap without the window keeps its plan when its split would take an
+/// arena, and ignores an arena lever it never asked for: the plan is the one an ample room makes
+/// under a given arena below the arena's floor (refused by name where the cap is passed) and
+/// under the prompt passes' own grant.
+///
+/// FAIL-first: a split that returns the lever's refusal on a room that never needed it ends
+/// `NvTierArenaUnder` (the arena of 1 B is under its floor of 7,274,496 B).
+#[test]
+fn a_room_that_holds_the_cap_ignores_an_arena_lever_it_never_asked_for() {
+    let model = layered(WIDE);
+    let room = cap_need(&model, POOL_HELD) + 6 * EXPERT;
+    let tight = named_machine_of(POOL_HELD, room);
+    let probe = pooled(&model, &tight, true).expect("a plan to read the arena's floor of");
+    let least = ArenaFloor::of(&probe).expect("the floor").bytes;
+    assert!(least > 1, "a given arena of 1 B is under the floor");
+    let under = pooled_by(&model, &tight, true, |plan, room| {
+        expert_nvme_tier(plan, room, Some(1))
+    })
+    .unwrap_or_else(|e| panic!("a room that holds the cap never reads the lever: {e}"));
+    let passes = pooled_by(&model, &tight, true, expert_nvme_tier_for_passes)
+        .expect("the passes' split of a room that holds the cap");
+    for (name, plan) in [
+        ("a given arena under the least", under),
+        ("the passes' grant", passes),
+    ] {
+        assert_eq!(plan.host.grow.hold, GrowHold::Room, "{name}");
+        assert_eq!(plan.host.nvme_arena_bytes, 0, "{name}");
+    }
+}
+
+/// A room that holds the cap takes the split only where both hold: the window past what the room
+/// leaves beside the cap (`over` > 0), and a pool past the headroom the cap leaves.
+/// Each row of the table breaks one of them against a row that takes it.
+///
+/// FAIL-first: a predicate without the window term takes the split at `over` 0, and with `>=` at a
+/// pool equal to the headroom.
+#[test]
+fn a_room_that_holds_the_cap_takes_the_split_only_where_it_pays() {
+    // (over, pool, headroom, takes)
+    let rows = [
+        (1, 11, 10, true),
+        (0, 11, 10, false),
+        (1, 10, 10, false),
+        (1, 0, 0, false),
+    ];
+    for (over, pool, headroom, takes) in rows {
+        assert_eq!(
+            room::split_pays(over, pool, headroom),
+            takes,
+            "over {over}, pool {pool}, headroom {headroom}"
+        );
+    }
 }

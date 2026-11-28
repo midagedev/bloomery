@@ -1,0 +1,23 @@
+# roomyield2, the deep look: the same two arms as docs/cards/roomyield262.card at D=65,536, past the 8,192-position floor, so the rule arm's
+# first prompt crosses the floor and its plan yields W + the growth's bytes (paper.md section 4: about 23.6e9 B, 1,402 host experts) at once
+# while the base arm (grow=room) yields nothing. A look at what the yield costs at depth, not a ruled A/B: two rounds, each arm first once.
+# The predecessor's rows of this pair (probe lever, both arms [cold], majflt 34.5k, [cpu-busy]): ratios +8.1 % and +3.8 %.
+kind: profile
+question: At depth 65,536 on ctx 262,144 does the rule arm (857-expert pool, host experts yielded at the first page past the floor) still
+  decode at least as fast as today's room-mode plan (217 experts, no yield), and by how much
+term: decode tok/s (timings.predicted_per_second) @ n=128, depth D=65,536 (the first 65,536 ids of the prose corpus), one fresh server a
+  row, V4.1 Q3_K_M (bq3km) at ctx 262,144 and BLOOMERY_HOST_ROOM=252150000000, RTX 5090: rule arm / base arm, as the per-round ratio, with
+  each row's [cold] flag and majflt read beside it
+unit: %
+predict: -3..12
+condition: the same two arm dirs and plan words as the D=512 card (the runner's plan check holds them across rounds); the rule arm's server
+  log carries one `host yield positions=... dropped=...` line past the first 8,192 positions and the base arm none; no compute process of
+  another owner on the card (ComfyUI is the user's: no run while it is up) and no rustc or cargo while the arms run; both arms see the same
+  corpus ids. The rows may be [cold] (the first prompt after a fresh server meets a cold page cache); the table is read with their flags,
+  not by the warm mean. The sampler's direct-reclaim and allocstall deltas of each request are recorded
+decide-in: -3..12 % and no direct reclaim: the yield costs at most the shallow gain (paper.md section 4: 4.2 ms a token [derived]); the
+  deep row does not block the rule, go to the owning gates
+decide-below: under -3 %: the yield costs more than the pool gains at this depth: name the depth and the loss, price the dropped experts'
+  reads (majflt and the second round's tg) and report to the lead before the gates (the lead decides a depth guard or a smaller window)
+decide-above: over 12 %: depth does not erode the gain as the predecessor's two cold rows read; check the base row's depth cost (the base
+  at D=512 against D=65,536) before reading it as the rule's

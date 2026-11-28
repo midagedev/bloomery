@@ -877,18 +877,39 @@ fn pool_room(
     u64::try_from(slack.min(u128::from(cards)).min(kept)).map_err(|_| past("the pool's room"))
 }
 
+/// Whether a room that holds the cap takes the split all the same, with `over` the cap and the
+/// window past the room (0 where the window fits beside the cap), `pool` the churn pool the
+/// floor's free room holds ([`pool_room`], none under an arena) and `headroom` what the cap
+/// leaves of the room: the window does not fit beside the cap, and the pool passes the headroom, which is the pool the room had without
+/// it.
+pub(super) fn split_pays(over: u128, pool: u64, headroom: u128) -> bool {
+    over > 0 && u128::from(pool) > headroom
+}
+
+/// The split of the host's routed experts to the NVMe tier, and the yields beside it.
+///
+/// A room that holds the cap splits nothing and charges the K/V at the cap ([`GrowHold::Room`]).
+/// The one exception is a plan whose growth budgets a churn pool ([`HostGrow::budgets_pool`])
+/// and whose room holds the cap with less than the split's window to spare
+/// (`need + window > room`): it splits like a room the cap passes, the K/V charged at its floor,
+/// when that gives the pool more than the headroom the cap leaves. Where the window fits beside
+/// the cap, where the split has an arena or its pool would be no larger than that headroom, the
+/// plan keeps the books it had.
 fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), PlacementError> {
     let model = plan.model;
     let need = workstation::HostNeed::of(plan, 0);
     // The exact sum: a need past u64 bytes reads `u64::MAX` in `bytes()`,
     // which a room of `u64::MAX` would hold.
-    if need.exact(true) <= u128::from(room) {
+    let exact = need.exact(true);
+    let holds = exact <= u128::from(room);
+    if holds && !plan.host.grow.budgets_pool() {
         return Ok(());
     }
-    if let Some(r) = plan
-        .rows
-        .iter()
-        .find(|r| row_read(model, r) && r.segments.iter().any(|s| s.device == Device::Host))
+    if !holds
+        && let Some(r) = plan
+            .rows
+            .iter()
+            .find(|r| row_read(model, r) && r.segments.iter().any(|s| s.device == Device::Host))
     {
         return Err(PlacementError::tensor(
             &model.tensors[r.tensor],
@@ -961,43 +982,47 @@ fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), P
     // The split dial: the arena's bytes come out of the host segments the
     // room holds, the split running on the room that remains.
     let held = plan.host.expert_bytes;
-    let dial = ArenaDial {
-        room,
-        base,
-        cards: need.cards,
-        heavy,
-        held,
-        need: need.bytes(),
-        least: ArenaFloor::of(plan)?,
-    };
-    let arena = match grant {
-        Grant::Given(given) => nvme_arena_of(&dial, given)?,
-        Grant::AtLeastFloor => match nvme_arena_of(&dial, None)? {
-            0 => nvme_arena_of(&dial, Some(dial.least.bytes))?,
-            dialled => dialled,
-        },
+    let arena = ArenaFloor::of(plan).and_then(|least| {
+        let dial = ArenaDial {
+            room,
+            base,
+            cards: need.cards,
+            heavy,
+            held,
+            need: need.bytes(),
+            least,
+        };
+        match grant {
+            Grant::Given(given) => nvme_arena_of(&dial, given),
+            Grant::AtLeastFloor => match nvme_arena_of(&dial, None)? {
+                0 => nvme_arena_of(&dial, Some(dial.least.bytes)),
+                dialled => Ok(dialled),
+            },
+        }
+    });
+    let arena = match arena {
+        Ok(arena) => arena,
+        // A room that holds the cap never asked the arena's lever for anything: the split that
+        // needs an arena judges its value, and this plan keeps the books it had.
+        Err(_) if holds => return Ok(()),
+        Err(refused) => return Err(refused),
     };
     let room = room - arena;
-    plan.host.nvme_arena_bytes = arena;
     // The prompt run-ahead's page-cache window, `2 W`, is a host reserve of
     // the split plan: the host keeps `keep` of its `held` expert bytes in
     // what the room leaves past the arena and the window, which the floor
     // keeps at least one layer's worth.
     // The split's sums are exact (the need may pass u64 bytes with the floor
     // under it): the reserve is checked, `keep` is computed in u128 from the
-    // exact need, which the room does not hold (the early return above), so
-    // `over` has no negative part. `3 W` fit u64 (the dial's floor).
+    // exact need. A room the cap passes leaves `over` positive; a room that holds the cap
+    // splits only where the window passes what it leaves (below), so `over` has no negative
+    // part. `3 W` fit u64 (the dial's floor).
     let past = |what: &str| PlacementError::Metadata {
         key: "the NVMe expert tier's split".to_string(),
         detail: format!("{what} passes u64 bytes"),
     };
     let window = 2 * heavy;
-    plan.host.reserve_bytes = plan
-        .host
-        .reserve_bytes
-        .checked_add(window)
-        .ok_or_else(|| past("the host reserve beside the window"))?;
-    let over = need.exact(true) + u128::from(window) - u128::from(room);
+    let over = (exact + u128::from(window)).saturating_sub(u128::from(room));
     // A plan whose K/V grows by yields budgets the churn pool the floor's free room can hold
     // before the growth takes it: those bytes page at the cap beside the growth's and the
     // window's, and all of them stay on the host at load.
@@ -1006,6 +1031,17 @@ fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), P
     } else {
         0
     };
+    // The headroom the cap leaves of the room that is left past the arena: an arena past it is a split
+    // with an arena, which budgets no pool (above), so `split_pays` refuses it.
+    if holds && !split_pays(over, pool, u128::from(room).saturating_sub(exact)) {
+        return Ok(());
+    }
+    plan.host.nvme_arena_bytes = arena;
+    plan.host.reserve_bytes = plan
+        .host
+        .reserve_bytes
+        .checked_add(window)
+        .ok_or_else(|| past("the host reserve beside the window"))?;
     let over = over + u128::from(pool);
     let keep = u128::from(held)
         .checked_sub(over)
