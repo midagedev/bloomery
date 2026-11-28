@@ -173,6 +173,14 @@ impl HostGrow {
         }
     }
 
+    /// Whether the split has a growth to yield to and a pool to budget before it: the K/V is
+    /// charged at a floor with bytes to grow, and the caller did not clear
+    /// [`HostGrow::pool_room`]. A room that holds the cap splits only such a plan.
+    #[must_use]
+    pub fn budgets_pool(&self) -> bool {
+        self.armed() && self.pool_room && self.grow_bytes > 0
+    }
+
     /// The host K/V bytes the plan's host need counts: the floor's and the growth the yields
     /// do not cover (none past the floor where the yields pass the growth).
     #[must_use]
