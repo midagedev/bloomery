@@ -3451,6 +3451,19 @@ impl Gpu {
         self.quantize_q8_1_cols_at_(stream, x, 0, act, m, false, fault)
     }
 
+    /// [`Gpu::enqueue_quantize_q8_1_on`] through `q3k_quantize_q8_1_relu_sqr`: the squared
+    /// ReLU applied to `x`'s values inside the quantize, on `stream`.
+    pub fn enqueue_quantize_q8_1_relu_sqr_on(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        act: &mut Q8Act,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let m = act.m();
+        self.quantize_q8_1_cols_at_(stream, x, 0, act, m, true, fault)
+    }
+
     /// The head's quantization: [`Gpu::enqueue_quantize_q8_1`] raising with
     /// [`LAYER_HEAD`].
     pub(crate) fn enqueue_quantize_q8_1_head(

@@ -90,6 +90,8 @@ generate_ds41 softmax_router_norm_m_prefetch 0 0
 # PIN(2026-11-23): mamba2_steps spill 0 -> 0 B, JIT local 0 -> 16 B: the PTX the llc `--nvptx-short-ptr` of #1661 writes takes 71 registers in ptxas against 69 without it, and the JIT keeps 16 B of local; the spill stays 0 (pinspill round; ptxas 13.3.73 sm_120a, RTX 5090 driver 615.71.09, a plain jit_local provisional for 595.99.02). pp A/B: none (no whole-card model on the A/B runs this kernel's pass; the effect is not measured) (pinab round).
 generate_ds41 mamba2_steps 0 16
 generate_ds41 add 0 0
+# PIN(2026-11-28): add3 (crates/gpu/src/elem.rs), the MoE layer's output add of the routed delta, the shared expert's down and the residual in one launch: 0 spill and 0 JIT local on sm_120a (ptxas 13.3.73, measured on the RTX 5090 at cc 12.0: `generate_ds41 add3 unpinned spill=0 jit_local=0` is gate-ptx-spill's only red); the other tables carry the same 0/0 [derived: three loads and one store a thread, no local array, far under every arch's 255-register cap], not measured there until a scan on them runs.
+generate_ds41 add3 0 0
 generate_ds41 argmax_fault 0 0
 generate_ds41 argmax_finite_fault 0 0
 generate_ds41 argmax_p_rows_fault 0 0

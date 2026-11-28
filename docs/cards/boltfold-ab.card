@@ -1,0 +1,32 @@
+# Round boltfold, the A/B: Bolt decode with the MoE layer's two output adds as one add3 (H1) and the shared expert's chain on a Branch stream beside the router and the routed
+# chain (F1), against its base (main e99204ffd), one lease, D = 512, n = 256. The prediction comes from the P2 trace (docs/cards/boltfold-p2.card, measured 2026-11-28 10:03 KST,
+# same lease, both binaries, nsys cuda-graph-trace=node, D = 512 prose ids, n = 128): replay wall 5,253.3 us (base, 900 nodes, 1 stream; P1 read 5,252.1) -> 4,923.8 us (new,
+# 860 nodes, 2 streams): -329.5 us, 5,253.3 / 4,923.8 = +6.69 %. Parts of that [derived from the two class tables]: H1 -26.5 us (20.3 us of kernel plus 40 x 0.18 us of gap, less ~1 us
+# for the third operand); F1 -303 us = 63 % of the shared chain's 481.1 us, the rest paid as contention: router 508.0 -> 662.4 us (+154), iq2_xxs_gemv_sel 882.3 -> 932.1 (+50),
+# q8_0_gemv +12, the relu quantize +22 [measured]. Both binaries wrote the same 128 token ids (content sha256 8774126125a5505e both).
+# Resource timeline per decode token: host CPU one graph launch and the sampler (nsys decode 5.627 ms a token against the 5.253 ms replay wall: 0.374 ms outside the replay, unchanged
+# by the change), PCIe the token in and the id out, host DRAM and NVMe nothing (the file is whole on the card). The card is the wall: before, one serial chain of 900 nodes whose
+# DRAM time is ~3.25 ms of 5.25 (62 %, 4.9 GB at 1.52 TB/s) and whose router, latent down, quantizes and weighted_sum run on 4..124 of the 170 SMs; after, the shared chain's three
+# gemv-class launches fill those idle SMs, the wall is the max of two chains where they overlap and the sum elsewhere. A term under the other chain's shadow is the 303 us.
+# tok/s ratio [derived]: (5,253.3 + 374) / (4,923.8 + 374) - 1 = +6.2 % with the host's 0.374 ms diluting the wall's +6.69 %; the single 128-token request under nsys read
+# 177.7 -> 189.2 tok/s = +6.5 % (one request each, no pairing: research evidence, not this card's term). The band's low edge (+5.0) leaves room for nsys's per-node trace having
+# made the overlap look larger than the production graph's; H1's 0.5 % is inside the 4-round ruler and is not read separately.
+kind: ab
+question: does the shared expert's chain on a second stream plus one add3 per MoE layer raise Nemotron 3.5 Bolt's decode tok/s on the card at depth 512?
+term: decode tok/s @ n=256, depth 512, RTX 5090 at 600 W, Nemotron 3.5 Bolt (nemotron_h_moe, 24GB file) whole on one card (place a), bloomery-serve at the serving defaults, no draft
+  (this serve seat has none) — (new - base) / base, paired by round
+unit: %
+predict: +5.0..+7.0
+rounds: 4
+sd: 0.6 % one run's scatter at depth 512 (AGENTS.md "Know the ruler"; the 4-round half-interval is 1.04 %)
+condition: one lease, BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_AB_ROUNDS=4 DEPTH_SERVE_N=256 just depth-serve bloomery-boltfold-base:512 bloomery-boltfold-new:512 (base = main e99204ffd,
+  sha256 1d017936834cab66; new = base + H1 + F1, sha256 f41df92b4f59be97, both printed before and after the call and unchanged), each arm its own remote dir with its own bloomery-serve,
+  the arm order rotated every round, under the LEAD-TIMING-HOLD, the card idle and ComfyUI not up; the witness block clean at start and end (no [cpu-busy], no [other-busy], card
+  clocks printed); the sitting's log carries both arm binaries' sha256 before and after the call, unchanged (the runner does not compare generated text: the new tree's
+  bit-identity is the e2e gate's and the P2 trace's equal content hash, not this run's term)
+decide-in: +5.0..+7.0 %: the nsys-read overlap holds in the serving binary; land as derived, with H1's 0.5 % marked [derived] and F1's share the interval's rest
+decide-below: under +5.0 %: if the paired interval excludes 0 it still lands (smaller than derived: the overlap is less in the serving graph than in the traced one, or the host's share
+  of the token is above 0.374 ms): take one nsys trace per arm at --cuda-graph-trace=graph and read the production graph's step against the node-traced one before a number is
+  published; if the interval includes 0, no landing, and the per-layer start times of the shared chain against the router in the new trace decide the fork point (before the router, after the latent down)
+decide-above: above +7.0 %: more than the traced wall's +6.69 % allows without a smaller host share: add an A/A arm (the base twice) at 4 rounds and read the window's own bias first,
+  then the generated text of both arms; no claim above the traced ceiling until the A/A is flat

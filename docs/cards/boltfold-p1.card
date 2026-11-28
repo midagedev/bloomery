@@ -1,0 +1,23 @@
+# Round boltfold, P1: the class table of one Nemotron 3.5 Bolt decode step on the 5090, written before the run. The `add` class is
+# the term the lead's decision rule reads (>= 100 us open H1 on Bolt, 50..100 only the add3, < 50 close it). The derivation is the
+# measured 0.53 us a launch of the same `add` kernel on this card (ingap2 plain1198.txt, Inkling, grid 9) times 128 launches, a hair
+# more for Bolt's grid 16; the chaincensus band was 90..140. The same trace carries the slot table that prices F1 (the shared
+# expert's chain, slots 1, 10 and 11 of the 14-launch MoE layer): predicted 14 us a layer (12..17), 560 us a step (480..680).
+kind: profile
+question: what do the 128 `add` launches of one Bolt decode step cost on the 5090, and how long is the shared expert's three-launch
+  chain a layer (the ceiling of F1)?
+term: the kernel-time sum of the `add` class in one graph-replay decode step (nsys cuda-graph-trace=node, mean over the replays after
+  the first two), bloomery-serve at the serving defaults on the whole-card Bolt 24GB file, D=512 ids of the prose corpus, n=128,
+  temperature 0, RTX 5090 at 600 W, base binary = main e99204ffd
+unit: us
+predict: 62..85
+condition: one lease through tools/ref/lease-hold.sh --card, after the LEAD-TIMING-HOLD queue; no other compute process on the card
+  (the apps line before and after the server comes up is recorded); the replay size must read 900 (898..902) and at least 100 replays
+  must be of that size, else the table is not read; nsys itself adds a few percent to the wall, so the table is read for per-kernel
+  us and class shares, never as the step ms; the 14-launch slot sequence must match its anchors on every one of the 40 layers
+decide-in: 62..85 us (the rule's 50..100 branch): the 5090 scale of the small kernels holds; implement the 3-input add (H1: 40 nodes,
+  +0.5 % [derived]) and read F1's ceiling from the slot table (shared chain over the replay wall, and its ratio to branch A)
+decide-below: below 62 us: the add is cheaper than the anchor, H1 is worth under 0.45 %; at or above 50 us still only the add3, below
+  50 us close H1's Bolt arm and report the table, F1 goes on the slot table alone
+decide-above: above 85 us: the scale of grid 9 to grid 16 or of Inkling to Bolt is wrong, re-derive the term before any code; at or
+  above 100 us the rule opens H1 on Bolt together with F1 and prices the wider W>ADD epilogue fold of the nvfp4 and IQ2 entries

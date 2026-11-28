@@ -38,6 +38,8 @@ generate_ds41 nvfp4_gemv_sel_f32 0 0
 # PIN(2026-10-23): measured on sm_121a, GB10, driver 595.84, CUDA 13.3.1. Shared GEMM epilogues retain exceptional range; the native 4K pair showed no throughput loss.
 generate_ds41 raon_hc_route 0 112
 generate_ds41 add 0 0
+# PIN(2026-11-28): add3 (crates/gpu/src/elem.rs), three-input add: 0/0 [derived: three loads and one store a thread, no local array, far under this arch's 255-register cap], not measured on this arch until a scan on it runs.
+generate_ds41 add3 0 0
 generate_ds41 argmax_fault 0 0
 generate_ds41 argmax_finite_fault 0 0
 generate_ds41 argmax_p_rows_fault 0 0
