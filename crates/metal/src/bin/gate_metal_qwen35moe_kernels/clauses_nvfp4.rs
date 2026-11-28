@@ -6,7 +6,8 @@
 //! dot of an independent decode, the decode itself held to the `gguf` crate's
 //! decoders, a scale byte that is no UE4M3, the launch's refusals and the
 //! planes at the Mini's two launch shapes; the quads mat-vec against the rows
-//! mat-vec on the same bytes, bit for bit.
+//! mat-vec on the same bytes, bit for bit, and the prompt pass's grouped tile
+//! the same.
 //!
 //! The decode: a code `c` is `KVALUES[c] · ue4m3(scale) / 2`, the doubled E2M1
 //! table and the halved scale both exact in f32; the dot's products and sums
@@ -15,8 +16,10 @@
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Elems};
-use bloomery_metal::inkling2_geom::TOP_K;
-use bloomery_metal::kernels::{Nvfp4Params, NvfpLayout};
+use bloomery_metal::inkling2_geom::{EXPERTS, TOP_K};
+use bloomery_metal::kernels::{
+    Ink2RoutedParams, Ink2TableParams, Nvfp4Params, NvfpLayout, route_table_words,
+};
 use gguf::quant::{GgmlType, Nvfp4Rows, dequant_row};
 
 use super::common::{self, LAYER};
@@ -906,6 +909,218 @@ pub fn mxfp8_quads_identity(h: &Harness<'_>) -> Clause {
     )))
 }
 
+/// The SITU caps of the grouped pair launches, wide enough that its tanh stays linear over the
+/// draw's dots.
+const BETA: f32 = 256.0;
+
+/// One grouped tile of the prompt pass over the rows-or-quads stack `bytes` of the
+/// stack's [`EXPERTS`] experts: the route table of `ids`, then the pair (gate·up with the SITU
+/// epilogue, `x` one row for each [`TOP_K`] slots) or the plain tile (`x` one row a place) over it.
+/// The route table places the slots of one expert in the order its threads' atomics arrive, so two
+/// launches of one route can place a slot differently: the pair's outputs come back by slot (through
+/// the table's `inv`), the plain tile's by place, which is stable when every slot of an expert
+/// carries one route weight. The outputs and the fault word the launch left.
+#[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
+fn tile_launch(
+    h: &Harness<'_>,
+    layout: NvfpLayout,
+    pair: bool,
+    (rows, cols): (usize, usize),
+    bytes: &[u8],
+    ids: &[u32],
+    scales: &[f32],
+    route_w: &[f32],
+    x: &[f32],
+) -> Result<(Vec<f32>, String), String> {
+    let slots = ids.len();
+    let words = route_table_words(slots, EXPERTS);
+    let w = ink2::up(h, bytes)?;
+    let idb = ink2::up(h, ids)?;
+    let sb = ink2::up(h, scales)?;
+    let rwb = ink2::up(h, route_w)?;
+    let xb = ink2::up(h, x)?;
+    let mut sorted = ink2::up(h, &vec![0u32; slots])?;
+    let mut inv = ink2::up(h, &vec![0u32; slots])?;
+    let mut tiles = ink2::up(h, &vec![0u32; words])?;
+    let mut y = ink2::up(h, &ink2::blank(slots * rows))?;
+    h.clear_fault()?;
+    h.encode(|encoder| {
+        h.kernels.ink2_route_table(
+            encoder,
+            Ink2TableParams {
+                slots,
+                ids: idb.window(Elems(0), Elems(slots))?,
+                sorted: sorted.window_mut(Elems(0), Elems(slots))?,
+                inv: inv.window_mut(Elems(0), Elems(slots))?,
+                tiles: tiles.window_mut(Elems(0), Elems(words))?,
+                fault: h.device.fault_word(),
+                layer: LAYER,
+            },
+        )?;
+        encoder.memory_barrier();
+        h.kernels.gemm_routed_ink2(
+            encoder,
+            Ink2RoutedParams {
+                layout,
+                pair,
+                cols,
+                rows,
+                stack: w.window(Elems(0), Elems(bytes.len()))?,
+                scales: sb.window(Elems(0), Elems(scales.len()))?,
+                x: xb.window(Elems(0), Elems(x.len()))?,
+                x_rows: if pair { slots / TOP_K } else { slots },
+                x_stride: cols,
+                gather: pair,
+                y: y.window_mut(Elems(0), Elems(slots * rows))?,
+                y_stride: rows,
+                slots,
+                per_row: TOP_K,
+                sorted: sorted.window(Elems(0), Elems(slots))?,
+                route_w: rwb.window(Elems(0), Elems(slots))?,
+                tiles: tiles.window(Elems(0), Elems(words))?,
+                gate_beta: BETA,
+                value_beta: BETA,
+                faults: h.device.fault_word(),
+                layer: LAYER,
+            },
+        )
+    })?;
+    let placed = ink2::read(h, &y)?;
+    ink2::written("the grouped tile", &placed)?;
+    let out = if pair {
+        let inv = ink2::read(h, &inv)?;
+        let mut by_slot = vec![0.0f32; placed.len()];
+        for (slot, &place) in inv.iter().enumerate() {
+            let place = place as usize;
+            by_slot[slot * rows..(slot + 1) * rows]
+                .copy_from_slice(&placed[place * rows..(place + 1) * rows]);
+        }
+        by_slot
+    } else {
+        placed
+    };
+    let fault = h
+        .fault()?
+        .map_or_else(|| "clean".to_string(), |f| f.to_string());
+    Ok((out, fault))
+}
+
+/// The quads tile is the rows tile on the same bytes, to the bit and to the fault word: the
+/// outputs of [`tile_launch`] over `rows_bytes` as rows and as [`quads_of`] it. The count of
+/// outputs compared.
+#[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
+fn tile_quads_vs_rows(
+    h: &Harness<'_>,
+    what: &str,
+    pair: bool,
+    shape: (usize, usize),
+    rows_bytes: &[u8],
+    ids: &[u32],
+    scales: &[f32],
+    route_w: &[f32],
+    x: &[f32],
+) -> Result<usize, String> {
+    let quads = quads_of(rows_bytes);
+    let (want, want_fault) = tile_launch(
+        h,
+        NvfpLayout::Mxfp8Rows,
+        pair,
+        shape,
+        rows_bytes,
+        ids,
+        scales,
+        route_w,
+        x,
+    )?;
+    let (got, got_fault) = tile_launch(
+        h,
+        NvfpLayout::Mxfp8Quads,
+        pair,
+        shape,
+        &quads,
+        ids,
+        scales,
+        route_w,
+        x,
+    )?;
+    if let Some((i, g, w)) = common::first_diff(
+        &got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        &want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+    ) {
+        return Err(format!(
+            "{what}: output {i} is {g:#010x} in the quads tile and {w:#010x} in the rows tile"
+        ));
+    }
+    if got_fault != want_fault {
+        return Err(format!(
+            "{what}: the quads tile left the fault word `{got_fault}`, the rows tile `{want_fault}`"
+        ));
+    }
+    Ok(got.len())
+}
+
+/// The prompt pass's grouped MXFP8 tile reads the quads layout as the rows layout, to the bit and
+/// to the fault word: (a) the coda's own draw through the pair tile (the gate·up's row mapping and
+/// SITU epilogue; 64 outputs over 512 columns, so each thread holds four blocks in turn) and the
+/// plain tile (a down's scaled store), a route of 96 slots over twelve experts with runs past one
+/// A fragment of eight; (b) every (code, scale byte) pair through the plain tile, the subnormal
+/// codes under the extreme scales, the NaN scale and the NaN codes included, the half conversion
+/// of each. The rows tile stays the reference.
+pub fn mxfp8_quads_tile(h: &Harness<'_>) -> Clause {
+    let mut compared = 0usize;
+    let ids: Vec<u32> = (0..96usize)
+        .map(|s| [3u32, 17, 17, 40, 40, 40, 99, 3][s % 8] + (s / 24) as u32)
+        .collect();
+    let scales: Vec<f32> = (0..EXPERTS).map(|e| 0.5 + e as f32 / 256.0).collect();
+    let route_w: Vec<f32> = ids
+        .iter()
+        .map(|&e| 0.1 + 0.9 * (e % 7) as f32 / 7.0)
+        .collect();
+    let cols = 512usize;
+    for (name, pair, rows) in [("pair", true, 64usize), ("plain", false, 128)] {
+        let stack_rows = if pair { 2 * rows } else { rows };
+        let bytes = coda_stack(EXPERTS, stack_rows, cols, 0x4E00 + rows as u64, false);
+        let x_rows = if pair { ids.len() / TOP_K } else { ids.len() };
+        let x = ink2::draw(x_rows * cols, 0x4E01 + rows as u64, 1.0);
+        compared += tile_quads_vs_rows(
+            h,
+            &format!("the coda's draw, {name} tile {rows}x{cols}"),
+            pair,
+            (rows, cols),
+            &bytes,
+            &ids,
+            &scales,
+            &route_w,
+            &x,
+        )?;
+    }
+    let exhaustive = exhaustive_stack();
+    let per_half = exhaustive.len() / 2;
+    let slots: Vec<u32> = (0..EXPERTS as u32).collect();
+    let ones = vec![1.0f32; EXPERTS];
+    let x = vec![1.0f32; EXPERTS * 128];
+    for (half, bytes) in exhaustive.chunks_exact(per_half).enumerate() {
+        compared += tile_quads_vs_rows(
+            h,
+            &format!(
+                "every pair, scale bytes {}..{}",
+                128 * half,
+                128 * half + 128
+            ),
+            false,
+            (256, 128),
+            bytes,
+            &slots,
+            &ones,
+            &ones,
+            &x,
+        )?;
+    }
+    Ok(Verdict::Noted(format!(
+        "{compared} outputs of the quads grouped tile are the rows tile's bits with its fault words: the coda's draw at the pair and the plain tile (96 slots over twelve experts, four blocks a row) and all 65,536 (code, scale byte) pairs"
+    )))
+}
+
 /// The mat-vec's clauses, in gate order.
 pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
     let h = ctx.harness;
@@ -916,5 +1131,6 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<
         ("nvfp4_route", Box::new(|| nvfp4_route(h))),
         ("nvfp4_planes", Box::new(|| nvfp4_planes(h))),
         ("mxfp8_quads_identity", Box::new(|| mxfp8_quads_identity(h))),
+        ("mxfp8_quads_tile", Box::new(|| mxfp8_quads_tile(h))),
     ]
 }

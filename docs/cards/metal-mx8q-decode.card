@@ -1,0 +1,22 @@
+# Inkling 2 Mini decode on the M4 Pro (Metal): the MXFP8 coda's quads layout against rows, after the prompt tile change of round
+# metalpp (gemm_routed.metal MX8Q: the grouped tile holds a block's words and decodes by integer). The decode step does not run the
+# grouped tile: it runs mxfp8_quads_gemv / mxfp8_rows_gemv (nvfp4.metal), which this change does not touch, so the decode effect of
+# M1 must be where it was: -4.19 % +-0.55 of gpu_us (6 rounds, the lead's A/B of M1 [measured]; A/A rows2/rows -0.35 % +-0.43).
+# Guard card: the number to see is that the -4.2 % is still -4.2 %.
+kind: ab
+question: is the Inkling 2 Mini decode step still shorter by the coda's quads layout than by rows after the tile change (the mat-vec
+  kernels untouched), on the M4 Pro?
+term: gpu_us of the 32 host-fed steps (the step clock's card-busy span a token) @ generate_metal -n 40 --step-times 32, prompt "The
+  capital of France is" (5 ids, depth 5-45), Inkling-2-Mini-mlx4, M4 Pro, no --profile — (quads - rows) / rows, paired by round
+unit: %
+predict: -4.9..-3.5
+rounds: 6
+sd: 0.3 % from the lead's M1 A/B (A/A rows2/rows at 6 rounds: interval +-0.43 %, so a run's sd = 0.43 / (2.571 * sqrt(2/6)))
+condition: one binary (target/release/generate_metal of the metalpp tree), arms quads, rows and rows2 (the A/A twin) alternate round by
+  round with the order rotated each round, BLOOMERY_METAL_MX8 the only difference; each launch under both Mac model locks after
+  runprof-guarded.sh's precheck; the same prompt and -n for every arm; the --print-ids lists of the arms equal
+decide-in: the decode gain of M1 stands: report it with the prompt card's verdict and land both together
+decide-below: gpu_us lower than -4.9 %: the step shares something with the tile (or the rows arm lost with the Hold edit); run the rows
+  arm of the old binary beside it before landing
+decide-above: effect above -3.5 % (smaller gain): the Hold edit moved the mat-vec's neighbours (a shared header or register
+  pressure); do not land; diff the two libraries' pipelines with metal_scan --keep

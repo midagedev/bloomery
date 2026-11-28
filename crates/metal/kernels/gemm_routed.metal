@@ -412,7 +412,7 @@ ROUTED_APART_PLAIN(q6k_apart_q8_0, Q6K, block_q6_K, Q8_0, block_q8_0)
 // Inkling 2's grouped experts over a pass's route table, the scaled pair and
 // plain tiles of its two stack forms:
 //
-//   gemm_routed_ink2_{nv4p,mx8r}_{pair,plain}_f16
+//   gemm_routed_ink2_{nv4p,mx8r,mx8q}_{pair,plain}_f16
 //
 //   pair     y[p][o] = situ(s_e (gate_e[o] . x), s_e (up_e[o] . x)), the
 //            stack's gate rows then its up rows in one tensor (the fused
@@ -423,9 +423,11 @@ ROUTED_APART_PLAIN(q6k_apart_q8_0, Q6K, block_q6_K, Q8_0, block_q8_0)
 // NV4P is the MLX folder's NVFP4 as two planes an expert (nvfp4.metal's
 // planes layout: every row's codes, value 2i the low nibble of byte i, then
 // every row's UE4M3 scale bytes, one a 16-value group), MX8R its MXFP8 coda
-// rows (33 bytes a 32-value group: the E8M0 scale byte, then 32 E4M3 codes).
-// Each form names its row of an expert (`row`) and decodes the 16 values at
-// a column of it (`dequant16`). Both decode exactly into half: an E2M1 code times a UE4M3
+// rows (33 bytes a 32-value group: the E8M0 scale byte, then 32 E4M3 codes),
+// MX8Q the same coda as four-group quads (below). Each form names its row of an expert (`row`) and decodes the 16 values at
+// a column of it (`dequant16`), through a `Hold`, the registers a form keeps
+// from one K step to the next (empty for the two that read what a step
+// needs). Every form decodes exactly into half: an E2M1 code times a UE4M3
 // half-scale is at most 7 significant bits inside half's normal range, and
 // an E4M3 code times a power of two loses only what falls under half's
 // subnormal step (2^-25 of absolute error a weight). The decode is
@@ -488,6 +490,7 @@ struct nv4p_row {
 
 struct NV4P {
     typedef nv4p_row Row;
+    struct Hold {};
 
     static inline int values_per_block() {
         return 16;
@@ -503,7 +506,7 @@ struct NV4P {
 
     // The 16 values at column `pos` (a multiple of 16) of `row`.
     template <typename T>
-    static inline void dequant16(Row row, int pos, thread matrix<T, 4, 4> & reg) {
+    static inline void dequant16(Row row, int pos, thread Hold &, thread matrix<T, 4, 4> & reg) {
         const float s = rt_ue4m3_half(uint(row.scales[pos / 16]));
         const uint2 q = *((device const uint2 *)(row.codes + pos / 2));
         FOR_UNROLL(short i = 0; i < 8; ++i) {
@@ -516,6 +519,7 @@ struct NV4P {
 
 struct MX8R {
     typedef device const block_mx8r * Row;
+    struct Hold {};
 
     static inline int values_per_block() {
         return 32;
@@ -530,7 +534,7 @@ struct MX8R {
     // The 16 values at column `pos` (a multiple of 16) of `row`: half `il`
     // of its group.
     template <typename T>
-    static inline void dequant16(Row row, int pos, thread matrix<T, 4, 4> & reg) {
+    static inline void dequant16(Row row, int pos, thread Hold &, thread matrix<T, 4, 4> & reg) {
         device const block_mx8r & blk = row[pos / 32];
         const short il = (short)((pos / 16) % 2);
         const uint sb = uint(blk.e);
@@ -543,12 +547,44 @@ struct MX8R {
     }
 };
 
+// The value of E4M3 code `c` times the f32 scale `s`, the integer decode of
+// nvfp4.metal's mxfp8_quad_value: `mag << 7` is the code's f16 pattern times
+// 2^-8 (a subnormal code a subnormal half), so `float(half) * 256` is the
+// code's value exactly. The NaN codes (magnitude 0x7f) are NaN, the sign is
+// the code's top bit, and the tile then converts the exact f32 product to
+// half, as MX8R's does.
+inline float rt_mx8q_value(uint c, float s) {
+    const uint mag = c & 0x7fu;
+    const float e = float(as_type<half>(ushort(mag << 7))) * 256.0f;
+    const float m = mag == 0x7fu ? NAN : e;
+    return as_type<float>(as_type<uint>(m) ^ ((c & 0x80u) << 24)) * s;
+}
+
+// The f32 of E8M0 scale byte `sb`: the byte is its exponent field (byte 0 is
+// 2^-127, the f32 pattern 0x00400000; 0xff is NaN), the same value as MX8R's
+// `exp2(sb - 127)`.
+inline float rt_e8m0(uint sb) {
+    return as_type<float>(sb == 0xffu ? 0x7fc00000u : (sb == 0u ? 0x00400000u : (sb << 23)));
+}
+
 // MX8Q is the same coda in nvfp4.metal's quads layout: a row is blocks of 132
 // bytes, 128 values of four groups — the four groups' E4M3 codes of lane `l`
 // the word at byte 4l, then the four scale bytes — so a row's bytes and an
-// expert's start are the rows layout's. The decode is MX8R's, unchanged.
+// expert's start are the rows layout's. A thread's 16 values of a K step are
+// half `il` of group `gg` of its block: it reads the block's 16 words of its
+// half and the four scale bytes once, at the block's first group, and the
+// four K steps of the block decode from them (a byte of each word a step),
+// where reading a step's words afresh would load four times the bytes the
+// step uses. The decode is the integer one (`rt_mx8q_value`).
 struct MX8Q {
     typedef device const uint8_t * Row;
+
+    // The block's half a thread holds: its 16 code words and the four scale
+    // bytes.
+    struct Hold {
+        uint w[16];
+        uint s;
+    };
 
     static inline int values_per_block() {
         return 128;
@@ -561,18 +597,23 @@ struct MX8Q {
     }
 
     // The 16 values at column `pos` (a multiple of 16) of `row`: half `il`
-    // of group `gg` of its block.
+    // of group `gg` of its block. `hold` carries the block's words from its
+    // first group (`gg` 0, where they are read) to its last.
     template <typename T>
-    static inline void dequant16(Row row, int pos, thread matrix<T, 4, 4> & reg) {
-        device const uint8_t * blk = row + (ulong)(pos / 128) * 132ul;
+    static inline void dequant16(Row row, int pos, thread Hold & hold, thread matrix<T, 4, 4> & reg) {
         const uint gg = (uint)((pos / 32) % 4);
-        const uint il = (uint)((pos / 16) % 2);
-        const uint sb = uint(blk[128u + gg]);
-        // E8M0, as MX8R's.
-        const float s = sb == 0xffu ? NAN : exp2(float(sb) + (-127.0f));
-        device const uint * codes = (device const uint *)blk + 16u * il;
+        if (gg == 0u) {
+            device const uint8_t * blk = row + (ulong)(pos / 128) * 132ul;
+            const uint il = (uint)((pos / 16) % 2);
+            device const uint * codes = (device const uint *)blk + 16u * il;
+            FOR_UNROLL(short i = 0; i < 16; ++i) {
+                hold.w[i] = codes[i];
+            }
+            hold.s = *(device const uint *)(blk + 128u);
+        }
+        const float s = rt_e8m0((hold.s >> (8u * gg)) & 0xffu);
         FOR_UNROLL(short i = 0; i < 16; ++i) {
-            reg[i / 4][i % 4] = (T)(rt_e4m3((codes[i] >> (8u * gg)) & 0xffu) * s);
+            reg[i / 4][i % 4] = (T)rt_mx8q_value((hold.w[i] >> (8u * gg)) & 0xffu, s);
         }
     }
 };
@@ -636,6 +677,7 @@ inline void ink2_routed_tile(threadgroup T                  * sa,
         }
     }
 
+    typename Q::Hold hold;
     for (int k0 = 0; k0 < (int)args.cols; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (b_stage) {
@@ -644,7 +686,7 @@ inline void ink2_routed_tile(threadgroup T                  * sa,
         }
         {
             matrix<T, 4, 4> reg;
-            Q::template dequant16<T>(a_src, k0 + a_koff, reg);
+            Q::template dequant16<T>(a_src, k0 + a_koff, hold, reg);
             FOR_UNROLL(short i = 0; i < 4; ++i) {
                 a_dst[i] = vec<T, 4>(reg[i][0], reg[i][1], reg[i][2], reg[i][3]);
             }

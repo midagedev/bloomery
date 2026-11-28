@@ -512,18 +512,29 @@ pub const INKLING2: &[Mutant] = &[
         clause: "k_logits",
         why: "an MXFP8 group's E8M0 scale reads its exponent one too high, so the MXFP8 coda's \
               every expert weight is doubled, which only an MLX folder's coda layer holds",
-        edits: &[("(sb << 23)", "((sb + 1u) << 23)", 1)],
+        edits: &[(
+            "const uint sbits = sb == 0xffu ? 0x7fc00000u : (sb == 0u ? 0x00400000u : (sb << 23));",
+            "const uint sbits = sb == 0xffu ? 0x7fc00000u : (sb == 0u ? 0x00400000u : ((sb + 1u) << 23));",
+            1,
+        )],
     },
     Mutant {
         name: "ink2_pass_mxfp8_scale_exp",
         clause: "k_pass",
         why: "the grouped tile's MXFP8 scale reads its exponent one too high, so the pass's coda \
               experts are doubled while the step's mat-vec reads them right",
-        edits: &[(
-            "exp2(float(sb) + (-127.0f))",
-            "exp2(float(sb) + (-126.0f))",
-            2,
-        )],
+        edits: &[
+            (
+                "exp2(float(sb) + (-127.0f))",
+                "exp2(float(sb) + (-126.0f))",
+                1,
+            ),
+            (
+                "return as_type<float>(sb == 0xffu ? 0x7fc00000u : (sb == 0u ? 0x00400000u : (sb << 23)));",
+                "return as_type<float>(sb == 0xffu ? 0x7fc00000u : (sb == 0u ? 0x00400000u : ((sb + 1u) << 23)));",
+                1,
+            ),
+        ],
     },
     Mutant {
         name: "ink2_pass_nv4p_one_nibble",
