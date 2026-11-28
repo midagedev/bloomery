@@ -924,7 +924,11 @@ gguf 7 2 0
 # block in its sum) and the entry's one block that builds it, each with its SAFETY line.
 # PIN(2026-11-28): gpu 3866 -> 3867 blocks, new code, not old code relaxed: the residency machine's write of a lent expert's
 # tier word (`write_tier_words`' one `mem_batch` over the tier's card copy of its places), with its SAFETY line.
-gpu 3867 491 10
+# PIN(2026-11-28): gpu 3867 -> 3887 blocks, new kernel entry, not old code relaxed: Inkling 2's fused ffn front
+# (route_norm.rs: sigmoid_128_8_router_norm, the ffn rms_norm, the card leg's q8_1 quantize and the E128 router in one
+# launch) indexes its launch-contract-sized slices with get_unchecked, writes through DisjointSlice and the device
+# atomics and holds the shared-memory row, plus its module load; each block has its SAFETY line.
+gpu 3887 491 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

@@ -623,9 +623,11 @@ mod gate {
     /// (segments, merge), the output gate, the output projection — one launch with the post conv
     /// and the join's add where the projection is Q8_0 (the body's `o_tail`), a block's first
     /// visit then adding nothing but copying the stream to its bank; else the projection, its
-    /// post conv and the join (a copy or an add); the feed-forward's mix, norm and router, the
-    /// card leg's four launches and its sum (one launch with the post conv and the stream's
-    /// add); a visit with messages runs the message mix in its attention
+    /// post conv and the join (a copy or an add); the feed-forward's mix, then its norm and the
+    /// router (one launch with the card leg's q8_1 quantize inside where the router is the
+    /// 128-expert one, the body's `route_norm` and `leg_prequant`: else the norm, the router and
+    /// the leg's quantize, three), the card leg's other four launches and its sum (one launch
+    /// with the post conv and the stream's add); a visit with messages runs the message mix in its attention
     /// mix's pair and adds two controller launch pairs. A pass edge copies the stream (pass 0) or
     /// the bank, its last row and the prelude back (a bank of no row copies nothing). The step
     /// opens with the embedding's lookup and norm and closes with the head's mix, norm,
@@ -636,6 +638,7 @@ mod gate {
         hp: &Hparams,
         table: &[(u32, u32)],
         (norm_proj, o_tail): (&[bool], &[bool]),
+        (route_norm, leg_prequant): (bool, bool),
         loopcd: Option<u32>,
     ) -> (usize, String) {
         const MIX: usize = 2;
@@ -646,8 +649,15 @@ mod gate {
         // own launch (-2 a visit, -1 on a block's first visit, which still copies the stream):
         // the visit's terms below are the epilogue, the attention's two, the gate, the output
         // projection, the feed-forward's mix, norm and router and the card leg's five.
-        const VISIT: usize = 1 + 2 + 1 + 1 + MIX + 1 + 1 + 5;
+        // PIN(2026-11-28): the feed-forward's norm and the router run in one launch where the router
+        // is the 128-expert instance (-1 a visit), and the card leg's q8_1 quantize inside it where
+        // the whole-card body runs the leg (-1 a visit): -96 a step. The visit's terms below are
+        // the epilogue, the attention's two, the gate, the output projection and the feed-forward's
+        // mix; `ffn` (the norm and the router) and `leg` (the card leg's launches) follow.
+        const VISIT: usize = 1 + 2 + 1 + 1 + MIX;
         const MESSAGES: usize = 2 + 2;
+        let ffn = if route_norm { 1 } else { 2 };
+        let leg = if leg_prequant { 4 } else { 5 };
         const EMBED: usize = 2;
         const HEAD: usize = MIX + 5;
         let core = hp.loop_.filter(|lp| lp.passes > 1);
@@ -682,8 +692,13 @@ mod gate {
             // The output projection's post conv and the join: nothing but the bank's copy in its
             // launch, else two launches.
             let join = if o_tail[l] { usize::from(banks) } else { 2 };
-            visit +=
-                VISIT + front + join + MIX * usize::from(l != 0) + if msg { MESSAGES } else { 0 };
+            visit += VISIT
+                + ffn
+                + leg
+                + front
+                + join
+                + MIX * usize::from(l != 0)
+                + if msg { MESSAGES } else { 0 };
             if banks {
                 pushed += 1;
             }
@@ -721,7 +736,7 @@ mod gate {
         if !tier::run_clause("graph_nodes_are_the_walks", Tag::SelfConsistency)? {
             return Ok(true);
         }
-        let (table, norm_proj, o_tail) = {
+        let (table, norm_proj, o_tail, route) = {
             let body = m.body(NAME)?;
             let per_layer = |f: &dyn Fn(usize) -> bool| -> Vec<bool> {
                 (0..body.stored_layers()).map(f).collect()
@@ -730,13 +745,14 @@ mod gate {
                 body.visit_table(),
                 per_layer(&|l| body.norm_proj(l)),
                 per_layer(&|l| body.o_tail(l)),
+                (body.route_norm(), body.leg_prequant()),
             )
         };
         let flags = (&norm_proj[..], &o_tail[..]);
-        let (want, terms) = derived_nodes(hp, &table, flags, None);
+        let (want, terms) = derived_nodes(hp, &table, flags, route, None);
         let (nodes, entries) = captured_entries(m)?;
         m.set_loopcd(LOOPCD_OMEGA, LOOPCD_REF)?;
-        let (want_on, terms_on) = derived_nodes(hp, &table, flags, Some(LOOPCD_REF));
+        let (want_on, terms_on) = derived_nodes(hp, &table, flags, route, Some(LOOPCD_REF));
         let (nodes_on, entries_on) = captured_entries(m)?;
         m.set_loopcd(0.0, LOOPCD_REF)?;
         m.set_mode(StepMode::Eager);
